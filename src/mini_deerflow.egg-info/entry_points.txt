@@ -1,0 +1,2 @@
+[console_scripts]
+mini-deerflow = mini_deerflow.cli:main
