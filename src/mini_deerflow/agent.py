@@ -1,8 +1,9 @@
-"""Agent：驱动模型与工具之间的调用循环。"""
+"""Agent：驱动模型与工具注册表之间的调用循环。"""
 
 from __future__ import annotations
 
 from mini_deerflow.models import FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.tools import ToolRegistry
 
 
 class Agent:
@@ -11,11 +12,11 @@ class Agent:
     def __init__(
         self,
         model: Model,
-        tools: dict[str, callable],
+        registry: ToolRegistry,
         max_steps: int = 10,
     ):
         self._model = model
-        self._tools = tools
+        self._registry = registry
         self._max_steps = max_steps
 
     def run(self, user_input: str) -> tuple[str, list[dict]]:
@@ -38,18 +39,18 @@ class Agent:
                 trace.append({
                     "step": step,
                     "action": "model_decision",
-                    "detail": f"调用工具 {decision.name}，参数: {decision.args}",
+                    "detail": f"调用工具 {decision.name}，参数: {decision.arguments}",
                 })
 
-                tool_fn = self._tools.get(decision.name)
-                if tool_fn is None:
-                    raise ValueError(f"未知工具: {decision.name}")
-
-                result = tool_fn(decision.args)
+                result = self._registry.execute(decision.name, decision.arguments)
                 trace.append({
                     "step": step,
                     "action": "tool_call",
-                    "detail": {"name": decision.name, "args": decision.args, "result": result},
+                    "detail": {
+                        "name": decision.name,
+                        "args": decision.arguments,
+                        "result": result,
+                    },
                 })
 
                 messages.append(Message(role="tool", content=result))

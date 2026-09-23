@@ -2,7 +2,7 @@
 
 import unittest
 
-from mini_deerflow.tools import TOOLS, calculator
+from mini_deerflow.tools import calculator
 
 
 class TestCalculator(unittest.TestCase):
@@ -34,11 +34,6 @@ class TestCalculator(unittest.TestCase):
         """属性访问应被拒绝"""
         with self.assertRaises(ValueError):
             calculator("(1).__class__")
-
-    def test_tools_dict(self):
-        """TOOLS 字典应包含 calculator"""
-        self.assertIn("calculator", TOOLS)
-        self.assertIs(TOOLS["calculator"], calculator)
 
 
 if __name__ == "__main__":

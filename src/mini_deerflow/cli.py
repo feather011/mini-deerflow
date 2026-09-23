@@ -6,7 +6,7 @@ import argparse
 
 from mini_deerflow.agent import Agent
 from mini_deerflow.models import FakeModel
-from mini_deerflow.tools import TOOLS
+from mini_deerflow.tools import create_default_registry
 
 
 def format_trace(trace: list[dict]) -> str:
@@ -36,7 +36,7 @@ def main() -> None:
     parser.add_argument("--trace", action="store_true", help="显示执行轨迹")
     args = parser.parse_args()
 
-    agent = Agent(model=FakeModel(), tools=TOOLS)
+    agent = Agent(model=FakeModel(), registry=create_default_registry())
 
     print("Mini DeerFlow（输入 exit 或 quit 退出）")
 

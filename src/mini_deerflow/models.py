@@ -17,7 +17,7 @@ class Message:
 class ToolCall:
     """模型决定调用工具。"""
     name: str
-    args: str
+    arguments: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class FakeModel:
 
         if latest.role == "user" and latest.content.startswith("计算 "):
             expression = latest.content[len("计算 "):]
-            return ToolCall(name="calculator", args=expression)
+            return ToolCall(name="calculator", arguments={"expression": expression})
 
         if latest.role == "tool":
             return FinalAnswer(content=f"计算结果: {latest.content}")

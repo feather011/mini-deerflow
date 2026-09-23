@@ -59,11 +59,6 @@ def calculator_handler(arguments: dict[str, object]) -> str:
     return calculator(expression)
 
 
-TOOLS: dict[str, callable] = {
-    "calculator": calculator,
-}
-
-
 # --- 工具管理基础设施 ---
 
 
