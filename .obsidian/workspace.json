@@ -15,8 +15,8 @@
               "state": {
                 "file": "mini-deerflow.canvas",
                 "viewState": {
-                  "x": 500,
-                  "y": 866.2929004679261,
+                  "x": 551.3094789682224,
+                  "y": 259.5048074496806,
                   "zoom": -0.5
                 }
               },
@@ -193,10 +193,18 @@
   },
   "active": "9e37fff9b67f4f6c",
   "lastOpenFiles": [
-    "mini-deerflow.canvas.tmp.55508.70111807a079",
-    "mini-deerflow.canvas.tmp.55508.c51cb4119dad",
-    "mini-deerflow.canvas.tmp.55508.91491df99be3",
-    "docs/thread-state.md",
-    "docs/thread-state.md.tmp.55508.b98cd2851080"
+    "mini-deerflow.canvas.tmp.63964.9b552908679f",
+    "mini-deerflow.canvas.tmp.63964.50a1b70c015a",
+    "mini-deerflow.canvas.tmp.63964.09413d360b5d",
+    "mini-deerflow.canvas.tmp.63964.1d28a6832fee",
+    "mini-deerflow.canvas.tmp.63964.72e1343e9767",
+    "docs/thread-store.md",
+    "docs/thread-store.md.tmp.63964.2db0f152ef68",
+    "src/mini_deerflow/__pycache__/thread_store.cpython-312.pyc",
+    "tests/__pycache__/test_thread_store.cpython-312.pyc",
+    "tests/test_thread_store.py",
+    "src/mini_deerflow/thread_store.py",
+    "src/mini_deerflow/thread_store.py.tmp.63964.e5fceae71d3d",
+    "docs/thread-state.md"
   ]
 }
