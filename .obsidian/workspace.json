@@ -191,20 +191,20 @@
       "bases:新建数据库": false
     }
   },
-  "active": "9e37fff9b67f4f6c",
+  "active": "de38ab7f1f9418f1",
   "lastOpenFiles": [
-    "mini-deerflow.canvas.tmp.63964.9b552908679f",
-    "mini-deerflow.canvas.tmp.63964.50a1b70c015a",
-    "mini-deerflow.canvas.tmp.63964.09413d360b5d",
-    "mini-deerflow.canvas.tmp.63964.1d28a6832fee",
-    "mini-deerflow.canvas.tmp.63964.72e1343e9767",
+    "tests/test_cli.py.tmp.63964.bd61057efdac",
+    "src/mini_deerflow/cli.py.tmp.63964.158435971759",
+    "tests/test_cli.py.tmp.63964.9e4e457a7a92",
+    "tests/test_cli.py.tmp.63964.6c743ef9b174",
+    "tests/test_cli.py.tmp.63964.3605aaf5e378",
+    "tests/test_cli.py.tmp.63964.ca5d98a9d9f3",
+    "tests/test_cli.py.tmp.63964.752411f02141",
+    "tests/test_cli.py.tmp.63964.571a882cb1c7",
+    "tests/test_cli.py.tmp.63964.178bcd7e15cd",
+    "src/mini_deerflow/cli.py.tmp.63964.9e1a4e48bcbe",
+    "tests/test_agent.py.tmp.63964.c02bf26fc963",
     "docs/thread-store.md",
-    "docs/thread-store.md.tmp.63964.2db0f152ef68",
-    "src/mini_deerflow/__pycache__/thread_store.cpython-312.pyc",
-    "tests/__pycache__/test_thread_store.cpython-312.pyc",
-    "tests/test_thread_store.py",
-    "src/mini_deerflow/thread_store.py",
-    "src/mini_deerflow/thread_store.py.tmp.63964.e5fceae71d3d",
     "docs/thread-state.md"
   ]
 }
