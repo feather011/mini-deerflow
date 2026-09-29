@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
+from typing import Callable, TypeVar
+
+from mini_deerflow.memory_manager import MemoryProcessor
+from mini_deerflow.memory_context import MemoryContextProvider
+from mini_deerflow.middleware import (
+    Budget,
+    BudgetExceededError,
+    ExecutionContext,
+    MiddlewarePipeline,
+    OperationType,
+)
 from mini_deerflow.models import FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.skill_runtime import SkillContextProvider
 from mini_deerflow.thread_store import ThreadStore
 from mini_deerflow.tools import ToolRegistry
+
+T = TypeVar("T")
 
 
 class Agent:
@@ -16,15 +30,70 @@ class Agent:
         registry: ToolRegistry,
         store: ThreadStore,
         max_steps: int = 10,
+        context_provider: MemoryContextProvider | None = None,
+        memory_processor: MemoryProcessor | None = None,
+        skill_context_provider: SkillContextProvider | None = None,
+        middleware_pipeline: MiddlewarePipeline | None = None,
+        budget: Budget | None = None,
     ):
         self._model = model
         self._registry = registry
         self._store = store
         self._max_steps = max_steps
+        self._context_provider = context_provider
+        self._memory_processor = memory_processor
+        self._skill_context_provider = skill_context_provider
+        self._middleware_pipeline = middleware_pipeline
+        self._budget = budget
+
+    def _run_via_pipeline(
+        self,
+        ctx: ExecutionContext,
+        action: Callable[[], T],
+    ) -> T:
+        """通过 MiddlewarePipeline 执行（含 RetryAgainError 重试）。
+
+        没有 pipeline 时直接执行 action()。
+        """
+        if self._middleware_pipeline is None:
+            return action()
+        return self._middleware_pipeline.execute_with_retry(ctx, action)
 
     def run(self, thread_id: str, user_input: str) -> tuple[str, list[dict]]:
         """对指定 thread_id 执行一轮 Agent 循环；成功后原子写入，失败时 Thread 不变。"""
         thread = self._store.get(thread_id)  # ThreadNotFoundError 原样传播
+
+        # 构建上下文消息（只调用一次 context_provider.build()）
+        memory_context_messages: list[Message] = []
+        if self._context_provider is not None:
+            memory_context = self._context_provider.build()
+
+            if not isinstance(memory_context, str):
+                raise TypeError(
+                    "MemoryContextProvider.build() 必须返回字符串"
+                )
+
+            memory_context = memory_context.strip()
+            if memory_context:
+                memory_context_messages.append(
+                    Message(role="system", content=memory_context)
+                )
+
+        # 构建 Skill 上下文（只调用一次 skill_context_provider.build()）
+        skill_context_messages: list[Message] = []
+        if self._skill_context_provider is not None:
+            skill_context = self._skill_context_provider.build(user_input)
+
+            if not isinstance(skill_context, str):
+                raise TypeError(
+                    "SkillContextProvider.build() 必须返回字符串"
+                )
+
+            skill_context = skill_context.strip()
+            if skill_context:
+                skill_context_messages.append(
+                    Message(role="system", content=skill_context)
+                )
 
         # 读取历史为快照；working_messages 是本轮累计（喂给模型），pending 是待提交的本轮增量
         working_messages: list[Message] = list(thread.snapshot())
@@ -37,7 +106,28 @@ class Agent:
         trace: list[dict] = []
 
         for step in range(1, self._max_steps + 1):
-            decision = self._model.decide(working_messages)
+            # 组合发送给模型的完整消息列表：Memory → Skill → history → user
+            # 每次循环重新组合以包含新增的 tool messages
+            model_messages = [
+                *memory_context_messages,
+                *skill_context_messages,
+                *working_messages,
+            ]
+
+            # Model call：通过 middleware_pipeline 包装（原子 consume 预算）
+            model_ctx = ExecutionContext(
+                run_id="",  # 由 IntegratedAgent 在外层生成
+                thread_id=thread_id,
+                operation=OperationType.MODEL_CALL,
+                operation_name="model_decide",
+                budget=self._budget,
+            )
+            def _do_model_call(_msgs=model_messages) -> ToolCall | FinalAnswer:
+                # 真正发起调用前原子消费额度（成功/失败/Retry 每次都计）
+                if self._budget is not None:
+                    self._budget.consume_model_call()
+                return self._model.decide(_msgs)
+            decision = self._run_via_pipeline(model_ctx, _do_model_call)
 
             if isinstance(decision, FinalAnswer):
                 assistant_message = Message(role="assistant", content=decision.content)
@@ -50,6 +140,11 @@ class Agent:
                 # 原子提交：先全部 extend，再 save
                 thread.extend(pending)
                 self._store.save(thread)
+
+                # 成功后处理记忆（只处理本轮 user Message）
+                if self._memory_processor is not None:
+                    self._process_memory(thread_id, user_message, trace)
+
                 return decision.content, trace
 
             if isinstance(decision, ToolCall):
@@ -59,7 +154,23 @@ class Agent:
                     "detail": f"调用工具 {decision.name}，参数: {decision.arguments}",
                 })
 
-                result = self._registry.execute(decision.name, decision.arguments)
+                # Tool call：通过 middleware_pipeline 包装（含 budget 检查/记录）
+                tool_ctx = ExecutionContext(
+                    run_id="",
+                    thread_id=thread_id,
+                    operation=OperationType.TOOL_CALL,
+                    operation_name=decision.name,
+                    budget=self._budget,
+                )
+                def _do_tool_call(
+                    _name=decision.name,
+                    _args=decision.arguments,
+                ) -> str:
+                    # 真正发起调用前原子消费额度（成功/失败都计）
+                    if self._budget is not None:
+                        self._budget.consume_tool_call()
+                    return self._registry.execute(_name, _args)
+                result = self._run_via_pipeline(tool_ctx, _do_tool_call)
                 trace.append({
                     "step": step,
                     "action": "tool_call",
@@ -71,3 +182,33 @@ class Agent:
                 pending.append(tool_message)
 
         raise RuntimeError(f"Agent 在 {self._max_steps} 步内未完成")
+
+    def _process_memory(
+        self,
+        thread_id: str,
+        user_message: Message,
+        trace: list[dict],
+    ) -> None:
+        """处理本轮用户消息中的记忆提取和保存。"""
+        try:
+            saved_memories = self._memory_processor.extract_and_save(
+                source_thread_id=thread_id,
+                messages=[user_message],
+            )
+
+            if saved_memories:
+                trace.append({
+                    "step": len(trace) + 1,
+                    "type": "memory_saved",
+                    "count": len(saved_memories),
+                    "memory_ids": [
+                        memory.memory_id
+                        for memory in saved_memories
+                    ],
+                })
+        except Exception as error:
+            trace.append({
+                "step": len(trace) + 1,
+                "type": "memory_warning",
+                "error": str(error),
+            })

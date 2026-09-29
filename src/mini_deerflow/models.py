@@ -3,14 +3,46 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
+_VALID_ROLES: frozenset[str] = frozenset({"system", "user", "assistant", "tool"})
 
 
 @dataclass(frozen=True)
 class Message:
     """对话消息。"""
-    role: str  # "user" | "tool"
+    role: str  # "user" | "assistant" | "tool"
     content: str
+
+    def to_dict(self) -> dict[str, object]:
+        """消息转字典：{"role": ..., "content": ...}"""
+        return {"role": self.role, "content": self.content}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "Message":
+        """从字典恢复 Message；非法数据抛 ValueError。"""
+        if not isinstance(data, dict):
+            raise ValueError(f"data 必须是字典，收到: {type(data).__name__}")
+
+        if "role" not in data:
+            raise ValueError("Message 缺少字段: role")
+        role = data["role"]
+        if not isinstance(role, str):
+            raise ValueError(f"role 必须是字符串，收到: {type(role).__name__}")
+        if role not in _VALID_ROLES:
+            raise ValueError(
+                f"未知 role: {role!r}（允许: system / user / assistant / tool）"
+            )
+
+        if "content" not in data:
+            raise ValueError("Message 缺少字段: content")
+        content = data["content"]
+        if not isinstance(content, str):
+            raise ValueError(
+                f"content 必须是字符串，收到: {type(content).__name__}"
+            )
+
+        return cls(role=role, content=content)
 
 
 @dataclass(frozen=True)

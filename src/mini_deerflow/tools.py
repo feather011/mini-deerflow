@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import operator as op
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 # ast 节点 → 安全运算符映射
@@ -106,6 +106,34 @@ class ToolRegistry:
         if tool.name in self._tools:
             raise DuplicateToolError(f"工具已存在: {tool.name}")
         self._tools[tool.name] = tool
+
+    def register_many(self, tools: Sequence[Tool]) -> None:
+        """批量原子注册工具。
+
+        全部验证通过后才提交：批次内无重复、与已有工具无冲突。
+        任何失败时 registry 保持不变。
+        """
+        if isinstance(tools, str):
+            raise TypeError("tools 不能是 str")
+        # 预先检查：批次内重复
+        seen: dict[str, Tool] = {}
+        for tool in tools:
+            if not isinstance(tool, Tool):
+                raise TypeError(
+                    f"tools 元素必须是 Tool，收到: {type(tool).__name__}"
+                )
+            if tool.name in seen:
+                raise DuplicateToolError(
+                    f"批次内工具名重复: {tool.name}"
+                )
+            seen[tool.name] = tool
+        # 预先检查：与已有冲突
+        for tool in tools:
+            if tool.name in self._tools:
+                raise DuplicateToolError(f"工具已存在: {tool.name}")
+        # 全部通过后原子提交
+        for tool in tools:
+            self._tools[tool.name] = tool
 
     def get(self, name: str) -> Tool:
         """按名称获取工具；未知时抛出 ToolNotFoundError。"""

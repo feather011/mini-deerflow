@@ -1,0 +1,605 @@
+"""Subagent 执行器（17B 阶段）。
+
+提供 SubagentRunner（子任务执行上下文）和 SubagentManager（并发管理）。
+
+设计原则：
+- 不持有父 Agent 的可变状态
+- 子任务使用独立工作消息列表
+- 结果通过 SubagentResult 回收
+- 不修改父 ThreadState
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Callable
+
+from mini_deerflow.agent import Agent
+from mini_deerflow.models import FakeModel, FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.subagent_models import (
+    SubagentContextPolicy,
+    SubagentResult,
+    SubagentTask,
+    TaskStatus,
+)
+from mini_deerflow.thread_state import ThreadState
+from mini_deerflow.thread_store import InMemoryThreadStore, ThreadStore
+from mini_deerflow.tools import Tool, ToolRegistry
+
+
+# --- Budget ---
+# 旧 SubagentBudget 类已合并到 middleware.Budget（项目唯一 Budget 实现）。
+# 保留 SubagentBudget 名称作为兼容别名：所有属性与 Budget 等价。
+
+from mini_deerflow.middleware import (  # noqa: E402, F401
+    Budget as SubagentBudget,
+    BudgetExceededError,
+)
+
+
+# --- Cancellation Token ---
+
+class CancellationToken:
+    """协作取消令牌。线程安全。"""
+    __slots__ = ("_cancelled", "_lock")
+
+    def __init__(self) -> None:
+        self._cancelled = False
+        self._lock = threading.Lock()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+
+# --- SubagentRunner ---
+
+@dataclass
+class SubagentRunner:
+    """子任务的执行上下文。
+
+    持有独立的：
+    - thread store
+    - agent instance
+    - 工作消息列表
+
+    不持有父 Agent 的可变状态。
+    """
+    task: SubagentTask
+    model: Model
+    registry: ToolRegistry
+    store: ThreadStore
+    budget: SubagentBudget
+    cancellation_token: CancellationToken
+    # 用于 Trace 关联
+    parent_run_id: str = ""
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def run(self) -> SubagentResult:
+        """执行子任务并返回结果。"""
+        thread_id = f"subagent-{self.task.task_id}"
+
+        try:
+            # 如果还是 QUEUED（直接调用 SubagentRunner，未经过 Manager._run_task），
+            # 转为 RUNNING。经过 Manager 时已在 _run_task 中转换过了。
+            if self.task.status == TaskStatus.QUEUED:
+                self.task.transition_to(TaskStatus.RUNNING)
+
+            # 创建独立 Thread
+            if self.store.exists(thread_id):
+                self.store.delete(thread_id)
+            self.store.create(thread_id)
+
+            started_at = time.monotonic()
+            if self.task.started_at is not None:
+                started_at = self.task.started_at
+            else:
+                self.task.started_at = started_at
+
+            # 注入取消检查到 Agent（通过包装 Model）
+            wrapped_model = _CancellableModel(
+                self.model,
+                self.cancellation_token,
+                self.budget,
+            )
+
+            # 使用 budget-aware agent
+            actual_agent = _BudgetAwareAgent(
+                model=wrapped_model,
+                registry=self.registry,
+                store=self.store,
+                max_steps=self.budget.max_steps,
+                budget=self.budget,
+                cancellation_token=self.cancellation_token,
+                timeout_seconds=self.task.timeout_seconds,
+            )
+
+            # 检查取消（在开始前）
+            if self.cancellation_token.is_cancelled():
+                return self._mark_cancelled_and_result()
+
+            output = actual_agent.run(thread_id, self.task.instruction)
+
+            # 检查取消（在完成后）
+            if self.cancellation_token.is_cancelled():
+                return self._mark_cancelled_and_result(output=output)
+
+            self.task.transition_to(TaskStatus.SUCCEEDED)
+            return SubagentResult.from_task(
+                self.task,
+                output=output,
+                run_id=self.run_id,
+            )
+
+        except _CancelledError:
+            return self._mark_cancelled_and_result()
+
+        except _BudgetExhaustedError as e:
+            self._safe_transition(TaskStatus.FAILED)
+            return SubagentResult.from_task(
+                self.task,
+                output="",
+                error_type="BudgetExhaustedError",
+                error_message=str(e),
+                run_id=self.run_id,
+            )
+
+        except Exception as e:
+            self._safe_transition(TaskStatus.FAILED)
+            return SubagentResult.from_task(
+                self.task,
+                output="",
+                error_type=type(e).__name__,
+                error_message=str(e),
+                run_id=self.run_id,
+            )
+
+    def _safe_transition(self, to: TaskStatus) -> None:
+        """安全地转换状态。"""
+        try:
+            if self.task.status in {
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.TIMED_OUT,
+            }:
+                return
+            self.task.transition_to(to)
+        except Exception:
+            pass
+
+    def _mark_cancelled_and_result(self, output: str = "") -> SubagentResult:
+        """标记取消并返回结果。"""
+        self._safe_transition(TaskStatus.CANCELLED)
+        return SubagentResult.from_task(
+            self.task,
+            output=output,
+            error_type="CancelledError",
+            error_message="任务被取消",
+            run_id=self.run_id,
+        )
+
+
+class _CancelledError(Exception):
+    """协作取消信号。"""
+    pass
+
+
+class _BudgetExhaustedError(Exception):
+    """预算耗尽信号。"""
+    pass
+
+
+class _CancellableModel:
+    """包装 Model，在每次 decide 前检查取消并原子消费 model 预算。"""
+    __slots__ = ("_model", "_token", "_budget")
+
+    def __init__(self, model: Model, token: CancellationToken, budget: SubagentBudget) -> None:
+        self._model = model
+        self._token = token
+        self._budget = budget
+
+    def decide(self, messages: list[Message]) -> ToolCall | FinalAnswer:
+        if self._token.is_cancelled():
+            raise _CancelledError()
+        # 在真正发起 model 调用前原子消费额度
+        try:
+            self._budget.consume_model_call()
+        except BudgetExceededError as e:
+            raise _BudgetExhaustedError(str(e)) from e
+        return self._model.decide(messages)
+
+
+class _BudgetAwareAgent:
+    """Budget-aware Agent wrapper。"""
+    _DEFAULT_MAX_STEPS = 10
+
+    def __init__(
+        self,
+        model: Model,
+        registry: ToolRegistry,
+        store: ThreadStore,
+        max_steps: int | None,
+        budget: SubagentBudget,
+        cancellation_token: CancellationToken,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        self._model = model
+        self._registry = registry
+        self._store = store
+        # budget.max_steps 可能为 None（无限），runner 必须给出有限上限以便 step 循环终止。
+        self._max_steps = max_steps if max_steps is not None else self._DEFAULT_MAX_STEPS
+        self._budget = budget
+        self._token = cancellation_token
+        self._deadline: float | None = time.monotonic() + timeout_seconds if timeout_seconds else None
+
+    def _check_deadline(self) -> None:
+        """检查是否超时。"""
+        if self._deadline is not None and time.monotonic() > self._deadline:
+            raise _CancelledError()
+
+    def run(self, thread_id: str, instruction: str) -> str:
+        thread = self._store.get(thread_id)
+        working_messages: list[Message] = list(thread.snapshot())
+        pending: list[Message] = []
+
+        user_message = Message(role="user", content=instruction)
+        working_messages.append(user_message)
+        pending.append(user_message)
+
+        for step in range(1, self._max_steps + 1):
+            # 取消检查
+            if self._token.is_cancelled():
+                raise _CancelledError()
+            # 超时检查
+            self._check_deadline()
+            # 步数预算
+            try:
+                self._budget.consume_step()
+            except BudgetExceededError as e:
+                raise _BudgetExhaustedError(str(e)) from e
+
+            model_messages = list(working_messages)
+            decision = self._model.decide(model_messages)
+
+            if isinstance(decision, FinalAnswer):
+                assistant_message = Message(role="assistant", content=decision.content)
+                pending.append(assistant_message)
+                thread.extend(pending)
+                self._store.save(thread)
+                return decision.content
+
+            if isinstance(decision, ToolCall):
+                # 工具调用前原子消费额度（成功/失败都计入）
+                try:
+                    self._budget.consume_tool_call()
+                except BudgetExceededError as e:
+                    raise _BudgetExhaustedError(str(e)) from e
+
+                result = self._registry.execute(decision.name, decision.arguments)
+                tool_message = Message(role="tool", content=result)
+                working_messages.append(tool_message)
+                pending.append(tool_message)
+
+        raise RuntimeError(f"Subagent 在 {self._max_steps} 步内未完成")
+
+
+# --- SubagentManager ---
+
+class SubagentManager:
+    """Subagent 并发管理器。
+
+    使用 ThreadPoolExecutor(max_workers=max_concurrency) 实现真正有界 worker pool。
+    queued 任务不创建额外线程，只在 executor 队列中等待。
+
+    父子预算关系：
+    - 父 Agent 持有 shared_budget（与 Manager 共享的 Budget 实例）
+    - submit 时 consume_subagent_task(depth) 原子扣减额度 + 验证深度
+    - 子任务执行 Model/Tool 时使用同一个 budget 实例，因此所有子任务
+      共享父级的总 model_calls / tool_calls 额度
+    """
+    def __init__(
+        self,
+        max_concurrency: int = 1,
+        max_depth: int = 3,
+        max_tasks_per_parent: int = 10,
+        default_timeout: float | None = 300.0,
+        default_budget: SubagentBudget | None = None,
+        shared_budget: SubagentBudget | None = None,
+    ) -> None:
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency 必须 >= 1")
+        if max_depth < 0:
+            raise ValueError("max_depth 不能为负")
+        if max_tasks_per_parent < 1:
+            raise ValueError("max_tasks_per_parent 必须 >= 1")
+
+        self._max_concurrency = max_concurrency
+        self._max_depth = max_depth
+        self._max_tasks_per_parent = max_tasks_per_parent
+        self._default_timeout = default_timeout
+        self._default_budget = default_budget or SubagentBudget()
+        # 父子共享 Budget（若提供）。submit / 子任务 Model/Tool 都会 consume 它。
+        self._shared_budget = shared_budget
+
+        self._lock = threading.Lock()
+        self._tasks: dict[str, SubagentTask] = {}
+        self._results: dict[str, SubagentResult] = {}
+        self._tokens: dict[str, CancellationToken] = {}
+        self._started = False
+        self._shutdown = False
+
+        # ThreadPoolExecutor 是真正的 worker pool
+        self._executor = ThreadPoolExecutor(max_workers=max_concurrency)
+        self._futures: dict[str, Future] = {}
+
+        # 任务计数器（用于 max_tasks_per_parent）
+        self._parent_task_counts: dict[str, int] = {}
+
+    def submit(
+        self,
+        instruction: str,
+        parent_run_id: str,
+        parent_thread_id: str,
+        *,
+        parent_task_id: str | None = None,
+        depth: int = 1,
+        timeout_seconds: float | None = None,
+        budget: SubagentBudget | None = None,
+        model: Model | None = None,
+        registry: ToolRegistry | None = None,
+        context_policy: SubagentContextPolicy | None = None,
+    ) -> SubagentTask:
+        """提交一个子任务。
+
+        若 Manager 配置了 shared_budget，会在提交时原子 consume_subagent_task(depth)：
+        - 子任务数 / 深度超限时抛 BudgetExceededError
+        - 子任务执行 Model/Tool 时使用同一个 shared_budget 实例
+        """
+        if self._shutdown:
+            raise RuntimeError("Manager 已关闭，不能提交新任务")
+
+        # 父子共享 Budget：原子扣减 + 深度校验
+        if self._shared_budget is not None:
+            self._shared_budget.consume_subagent_task(depth)
+
+        # 深度检查（向后兼容，即使没有 shared_budget 也允许 Manager 内部 max_depth 限制）
+        if depth > self._max_depth:
+            raise ValueError(
+                f"子任务深度 {depth} 超过上限 {self._max_depth}"
+            )
+
+        # 父任务子任务数检查
+        parent_key = parent_task_id or parent_run_id
+        with self._lock:
+            count = self._parent_task_counts.get(parent_key, 0)
+            if count >= self._max_tasks_per_parent:
+                raise ValueError(
+                    f"父任务 {parent_key} 的子任务数已达上限 {self._max_tasks_per_parent}"
+                )
+            self._parent_task_counts[parent_key] = count + 1
+
+        task_id = f"sa-{uuid.uuid4().hex[:12]}"
+        created_at = time.monotonic()
+
+        task = SubagentTask(
+            task_id=task_id,
+            parent_run_id=parent_run_id,
+            parent_thread_id=parent_thread_id,
+            instruction=instruction,
+            status=TaskStatus.QUEUED,
+            created_at=created_at,
+            parent_task_id=parent_task_id,
+            depth=depth,
+            timeout_seconds=timeout_seconds or self._default_timeout,
+            context_policy=context_policy,
+        )
+
+        token = CancellationToken()
+
+        with self._lock:
+            self._tasks[task_id] = task
+            self._tokens[task_id] = token
+
+        # 提交到 ThreadPoolExecutor（不是每任务一线程）
+        future = self._executor.submit(
+            self._run_task,
+            task,
+            token,
+            model,
+            registry,
+            budget,
+        )
+        with self._lock:
+            self._futures[task_id] = future
+
+        return task
+
+    def _run_task(
+        self,
+        task: SubagentTask,
+        token: CancellationToken,
+        model: Model | None,
+        registry: ToolRegistry | None,
+        budget: SubagentBudget | None,
+    ) -> None:
+        """在 worker 线程中执行任务。"""
+        # 先在锁内做状态确认和转换，释放锁后再处理取消分支（避免重入死锁）
+        should_cancel = False
+        task_obj: SubagentTask | None = None
+        with self._lock:
+            task_obj = self._tasks.get(task.task_id)
+            if task_obj is None:
+                return
+            if self._tokens[task_obj.task_id].is_cancelled():
+                should_cancel = True
+            else:
+                # 转换到 RUNNING
+                task_obj.transition_to(TaskStatus.RUNNING)
+
+        if should_cancel:
+            self._mark_task_cancelled(task.task_id)
+            return
+
+        try:
+            # 父子共享 Budget 优先：所有 Model/Tool 调用都受其约束
+            effective_budget = budget or self._shared_budget or self._default_budget
+            # 创建执行器并运行
+            runner = SubagentRunner(
+                task=task_obj,
+                model=model or FakeModel(),
+                registry=registry or ToolRegistry(),
+                store=InMemoryThreadStore(),
+                budget=effective_budget,
+                cancellation_token=token,
+                parent_run_id=task.parent_run_id,
+            )
+
+            result = runner.run()
+
+            with self._lock:
+                self._tasks[task.task_id] = runner.task
+                self._results[task.task_id] = result
+
+        except Exception as e:
+            with self._lock:
+                task_obj_ref = self._tasks.get(task.task_id) if task_obj is None else task_obj
+                if task_obj_ref and task_obj_ref.status in {
+                    TaskStatus.QUEUED,
+                    TaskStatus.RUNNING,
+                }:
+                    try:
+                        task_obj_ref.transition_to(TaskStatus.FAILED)
+                    except Exception:
+                        pass
+                if task.task_id not in self._results:
+                    self._results[task.task_id] = SubagentResult.from_task(
+                        task_obj_ref or task,
+                        output="",
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                    )
+
+    def get_status(self, task_id: str) -> TaskStatus:
+        """查询任务状态。未知任务抛出 KeyError。"""
+        with self._lock:
+            return self._tasks[task_id].status
+
+    def list_tasks(self) -> list[SubagentTask]:
+        """列出所有任务（快照）。"""
+        with self._lock:
+            return list(self._tasks.values())
+
+    def collect(self, task_id: str, timeout: float = 0) -> SubagentResult:
+        """回收任务结果。
+
+        timeout=0：立即返回（未完成则抛出 KeyError）
+        timeout>0：等待最多 timeout 秒
+        """
+        deadline: float | None = time.monotonic() + timeout if timeout > 0 else None
+
+        while True:
+            with self._lock:
+                if task_id not in self._results:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(f"等待结果超时: {task_id}")
+                    # 未完成，继续等待
+                    pass
+                else:
+                    return self._results[task_id]
+
+            if deadline is None:
+                raise KeyError(f"任务未完成: {task_id}")
+
+            # 短暂等待后重试
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"等待结果超时: {task_id}")
+            time.sleep(min(0.1, remaining))
+
+    def collect_many(self, task_ids: list[str], timeout: float = 0) -> dict[str, SubagentResult]:
+        """批量回收结果。"""
+        results: dict[str, SubagentResult] = {}
+        deadline: float | None = time.monotonic() + timeout if timeout > 0 else None
+
+        for task_id in task_ids:
+            while True:
+                with self._lock:
+                    if task_id in self._results:
+                        results[task_id] = self._results[task_id]
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+                remaining = (deadline - time.monotonic()) if deadline else 0.1
+                time.sleep(min(0.1, max(0, remaining)))
+                if deadline and time.monotonic() >= deadline:
+                    break
+
+        return results
+
+    def cancel(self, task_id: str) -> bool:
+        """请求取消任务。返回是否成功接受取消请求。"""
+        with self._lock:
+            if task_id not in self._tasks:
+                return False
+            status = self._tasks[task_id].status
+            if status not in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
+                return False
+            self._tokens[task_id].cancel()
+            return True
+
+    def shutdown(self, cancel_pending: bool = True) -> None:
+        """关闭管理器。
+
+        关闭 ThreadPoolExecutor（不再创建新线程）。running 任务通过 cancel_pending
+        协作取消，queue 中的任务随 executor.shutdown 一并清除。
+        """
+        with self._lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+
+        if cancel_pending:
+            with self._lock:
+                for task_id, task in self._tasks.items():
+                    if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
+                        self._tokens[task_id].cancel()
+
+        # 关闭 executor。wait=True 等所有 running 任务结束（协作取消后会快速退出）
+        self._executor.shutdown(wait=True)
+
+    def _store_result(self, result: SubagentResult) -> None:
+        with self._lock:
+            self._results[result.task_id] = result
+
+    def _mark_task_cancelled(self, task_id: str) -> None:
+        with self._lock:
+            if task_id not in self._tasks:
+                return
+            task = self._tasks[task_id]
+            if task.status in {
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.TIMED_OUT,
+            }:
+                return  # 已是终态
+            try:
+                task.transition_to(TaskStatus.CANCELLED)
+            except Exception:
+                pass
+            self._results[task_id] = SubagentResult.from_task(
+                task,
+                output="",
+                error_type="CancelledError",
+                error_message="任务被取消",
+            )
