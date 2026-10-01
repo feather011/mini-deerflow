@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment files (keep .env.example)
+.env
+.env.local
+.env.*.local
+
+# Test coverage / 缓存
+coverage/
+.vitest/
+.vite/
+.tsbuildinfo
+*.tsbuildinfo
+
+# Playwright E2E（20F）
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+e2e/.artifacts/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

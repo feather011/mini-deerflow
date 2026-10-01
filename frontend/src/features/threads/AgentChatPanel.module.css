@@ -1,0 +1,61 @@
+/* AgentChatPanel — Agent 聊天面板样式 */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.messageArea {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* SSE 流事件面板 */
+.streamArea {
+  border-top: 1px solid var(--color-border, #e5e7eb);
+  max-height: 250px;
+  overflow: hidden;
+}
+
+/* 错误提示 */
+.errorBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 16px;
+  background: #fef2f2;
+  border-top: 1px solid #fecaca;
+  color: var(--color-danger, #dc2626);
+}
+
+.errorMsg {
+  font-size: 13px;
+  flex: 1;
+  word-break: break-word;
+}
+
+.errorRequestId {
+  font-size: 11px;
+  color: #6b7280;
+  margin-left: 4px;
+}
+
+.dismissBtn {
+  padding: 4px 8px;
+  background: none;
+  border: 1px solid #fecaca;
+  border-radius: 4px;
+  color: var(--color-danger, #dc2626);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.dismissBtn:hover {
+  background: #fee2e2;
+}

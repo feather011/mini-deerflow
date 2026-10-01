@@ -1,4 +1,4 @@
-{
+
 	"nodes":[
 		{"id":"g_arch","type":"group","x":0,"y":400,"width":1960,"height":520,"label":"架构分层（从上到下调用）"},
 		{"id":"g_stage","type":"group","x":0,"y":0,"width":1960,"height":580,"label":"关卡进度"},
@@ -10,6 +10,7 @@
 		{"id":"s5a","type":"text","text":"# 第5A关：ThreadState\n\n- 会话状态数据模型\n- append / extend / snapshot\n- 11 个新测试\n\n✅ 已完成","x":1360,"y":50,"width":280,"height":220},
 		{"id":"s5b","type":"text","text":"# 第5B关：ThreadStore\n\n- 多会话仓库接口\n- Protocol + 异常族\n- InMemoryThreadStore 实现\n- 14 个新测试\n\n✅ 刚完成","x":1360,"y":290,"width":280,"height":220},
 		{"id":"s5c","type":"text","text":"# 后续阶段\n\n- 5C：Agent 接入 ThreadStore\n- 多轮对话成为可能\n- 接入真实大模型\n- 多工具\n\n🚧 待开始","x":1680,"y":290,"width":240,"height":220},
+		{"id":"s6a","type":"text","text":"# 第6A关：序列化边界\n\n- Message / Thread ↔ dict / JSON\n- SCHEMA_VERSION + SerializationError\n- 原子恢复，bool 版本拒绝\n- 26 个新测试\n\n✅ 刚完成","x":1680,"y":50,"width":240,"height":220},
 		{"id":"a1","type":"text","text":"**表现层 · CLI**（cli.py）\n读输入、打印答案、--trace 轨迹。不做任何决策。","x":700,"y":450,"width":560,"height":90},
 		{"id":"a2","type":"text","text":"**调度层 · Agent**（agent.py）\n循环：用户 → 模型决策 → 调工具 → 回喂 → 最终答案。依赖注入 Model + ToolRegistry。","x":700,"y":580,"width":560,"height":90},
 		{"id":"a3","type":"text","text":"**决策层 · Model**（models.py）\nMessage / ToolCall / FinalAnswer + Model Protocol。FakeModel 确定性模拟。","x":380,"y":710,"width":500,"height":90},
@@ -22,8 +23,9 @@
 		{"id":"d4","type":"file","file":"docs/tools-design.md","x":1620,"y":1150,"width":320,"height":90},
 		{"id":"d5","type":"file","file":"docs/calculator-tool-registration.md","x":1280,"y":1270,"width":320,"height":90},
 		{"id":"d6","type":"file","file":"docs/agent-registry-migration.md","x":1620,"y":1270,"width":320,"height":90},
-{"id":"d7","type":"file","file":"docs/thread-state.md","x":1280,"y":1390,"width":320,"height":90},
-{"id":"d8","type":"file","file":"docs/thread-store.md","x":1620,"y":1390,"width":320,"height":90},
+		{"id":"d7","type":"file","file":"docs/thread-state.md","x":1280,"y":1390,"width":320,"height":90},
+		{"id":"d8","type":"file","file":"docs/thread-store.md","x":1620,"y":1390,"width":320,"height":90},
+		{"id":"d9","type":"file","file":"docs/serialization.md","x":1280,"y":1510,"width":320,"height":90},
 		{"id":"s2","type":"text","text":"# 第2关：Agent 循环\n\n- Message / ToolCall / FinalAnswer\n- Model Protocol + FakeModel\n- 决策→工具→回喂→答案\n\n✅ 已完成","x":400,"y":50,"width":280,"height":220},
 		{"id":"f_agent","type":"file","file":"src/mini_deerflow/agent.py","x":800,"y":1050,"width":340,"height":140},
 		{"id":"f_tests","type":"file","file":"tests/test_thread_state.py","x":800,"y":1230,"width":340,"height":140},
@@ -52,8 +54,11 @@
 		{"id":"e_s4_d4","fromNode":"s4","fromSide":"right","toNode":"d4","toSide":"left"},
 		{"id":"e_s4_d5","fromNode":"s4","fromSide":"right","toNode":"d5","toSide":"left"},
 		{"id":"e_s4_d6","fromNode":"s4","fromSide":"right","toNode":"d6","toSide":"left"},
-{"id":"e_s5_d7","fromNode":"s5a","fromSide":"right","toNode":"d7","toSide":"left"},
-{"id":"e_s5b_d8","fromNode":"s5b","fromSide":"right","toNode":"d8","toSide":"left"},
-{"id":"e_s5b_s5c","fromNode":"s5b","fromSide":"right","toNode":"s5c","toSide":"left"}
+		{"id":"e_s5_d7","fromNode":"s5a","fromSide":"right","toNode":"d7","toSide":"left"},
+		{"id":"e_s5b_d8","fromNode":"s5b","fromSide":"right","toNode":"d8","toSide":"left"},
+		{"id":"e_s6a_d9","fromNode":"s6a","fromSide":"right","toNode":"d9","toSide":"left"},
+		{"id":"e_s5b_s5c","fromNode":"s5b","fromSide":"right","toNode":"s5c","toSide":"left"},
+		{"id":"e_s5a_s6a","fromNode":"s5a","fromSide":"right","toNode":"s6a","toSide":"bottom"},
+		{"id":"e_s6a_s5c","fromNode":"s6a","fromSide":"bottom","toNode":"s5c","toSide":"top"}
 	]
 }

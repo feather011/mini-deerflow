@@ -1,0 +1,413 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1790678690422,
+  "projectRoot": "d:\\项目解读\\Deerflow\\mini-deerflow",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "src",
+      "tests"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "data": {
+      "path": "data",
+      "purpose": "Data files",
+      "fileCount": 0,
+      "lastAccessed": 1790678690391,
+      "keyFiles": []
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 11,
+      "lastAccessed": 1790678690391,
+      "keyFiles": [
+        "agent-registry-migration.md",
+        "calculator-tool-registration.md",
+        "implementation-notes.md",
+        "serialization.md",
+        "sqlite-thread-store.md"
+      ]
+    },
+    "mini-deerflow": {
+      "path": "mini-deerflow",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1790678690392,
+      "keyFiles": [
+        "欢迎.md"
+      ]
+    },
+    "sandbox-workspace": {
+      "path": "sandbox-workspace",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1790678690392,
+      "keyFiles": []
+    },
+    "skills": {
+      "path": "skills",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1790678690393,
+      "keyFiles": []
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 0,
+      "lastAccessed": 1790678690393,
+      "keyFiles": []
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 42,
+      "lastAccessed": 1790678690393,
+      "keyFiles": [
+        "test_agent.py",
+        "test_agent_memory_context.py",
+        "test_agent_memory_processing.py",
+        "test_agent_sandbox_tools.py",
+        "test_agent_skill_context.py"
+      ]
+    },
+    "tests\\fixtures": {
+      "path": "tests\\fixtures",
+      "purpose": "Test fixtures",
+      "fileCount": 0,
+      "lastAccessed": 1790678690394,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/mini_deerflow/runtime.py",
+      "accessCount": 48,
+      "lastAccessed": 1790738872038,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_api_runs_stream_components.py",
+      "accessCount": 43,
+      "lastAccessed": 1790747326999,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_api_runs.py",
+      "accessCount": 29,
+      "lastAccessed": 1790738865903,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/subagent_executor.py",
+      "accessCount": 27,
+      "lastAccessed": 1790737173322,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_phase17_18_closing.py",
+      "accessCount": 20,
+      "lastAccessed": 1790696072261,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/middleware.py",
+      "accessCount": 14,
+      "lastAccessed": 1790738272526,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/services/event_broker.py",
+      "accessCount": 14,
+      "lastAccessed": 1790748137166,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/app.py",
+      "accessCount": 13,
+      "lastAccessed": 1790738734108,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/agent.py",
+      "accessCount": 11,
+      "lastAccessed": 1790737173562,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/services/run_stream.py",
+      "accessCount": 11,
+      "lastAccessed": 1790746500760,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_subagent_integration.py",
+      "accessCount": 9,
+      "lastAccessed": 1790695915874,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/services/agent_runs.py",
+      "accessCount": 9,
+      "lastAccessed": 1790738832910,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_api_lifespan.py",
+      "accessCount": 8,
+      "lastAccessed": 1790703806054,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/routes/runs.py",
+      "accessCount": 8,
+      "lastAccessed": 1790738840459,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_api_health.py",
+      "accessCount": 7,
+      "lastAccessed": 1790703121917,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/routes/runs_stream.py",
+      "accessCount": 6,
+      "lastAccessed": 1790741092652,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/skill_catalog.py",
+      "accessCount": 5,
+      "lastAccessed": 1790695486745,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/routes/threads.py",
+      "accessCount": 5,
+      "lastAccessed": 1790703720010,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/skill_registry.py",
+      "accessCount": 4,
+      "lastAccessed": 1790695498026,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/subagent_tools.py",
+      "accessCount": 4,
+      "lastAccessed": 1790695812482,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_subagent_executor.py",
+      "accessCount": 4,
+      "lastAccessed": 1790695828921,
+      "type": "file"
+    },
+    {
+      "path": "pyproject.toml",
+      "accessCount": 4,
+      "lastAccessed": 1790703510363,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/services/threads.py",
+      "accessCount": 4,
+      "lastAccessed": 1790706873982,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/cli.py",
+      "accessCount": 4,
+      "lastAccessed": 1790737310322,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/routes/health.py",
+      "accessCount": 3,
+      "lastAccessed": 1790703096116,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/middleware/run_event.py",
+      "accessCount": 3,
+      "lastAccessed": 1790738557244,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_api_runs_stream.py",
+      "accessCount": 3,
+      "lastAccessed": 1790739003514,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/config.py",
+      "accessCount": 2,
+      "lastAccessed": 1790701953740,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/thread_state.py",
+      "accessCount": 2,
+      "lastAccessed": 1790703424712,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/models.py",
+      "accessCount": 2,
+      "lastAccessed": 1790703431635,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/schemas/threads.py",
+      "accessCount": 2,
+      "lastAccessed": 1790703714027,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 2,
+      "lastAccessed": 1790706889016,
+      "type": "directory"
+    },
+    {
+      "path": "src/mini_deerflow/api/dependencies.py",
+      "accessCount": 2,
+      "lastAccessed": 1790738704094,
+      "type": "file"
+    },
+    {
+      "path": "C:/Users/ffff1/AppData/Local/Temp/claude/d-------Deerflow-mini-deerflow/0f0f3b77-32ec-4922-8ba4-f57a53babdf2/tasks/buntjuo02.output",
+      "accessCount": 2,
+      "lastAccessed": 1790741572290,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_cli.py",
+      "accessCount": 1,
+      "lastAccessed": 1790681398139,
+      "type": "file"
+    },
+    {
+      "path": "C:/Users/ffff1/AppData/Local/Temp/claude/d-------Deerflow-mini-deerflow/0f0f3b77-32ec-4922-8ba4-f57a53babdf2/tasks/bkx8im9e9.output",
+      "accessCount": 1,
+      "lastAccessed": 1790681607090,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/subagent_models.py",
+      "accessCount": 1,
+      "lastAccessed": 1790682056502,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/tools.py",
+      "accessCount": 1,
+      "lastAccessed": 1790682182627,
+      "type": "file"
+    },
+    {
+      "path": "tests/debug_concurrent.py",
+      "accessCount": 1,
+      "lastAccessed": 1790696045421,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1790698029440,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api/routes/__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1790698030775,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/thread_store.py",
+      "accessCount": 1,
+      "lastAccessed": 1790703397022,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_api_threads.py",
+      "accessCount": 1,
+      "lastAccessed": 1790703622079,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/api",
+      "accessCount": 1,
+      "lastAccessed": 1790706874105,
+      "type": "directory"
+    },
+    {
+      "path": "src/mini_deerflow/api/schemas/runs.py",
+      "accessCount": 1,
+      "lastAccessed": 1790706925906,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow",
+      "accessCount": 1,
+      "lastAccessed": 1790737170003,
+      "type": "directory"
+    },
+    {
+      "path": "src/mini_deerflow/api/schemas/streaming.py",
+      "accessCount": 1,
+      "lastAccessed": 1790738314964,
+      "type": "file"
+    },
+    {
+      "path": "src/mini_deerflow/thread_run_coordinator.py",
+      "accessCount": 1,
+      "lastAccessed": 1790738790608,
+      "type": "file"
+    },
+    {
+      "path": "C:/Users/ffff1/AppData/Local/Temp/claude/d-------Deerflow-mini-deerflow/0f0f3b77-32ec-4922-8ba4-f57a53babdf2/tasks/bc29tp3zt.output",
+      "accessCount": 1,
+      "lastAccessed": 1790739244137,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

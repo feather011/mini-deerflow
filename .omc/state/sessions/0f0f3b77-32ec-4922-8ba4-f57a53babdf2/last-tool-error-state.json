@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"uv run pytest tests/test_api_runs_stream_components.py -v 2>&1\",\"timeout\":60000}",
+  "error": "Exit code 1\n============================= test session starts =============================\r\nplatform win32 -- Python 3.12.12, pytest-9.1.1, pluggy-1.6.0 -- D:\\��Ŀ���\\Deerflow\\mini-deerflow\\.venv\\Scripts\\python.exe\r\ncachedir: .pytest_cache\r\nrootdir: D:\\��Ŀ���\\Deerflow\\mini-deerflow\r\nconfigfile: pyproject.toml\r\nplugins: anyio-4.15.1\r\ncollecting ... collected 37 items\r\n\r\ntests/test_api_runs_stream_components.py::test_broker_terminal_publish_never_blocks_queue_size_1 PASSED [  2%]\r\ntests/test_api_r...",
+  "timestamp": "2026-09-30T04:20:20.889Z",
+  "retry_count": 1
+}

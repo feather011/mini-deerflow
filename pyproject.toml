@@ -4,12 +4,22 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.7.0",
+    "fastapi>=0.141.1",
+    "python-multipart>=0.0.19",
     "python-dotenv>=1.2.3",
+    "pyyaml>=6.0.3",
+    "uvicorn>=0.54.0",
 ]
 
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.0",
+]
 
 [project.scripts]
 mini-deerflow = "mini_deerflow.cli:main"

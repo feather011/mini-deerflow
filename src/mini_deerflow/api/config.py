@@ -1,0 +1,122 @@
+"""API 配置（19A 阶段，19F 扩展 CORS）。
+
+所有配置项支持环境变量覆盖。
+环境变量格式：MINI_DEERFLOW_<UPPER_NAME>
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+
+def _get_env(name: str, default: str | None) -> str | None:
+    return os.environ.get(f"MINI_DEERFLOW_{name}", default)
+
+
+def _get_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(f"MINI_DEERFLOW_{name}")
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"环境变量 MINI_DEERFLOW_{name} 必须为整数，当前值: {raw!r}"
+        )
+
+
+def _parse_cors_origins(raw: str | None) -> list[str] | None:
+    """解析逗号分隔的 Origin 列表。"""
+    if not raw:
+        return None
+    seen: set[str] = set()
+    result: list[str] = []
+    for origin in raw.split(","):
+        origin = origin.strip()
+        if not origin:
+            continue
+        if origin in seen:
+            continue
+        seen.add(origin)
+        result.append(origin)
+    if not result:
+        return None
+    return result
+
+
+# --------------------------------------------------------------------------- ApiSettings
+
+
+@dataclass(frozen=True)
+class ApiSettings:
+    title: str = "Mini DeerFlow API"
+    version: str = "0.1.0"
+    api_prefix: str = "/api"
+
+    # ---- CORS（19F）----
+    cors_origins: list[str] | None = None
+    """允许的 CORS Origin 列表。None = 不启用 CORS。"""
+    cors_allow_credentials: bool = False
+    """CORS 是否允许凭据。默认 False（安全默认值）。"""
+
+    # ---- Workspace 文件服务（19E）----
+    workspace_root: str | None = None
+    """Workspace 根目录。None = 使用临时目录（lifespan 内创建）。"""
+    max_upload_bytes: int = 10 * 1024 * 1024
+    """单次上传最大字节数。"""
+    max_list_entries: int = 1000
+    """文件列表最大条目数。"""
+
+    def __post_init__(self) -> None:
+        """从环境变量覆盖各字段。"""
+        # 使用 object.__setattr__ 因为 frozen=True
+        # CORS
+        env_origins = _get_env("CORS_ORIGINS", None)
+        if env_origins is not None:
+            parsed = _parse_cors_origins(env_origins)
+            if parsed is not None:
+                object.__setattr__(self, "cors_origins", parsed)
+        creds_raw = _get_env("CORS_ALLOW_CREDENTIALS", None)
+        if creds_raw is not None:
+            object.__setattr__(
+                self,
+                "cors_allow_credentials",
+                creds_raw.lower() in ("true", "1", "yes"),
+            )
+        # Workspace
+        env_ws = _get_env("WORKSPACE_ROOT", None)
+        if env_ws is not None:
+            object.__setattr__(self, "workspace_root", env_ws)
+        env_upload = _get_env("MAX_UPLOAD_BYTES", None)
+        if env_upload is not None:
+            object.__setattr__(self, "max_upload_bytes", int(env_upload))
+        env_list = _get_env("MAX_LIST_ENTRIES", None)
+        if env_list is not None:
+            object.__setattr__(self, "max_list_entries", int(env_list))
+        # 验证
+        if self.max_upload_bytes < 0:
+            raise ValueError(
+                f"max_upload_bytes 必须非负，当前值: {self.max_upload_bytes}"
+            )
+        if self.max_list_entries < 1:
+            raise ValueError(
+                f"max_list_entries 必须 >= 1，当前值: {self.max_list_entries}"
+            )
+        if self.api_prefix and not self.api_prefix.startswith("/"):
+            raise ValueError(
+                f"api_prefix 必须以 / 开头，当前值: {self.api_prefix!r}"
+            )
+        # CORS 去重（无论来源）
+        if self.cors_origins is not None:
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for origin in self.cors_origins:
+                if origin not in seen:
+                    seen.add(origin)
+                    deduped.append(origin)
+            object.__setattr__(self, "cors_origins", deduped)
+            for origin in deduped:
+                if not origin.startswith(("http://", "https://")):
+                    raise ValueError(
+                        f"CORS Origin 必须以 http:// 或 https:// 开头，当前值: {origin!r}"
+                    )

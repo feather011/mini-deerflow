@@ -1,0 +1,234 @@
+/* ThreadSidebar — 会话列表侧边栏 */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.sidebarHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+  flex-shrink: 0;
+}
+
+.sidebarTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary, #111827);
+  margin: 0;
+}
+
+.sidebarActions {
+  display: flex;
+  gap: 4px;
+}
+
+/* 按钮基础样式 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 6px;
+  background: var(--color-bg, #fff);
+  color: var(--color-text-secondary, #374151);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+  line-height: 1.5;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--color-bg-hover, #f9fafb);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btnPrimary {
+  background: var(--color-primary, #2563eb);
+  border-color: var(--color-primary, #2563eb);
+  color: #fff;
+}
+
+.btnPrimary:hover:not(:disabled) {
+  background: var(--color-primary-hover, #1d4ed8);
+}
+
+.btnDanger {
+  color: var(--color-danger, #dc2626);
+  border-color: transparent;
+  background: transparent;
+  padding: 4px 6px;
+  min-width: 28px;
+}
+
+.btnDanger:hover:not(:disabled) {
+  background: #fef2f2;
+}
+
+.btnDanger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 列表区域 */
+.list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.listItem {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.1s;
+  min-width: 0;
+}
+
+.listItem:hover {
+  background: var(--color-bg-hover, #f9fafb);
+}
+
+.listItemActive {
+  background: #eff6ff;
+  border-color: var(--color-primary, #2563eb);
+}
+
+.listItemActive .threadId {
+  color: var(--color-primary, #2563eb);
+}
+
+.threadId {
+  flex: 1;
+  font-size: 13px;
+  color: var(--color-text-secondary, #374151);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.itemActions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* 删除确认状态 */
+.confirmDelete {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.confirmText {
+  font-size: 12px;
+  color: var(--color-danger, #dc2626);
+  white-space: nowrap;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 空状态 */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  gap: 8px;
+  text-align: center;
+  flex: 1;
+}
+
+.emptyIcon {
+  font-size: 32px;
+  opacity: 0.4;
+}
+
+.emptyTitle {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text-primary, #111827);
+  margin: 0;
+}
+
+.emptyBody {
+  font-size: 12px;
+  color: var(--color-text-secondary, #374151);
+  margin: 0;
+  max-width: 200px;
+}
+
+/* Loading */
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 13px;
+  gap: 8px;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--color-border, #e5e7eb);
+  border-top-color: var(--color-primary, #2563eb);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 错误状态 */
+.error {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  margin: 8px;
+  border-radius: 6px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+}
+
+.errorMsg {
+  font-size: 13px;
+  color: var(--color-danger, #dc2626);
+  margin: 0;
+}
+
+.errorRequestId {
+  font-size: 11px;
+  color: #6b7280;
+  margin: 0;
+}

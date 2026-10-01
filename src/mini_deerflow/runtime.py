@@ -6,13 +6,20 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mini_deerflow.agent import Agent
+from mini_deerflow.api.middleware.run_event import RunEventMiddleware
+from mini_deerflow.api.services.event_broker import RunEventBroker
+from mini_deerflow.api.services.run_stream import RunStreamManager
 from mini_deerflow.middleware import (
     Budget,
     BudgetMiddleware,
@@ -35,8 +42,16 @@ from mini_deerflow.middleware import (
 from mini_deerflow.models import FakeModel, FinalAnswer, Message, Model, ToolCall
 from mini_deerflow.subagent_executor import SubagentBudget, SubagentManager
 from mini_deerflow.subagent_tools import create_subagent_tools
+from mini_deerflow.thread_run_coordinator import (
+    ThreadRunConflictError,
+    ThreadRunCoordinator,
+)
 from mini_deerflow.thread_store import ThreadStore
 from mini_deerflow.tools import ToolRegistry
+
+
+if TYPE_CHECKING:
+    from mini_deerflow.api.services.agent_runs import AgentRunService
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,6 +76,13 @@ class RuntimeConfig:
     # Retry
     retry_enabled: bool = False
     retry_max_attempts: int = 1
+    # SSE Stream（19D）
+    stream_max_workers: int = 8
+    stream_queue_maxsize: int = 1024
+    # Workspace File Service（19E）
+    workspace_root: str | None = None  # None = 临时目录
+    workspace_max_upload_bytes: int = 10 * 1024 * 1024
+    workspace_max_list_entries: int = 1000
 
 
 # =============================================================================
@@ -135,6 +157,7 @@ class IntegratedAgent:
         agent: Agent,
         config: RuntimeConfig,
         trace_sink: TraceSink | None = None,
+        extra_middlewares: list[Middleware] | None = None,
     ) -> None:
         self._agent = agent
         self._config = config
@@ -146,6 +169,8 @@ class IntegratedAgent:
         # 构建中间件列表
         if trace_sink:
             self._middlewares.append(TraceMiddleware(trace_sink))
+        if extra_middlewares:
+            self._middlewares.extend(extra_middlewares)
         self._middlewares.append(LoggingMiddleware())
 
     def _next_run_id(self) -> str:
@@ -153,12 +178,28 @@ class IntegratedAgent:
             self._run_id_counter += 1
             return f"run-{uuid.uuid4().hex[:8]}"
 
-    def run(self, thread_id: str, user_input: str) -> tuple[str, list[dict]]:
-        """执行 Agent，带 Middleware。"""
-        run_id = self._next_run_id()
+    def run(
+        self,
+        thread_id: str,
+        user_input: str,
+        run_id: str | None = None,
+    ) -> tuple[str, list[dict]]:
+        """执行 Agent，带 Middleware。
+
+        Args:
+            thread_id: 目标 Thread ID。
+            user_input: 用户输入文本。
+            run_id: 可选；调用方提供时原样使用（用于跨层 ID 贯通），
+                缺省时由本方法自动生成（向后兼容 CLI / 旧调用方）。
+
+        Returns:
+            (final_answer, trace_events) 元组。
+        """
+        # 唯一 ID 生成点：未指定时内部生成；指定时绝不二次生成。
+        effective_run_id = run_id if run_id else self._next_run_id()
 
         ctx = ExecutionContext(
-            run_id=run_id,
+            run_id=effective_run_id,
             thread_id=thread_id,
             operation=OperationType.AGENT_RUN,
             operation_name="agent_run",
@@ -180,22 +221,57 @@ class RuntimeContext:
     """运行时上下文。持有所有运行时组件。"""
     def __init__(
         self,
+        store: ThreadStore,
         agent: Agent,
         integrated_agent: IntegratedAgent,
         manager: SubagentManager | None,
         config: RuntimeConfig,
         trace_sink: TraceSink | None,
         lifecycle: LifecycleManager,
+        run_event_broker: RunEventBroker | None = None,
+        run_stream_manager: RunStreamManager | None = None,
+        run_event_middleware: RunEventMiddleware | None = None,
+        stream_executor: ThreadPoolExecutor | None = None,
+        agent_run_service: "AgentRunService | None" = None,
+        file_service: "WorkspaceFileService | None" = None,
     ) -> None:
+        self.store = store
         self.agent = agent
         self.integrated_agent = integrated_agent
         self.manager = manager
         self.config = config
         self.trace_sink = trace_sink
         self.lifecycle = lifecycle
+        self.thread_run_coordinator = ThreadRunCoordinator()
+        # 19D SSE Stream
+        self.run_event_broker = run_event_broker
+        self.run_stream_manager = run_stream_manager
+        self.run_event_middleware = run_event_middleware
+        self.stream_executor = stream_executor
+        self.agent_run_service = agent_run_service
+        # 19E Workspace File Service
+        self.file_service = file_service
+
+        # 注入 coordinator（构造期循环依赖，延后绑定）
+        if self.agent_run_service is not None:
+            self.agent_run_service._coordinator = self.thread_run_coordinator
+        if self.run_stream_manager is not None:
+            self.run_stream_manager._coordinator = self.thread_run_coordinator
 
     def shutdown(self) -> None:
-        """关闭所有资源。"""
+        """关闭所有资源；幂等，重复调用安全。
+
+        19D 关闭顺序：
+            1. coordinator.shutdown() — 清占用表；
+            2. run_stream_manager.shutdown() — executor 关闭 + broker.close()（投递哨兵）；
+            3. manager.shutdown()；
+            4. trace_sink.close()；
+            5. lifecycle.close_all()。
+        """
+        if hasattr(self, "thread_run_coordinator"):
+            self.thread_run_coordinator.shutdown()
+        if hasattr(self, "run_stream_manager") and self.run_stream_manager is not None:
+            self.run_stream_manager.shutdown()
         if self.manager:
             self.manager.shutdown()
         if self.trace_sink:
@@ -255,6 +331,11 @@ def create_runtime(
         registry.register_many(tools)
 
     # Agent（带 Middleware pipeline：Logging + Trace + Retry + Budget）
+    # 19D：额外注入 RunEventMiddleware（同一实例同时挂在 IntegratedAgent.pipeline，
+    #     共享 thread-local 栈关联 AGENT_RUN 与 MODEL_CALL/TOOL_CALL）。
+    run_event_broker = RunEventBroker(queue_maxsize=config.stream_queue_maxsize)
+    run_event_middleware = RunEventMiddleware(run_event_broker)
+
     pipeline_middlewares: list = []
     pipeline_middlewares.append(BudgetMiddleware(budget))
     if trace_sink:
@@ -266,6 +347,7 @@ def create_runtime(
                 retryable_types=(RuntimeError, ConnectionError),
             )
         ))
+    pipeline_middlewares.append(run_event_middleware)
     pipeline_middlewares.append(LoggingMiddleware())
     agent_pipeline = MiddlewarePipeline(pipeline_middlewares)
 
@@ -282,15 +364,64 @@ def create_runtime(
         agent=agent,
         config=config,
         trace_sink=trace_sink,
+        extra_middlewares=[run_event_middleware],
     )
 
+    # 19D：Stream Manager + 有界 Executor
+    # 延迟导入避免循环依赖（agent_runs → runtime.ThreadRunCoordinator）
+    from mini_deerflow.api.services.agent_runs import AgentRunService
+
+    stream_executor = ThreadPoolExecutor(
+        max_workers=config.stream_max_workers,
+        thread_name_prefix="run-stream",
+    )
+    # coordinator 由 RuntimeContext 构造；这里临时占位 None
+    agent_run_service = AgentRunService(
+        runner=integrated_agent.run,
+        store=store,
+        coordinator=None,  # type: ignore[arg-type]
+    )
+    run_stream_manager = RunStreamManager(
+        broker=run_event_broker,
+        agent_run_service=agent_run_service,
+        coordinator=None,  # type: ignore[arg-type]
+        executor=stream_executor,
+    )
+
+    # 19E：Workspace File Service
+    from mini_deerflow.api.services.workspace_file import WorkspaceFileService
+    from mini_deerflow.sandbox_path import WorkspacePathResolver
+
+    if config.workspace_root:
+        ws_root = Path(config.workspace_root)
+        ws_root.mkdir(parents=True, exist_ok=True)
+        is_temp = False
+    else:
+        ws_root = Path(tempfile.mkdtemp(prefix="mdf_ws_"))
+        is_temp = True
+
+    resolver = WorkspacePathResolver(ws_root)
+    file_service = WorkspaceFileService(
+        resolver=resolver,
+        max_upload_bytes=config.workspace_max_upload_bytes,
+        max_list_entries=config.workspace_max_list_entries,
+    )
+    lifecycle.register(_WorkspaceCleanup(ws_root, is_temp))
+
     return RuntimeContext(
+        store=store,
         agent=agent,
         integrated_agent=integrated_agent,
         manager=manager,
         config=config,
         trace_sink=trace_sink,
         lifecycle=lifecycle,
+        run_event_broker=run_event_broker,
+        run_stream_manager=run_stream_manager,
+        run_event_middleware=run_event_middleware,
+        stream_executor=stream_executor,
+        agent_run_service=agent_run_service,
+        file_service=file_service,
     )
 
 
@@ -304,3 +435,21 @@ class _TraceSinkResource:
 
     def close(self) -> None:
         self._sink.close()
+
+
+class _WorkspaceCleanup:
+    """临时 Workspace 目录的清理器。"""
+    def __init__(self, root: Path, is_temp: bool) -> None:
+        self._root = root
+        self._is_temp = is_temp
+
+    def start(self) -> None:
+        pass
+
+    def close(self) -> None:
+        import shutil
+        if self._is_temp and self._root.exists():
+            try:
+                shutil.rmtree(self._root)
+            except OSError:
+                pass

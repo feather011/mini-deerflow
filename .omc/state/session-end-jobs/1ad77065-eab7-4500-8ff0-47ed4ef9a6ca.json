@@ -1,0 +1,266 @@
+{
+  "version": 1,
+  "jobId": "7faef9c8-5383-4dcc-8b3d-becc87cff961",
+  "sessionId": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+  "scopeKey": "39ac4461c9e5760021e41af265c4db23ed0c0e43870afbab1aa3f0a7d1c90be4",
+  "revision": 7,
+  "createdAt": "2026-09-29T09:56:02.752Z",
+  "updatedAt": "2026-09-29T11:27:39.889Z",
+  "producerGraceExpiresAt": "2026-09-29T09:56:32.753Z",
+  "bestEffortDeadlineAt": "2026-09-29T09:57:23.753Z",
+  "producers": {
+    "core": {
+      "state": "no-op",
+      "intentKey": "fe829055b0062f86f1b80e62ba88c685de6a727b8a562f9a3ba546725d573ae6",
+      "payloadDigest": "fe829055b0062f86f1b80e62ba88c685de6a727b8a562f9a3ba546725d573ae6",
+      "sealedAt": "2026-09-29T11:27:39.889Z",
+      "sealedBy": "recovery"
+    },
+    "wiki": {
+      "state": "no-op",
+      "sealedAt": "2026-09-29T11:27:39.889Z",
+      "sealedBy": "recovery"
+    }
+  },
+  "actions": {
+    "foreground-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "0a2f00343ace02593fe77a76bdc3621c483169e0b5f7c81a8794d14373e549a8",
+      "payload": {
+        "transcriptPath": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+        "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+        "reason": "prompt_input_exit",
+        "input": {
+          "session_id": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+          "transcript_path": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+          "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+          "prompt_id": "a4ac89ff-25cb-4ebb-82ee-34703b410d69",
+          "hook_event_name": "SessionEnd",
+          "reason": "prompt_input_exit"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {}
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-deadline-expired"
+    },
+    "wiki-capture": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "27c12b54664795cb49916a52e14f633ee100d23d7d306b034c0f7ec9ae34dad4",
+      "payload": {
+        "transcriptPath": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+        "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+        "reason": "prompt_input_exit",
+        "input": {
+          "session_id": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+          "transcript_path": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+          "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+          "prompt_id": "a4ac89ff-25cb-4ebb-82ee-34703b410d69",
+          "hook_event_name": "SessionEnd",
+          "reason": "prompt_input_exit"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 0,
+          "outcomeCode": "required-deadline-expired"
+        }
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-core-producer-unavailable"
+    },
+    "team-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "5186f710ed60542a962cd3eb1d8c5f468f3ebb51b114fbd10dfde3657c156418",
+      "payload": {
+        "transcriptPath": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+        "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+        "reason": "prompt_input_exit",
+        "input": {
+          "session_id": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+          "transcript_path": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+          "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+          "prompt_id": "a4ac89ff-25cb-4ebb-82ee-34703b410d69",
+          "hook_event_name": "SessionEnd",
+          "reason": "prompt_input_exit"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 0,
+          "outcomeCode": "required-deadline-expired"
+        }
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-core-producer-unavailable"
+    },
+    "python-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "5afffab61a484e3804011f92af992362531a9d7505789d316b79dc58c35f59d2",
+      "payload": {
+        "transcriptPath": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+        "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+        "reason": "prompt_input_exit",
+        "input": {
+          "session_id": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+          "transcript_path": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+          "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+          "prompt_id": "a4ac89ff-25cb-4ebb-82ee-34703b410d69",
+          "hook_event_name": "SessionEnd",
+          "reason": "prompt_input_exit"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 0,
+          "outcomeCode": "required-deadline-expired"
+        }
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-core-producer-unavailable"
+    },
+    "reply-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "7ae7a5e2ba3df39e7a2a45bacd538690cef4141233749d4421e271043c9512dd",
+      "payload": {
+        "transcriptPath": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+        "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+        "reason": "prompt_input_exit",
+        "input": {
+          "session_id": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+          "transcript_path": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+          "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+          "prompt_id": "a4ac89ff-25cb-4ebb-82ee-34703b410d69",
+          "hook_event_name": "SessionEnd",
+          "reason": "prompt_input_exit"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 0,
+          "outcomeCode": "required-deadline-expired"
+        }
+      },
+      "budgetMs": 9000,
+      "lastOutcomeCode": "required-core-producer-unavailable"
+    },
+    "callback": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "7151b87a9e7a743c731a978836fdb2c39fbb93db050bd60aa26fe1110b1ce04e",
+      "payload": {
+        "transcriptPath": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+        "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+        "reason": "prompt_input_exit",
+        "input": {
+          "session_id": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+          "transcript_path": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+          "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+          "prompt_id": "a4ac89ff-25cb-4ebb-82ee-34703b410d69",
+          "hook_event_name": "SessionEnd",
+          "reason": "prompt_input_exit"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 0,
+          "outcomeCode": "required-deadline-expired"
+        }
+      },
+      "budgetMs": 2000,
+      "lastOutcomeCode": "best-effort-core-producer-unavailable"
+    },
+    "notification": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "2e0bc59e0daed4eb52d04493fc421b8947d9dadccf3369b1c765755c60f654ea",
+      "payload": {
+        "transcriptPath": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+        "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+        "reason": "prompt_input_exit",
+        "input": {
+          "session_id": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+          "transcript_path": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+          "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+          "prompt_id": "a4ac89ff-25cb-4ebb-82ee-34703b410d69",
+          "hook_event_name": "SessionEnd",
+          "reason": "prompt_input_exit"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 0,
+          "outcomeCode": "required-deadline-expired"
+        }
+      },
+      "budgetMs": 2000,
+      "lastOutcomeCode": "best-effort-core-producer-unavailable"
+    },
+    "openclaw": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "expired",
+      "attempts": 0,
+      "idempotencyKey": "372b468b34b69d0ef0b7c59a99829622218e87d7f159fadf21be3e9090614aab",
+      "payload": {
+        "transcriptPath": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+        "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+        "reason": "prompt_input_exit",
+        "input": {
+          "session_id": "1ad77065-eab7-4500-8ff0-47ed4ef9a6ca",
+          "transcript_path": "C:\\Users\\ffff1\\.claude\\projects\\D-------Deerflow-mini-deerflow\\1ad77065-eab7-4500-8ff0-47ed4ef9a6ca.jsonl",
+          "cwd": "D:\\项目解读\\Deerflow\\mini-deerflow",
+          "prompt_id": "a4ac89ff-25cb-4ebb-82ee-34703b410d69",
+          "hook_event_name": "SessionEnd",
+          "reason": "prompt_input_exit"
+        },
+        "initialTeamNames": [],
+        "openClawRouting": {},
+        "terminalization": {
+          "reason": "foreground-cleanup-exhausted",
+          "attempts": 0,
+          "outcomeCode": "required-deadline-expired"
+        }
+      },
+      "budgetMs": 2000,
+      "lastOutcomeCode": "best-effort-core-producer-unavailable"
+    }
+  },
+  "owner": null,
+  "phase": "complete",
+  "recoverableFailure": {
+    "reason": "actions-settled",
+    "releasedAt": "2026-09-29T11:27:39.876Z",
+    "ownerNonce": "05501019-c1a1-4367-a72a-80b854db56cc"
+  },
+  "completion": {
+    "completedAt": "2026-09-29T11:27:39.889Z",
+    "terminalDigest": "4d5aae2120e1f18a10b9fc7376c036cb96f4634680e4bac3b281c07972e83e07",
+    "terminalRevision": 7
+  }
+}
