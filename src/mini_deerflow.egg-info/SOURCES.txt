@@ -1,7 +1,13 @@
 pyproject.toml
 src/mini_deerflow/__init__.py
 src/mini_deerflow/agent.py
+src/mini_deerflow/anthropic_compat_model.py
 src/mini_deerflow/cli.py
+src/mini_deerflow/mcp_adapter.py
+src/mini_deerflow/mcp_bridge.py
+src/mini_deerflow/mcp_config.py
+src/mini_deerflow/mcp_errors.py
+src/mini_deerflow/mcp_manager.py
 src/mini_deerflow/memory.py
 src/mini_deerflow/memory_context.py
 src/mini_deerflow/memory_dedup.py
@@ -10,6 +16,9 @@ src/mini_deerflow/memory_manager.py
 src/mini_deerflow/memory_store_sqlite.py
 src/mini_deerflow/middleware.py
 src/mini_deerflow/mimo_smoke_test.py
+src/mini_deerflow/model_config.py
+src/mini_deerflow/model_errors.py
+src/mini_deerflow/model_factory.py
 src/mini_deerflow/models.py
 src/mini_deerflow/runtime.py
 src/mini_deerflow/sandbox_cli.py
@@ -43,6 +52,8 @@ src/mini_deerflow/api/__init__.py
 src/mini_deerflow/api/app.py
 src/mini_deerflow/api/config.py
 src/mini_deerflow/api/dependencies.py
+src/mini_deerflow/api/middleware/__init__.py
+src/mini_deerflow/api/middleware/request_id.py
 src/mini_deerflow/api/middleware/run_event.py
 src/mini_deerflow/api/routes/__init__.py
 src/mini_deerflow/api/routes/files.py
@@ -51,6 +62,7 @@ src/mini_deerflow/api/routes/runs.py
 src/mini_deerflow/api/routes/runs_stream.py
 src/mini_deerflow/api/routes/threads.py
 src/mini_deerflow/api/schemas/__init__.py
+src/mini_deerflow/api/schemas/errors.py
 src/mini_deerflow/api/schemas/files.py
 src/mini_deerflow/api/schemas/runs.py
 src/mini_deerflow/api/schemas/streaming.py
@@ -66,6 +78,9 @@ tests/test_agent_memory_context.py
 tests/test_agent_memory_processing.py
 tests/test_agent_sandbox_tools.py
 tests/test_agent_skill_context.py
+tests/test_anthropic_compat_model.py
+tests/test_api_e2e.py
+tests/test_api_errors.py
 tests/test_api_files.py
 tests/test_api_health.py
 tests/test_api_lifespan.py
@@ -87,7 +102,11 @@ tests/test_memory_store.py
 tests/test_memory_store_sqlite.py
 tests/test_memory_update.py
 tests/test_middleware.py
+tests/test_model_config.py
+tests/test_model_factory.py
 tests/test_phase17_18_closing.py
+tests/test_phase21b_events.py
+tests/test_phase23_persistence.py
 tests/test_sandbox_cli.py
 tests/test_sandbox_command.py
 tests/test_sandbox_docker.py
@@ -109,5 +128,6 @@ tests/test_subagent_models.py
 tests/test_thread_state.py
 tests/test_thread_store.py
 tests/test_thread_store_sqlite.py
+tests/test_tool_loop_21b.py
 tests/test_tool_registry.py
 tests/test_tools.py

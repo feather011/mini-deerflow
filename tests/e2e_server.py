@@ -57,10 +57,12 @@ class SlowFakeModel:
         self._base = base
         self._delay = delay_seconds
 
-    def decide(self, messages: list[Message]) -> ToolCall | FinalAnswer:
+    def decide(self, messages: list[Message], tools=None) -> ToolCall | FinalAnswer:
         if self._delay > 0:
             time.sleep(self._delay)
-        return self._base.decide(messages)
+        # 必须把 tools 继续转发：包装器若丢弃，模型将看不到任何可调用工具描述，
+        # Agent 的工具循环会在 E2E 里静默失效（FakeModel 自身忽略 tools，不受影响）。
+        return self._base.decide(messages, tools)
 
 
 def _resolve_workspace() -> Path:
@@ -101,11 +103,19 @@ def build_e2e_app(workspace: Path | None = None, delay_seconds: float | None = N
     seed_artifact(root)
     delay = _model_delay_seconds() if delay_seconds is None else delay_seconds
 
-    # Vite dev server 默认 5173；测试并发时可能落到 5174+，故放行一段区间
+    # Vite 端口由 E2E_FRONTEND_PORT 控制（Playwright 用同一个变量启动 vite）。
+    # 这里必须跟着它走：原先硬编码 5173–5179 区间，一旦换端口跑 E2E，
+    # 全部请求会被 CORS 拦下，18 个用例会同时"莫名其妙"失败。
+    # 保留默认区间，使多份 E2E 并行执行时互不冲突。
+    ports: set[int] = set(range(5173, 5180))
+    raw_port = os.environ.get("E2E_FRONTEND_PORT", "").strip()
+    if raw_port.isdigit():
+        ports.add(int(raw_port))
+
     vite_origins = [
         f"http://{host}:{p}"
         for host in ("localhost", "127.0.0.1")
-        for p in range(5173, 5180)
+        for p in sorted(ports)
     ]
 
     settings = ApiSettings(

@@ -74,8 +74,8 @@ export function readDownload(downloadPath: string): Buffer {
   return fs.readFileSync(downloadPath)
 }
 
-/** 后端地址（与 playwright.config.ts webServer 保持一致）。 */
-export const BACKEND_URL = 'http://127.0.0.1:8000'
+/** 后端地址（与 playwright.config.ts webServer 保持一致，端口可由环境变量覆盖）。 */
+export const BACKEND_URL = `http://127.0.0.1:${process.env.E2E_BACKEND_PORT ?? 8000}`
 
 /** 预置 Artifact 的内容（与 tests/e2e_server.py ARTIFACT_CONTENT 一致）。 */
 export const ARTIFACT_CONTENT = 'mini-deerflow-20f-e2e-artifact\n'

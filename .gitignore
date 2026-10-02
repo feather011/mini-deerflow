@@ -1,4 +1,8 @@
+# 本地凭据：任何 .env 变体都不入库（.env.example 除外，它不含真实 Key）
 .env
+.env.*
+!.env.example
+
 __pycache__/
 *.pyc
 *.egg-info/

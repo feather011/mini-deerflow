@@ -1,0 +1,38 @@
+# ============================================================
+# MCP smoke 测试覆盖层（Phase 22/23 验收专用）
+#
+# **本文件不单独使用**，必须叠在主 Compose 之上：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+#
+# 为什么单独拆出来：
+#   主 docker-compose.yml 是正常部署面，只应出现具名卷；
+#   `./tests/fixtures` 是**测试资源**，挂进生产 Compose 会让部署层与
+#   测试层耦合——运维照着主文件部署时会多出一个无关的宿主挂载。
+#   拆开后：`docker compose up -d` 永远看不到测试资源。
+#
+# 本覆盖层只做两件事（对 services.api 追加，不改动其它任何配置）：
+#   1. 把 tests/fixtures 只读挂到 /mcp/fixtures
+#   2. 设置 MINI_DEERFLOW_MCP_CONFIG 指向其中的 mcp.smoke.json
+#
+# 注意：**必须加 MSYS_NO_PATHCONV=1**（Git Bash 会把 /mcp/... 改写成
+# C:/Program Files/Git/mcp/...，导致容器内找不到配置文件）：
+#
+#   MSYS_NO_PATHCONV=1 docker compose -f docker-compose.yml \
+#       -f docker-compose.test.yml up -d
+#
+# 关闭时用同样两个 -f 执行 down，保证识别同一个 project：
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml down
+# ============================================================
+
+services:
+  api:
+    environment:
+      # 指向下面挂进来的测试配置；MCP 是 required=false，失败也只跳过不拖垮启动
+      MINI_DEERFLOW_MCP_CONFIG: /mcp/fixtures/mcp.smoke.json
+
+    volumes:
+      # 本地确定性测试 MCP Server（echo / add / failing_tool / wait），
+      # **只读**；刻意用 bind mount 而不是 COPY 进镜像——测试服务器
+      # 不该出现在生产镜像里。
+      - ./tests/fixtures:/mcp/fixtures:ro

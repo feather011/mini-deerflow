@@ -1,0 +1,31 @@
+# ============================================================
+# 前端构建上下文排除（Phase 23）
+# 构建上下文根目录就是 frontend/，所以这里写相对路径即可。
+# ============================================================
+
+# --- 凭据 ---
+.env
+.env.*
+!.env.example
+
+# --- 依赖与产物：这些由 Dockerfile 内的 npm ci / vite build 重新生成 ---
+node_modules
+dist
+
+# --- 测试产物 ---
+test-results
+playwright-report
+blob-report
+coverage
+.vite
+.tsbuildinfo
+*.tsbuildinfo
+
+# --- 版本控制与缓存 ---
+.git
+.github
+
+# --- 杂项 ---
+*.log
+.e2e.artifacts
+e2e/.artifacts

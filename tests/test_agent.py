@@ -22,14 +22,14 @@ from mini_deerflow.tools import (
 class AlwaysToolCallModel:
     """总是返回工具调用的模型，用于测试 max_steps 限制。"""
 
-    def decide(self, messages: list[Message]) -> ToolCall:
+    def decide(self, messages: list[Message], tools=None) -> ToolCall:
         return ToolCall(name="calculator", arguments={"expression": "1 + 1"})
 
 
 class UnknownToolModel:
     """返回未知工具名的模型。"""
 
-    def decide(self, messages: list[Message]) -> ToolCall:
+    def decide(self, messages: list[Message], tools=None) -> ToolCall:
         return ToolCall(name="hack", arguments={"expression": "x"})
 
 
@@ -40,7 +40,7 @@ class ScriptedModel:
         self._decisions = list(decisions)
         self.calls: list[list[Message]] = []
 
-    def decide(self, messages: list[Message]) -> FinalAnswer | ToolCall:
+    def decide(self, messages: list[Message], tools=None) -> FinalAnswer | ToolCall:
         self.calls.append(list(messages))
         return self._decisions.pop(0)
 
@@ -123,24 +123,33 @@ class TestAgentThreadStoreIntegration(unittest.TestCase):
             agent.run("missing", "你好")
 
     def test_messages_saved_on_success(self):
-        """成功运行后 Thread 中应保存 user/tool/assistant"""
+        """成功运行后 Thread 只保存 user 与最终 assistant。
+
+        中间工具往返（assistant tool_use + tool 结果）只存在于本轮
+        working_messages / Trace / SSE，**不进 ThreadState**——否则会留下
+        没有配对 tool_use 的孤儿 tool_result，污染下一轮模型请求。
+        """
         store = _store_with_default()
         agent = Agent(model=FakeModel(), registry=create_default_registry(), store=store)
         agent.run("default", "计算 1 + 1")
         snapshot = store.get("default").snapshot()
         roles = [m.role for m in snapshot]
-        self.assertEqual(roles, ["user", "tool", "assistant"])
+        self.assertEqual(roles, ["user", "assistant"])
 
     def test_message_order(self):
-        """消息顺序应严格按 user→tool→assistant"""
+        """消息顺序应严格按 user→assistant（工具结果只进 Trace）"""
         store = _store_with_default()
         agent = Agent(model=FakeModel(), registry=create_default_registry(), store=store)
-        agent.run("default", "计算 1 + 1")
+        answer, trace = agent.run("default", "计算 1 + 1")
         snapshot = store.get("default").snapshot()
         self.assertEqual(snapshot[0].content, "计算 1 + 1")
-        self.assertEqual(snapshot[1].role, "tool")
-        self.assertEqual(snapshot[2].role, "assistant")
-        self.assertEqual(snapshot[2].content, "计算结果: 2")
+        self.assertEqual(snapshot[1].role, "assistant")
+        self.assertEqual(snapshot[1].content, "计算结果: 2")
+        # 工具结果没有丢：它在 Trace 里
+        self.assertEqual(answer, "计算结果: 2")
+        tool_entries = [t for t in trace if t.get("action") == "tool_call"]
+        self.assertEqual(len(tool_entries), 1)
+        self.assertEqual(tool_entries[0]["detail"]["result"], "2")
 
     def test_second_run_reads_first_history(self):
         """第二次运行应能读取第一次的历史"""
@@ -150,9 +159,10 @@ class TestAgentThreadStoreIntegration(unittest.TestCase):
         agent.run("default", "你好")
         snapshot = store.get("default").snapshot()
         roles = [m.role for m in snapshot]
-        self.assertEqual(roles, ["user", "tool", "assistant", "user", "assistant"])
+        self.assertEqual(roles, ["user", "assistant", "user", "assistant"])
         self.assertEqual(snapshot[0].content, "计算 1 + 1")
-        self.assertEqual(snapshot[3].content, "你好")
+        # 工具结果不再落库，第二次 user 输入的下标由 3 前移到 2
+        self.assertEqual(snapshot[2].content, "你好")
 
     def test_two_threads_isolated(self):
         """两个 Thread 的历史互相隔离"""
@@ -166,8 +176,8 @@ class TestAgentThreadStoreIntegration(unittest.TestCase):
         b_msgs = store.get("b").snapshot()
         self.assertEqual(a_msgs[0].content, "计算 1 + 1")
         self.assertEqual(b_msgs[0].content, "计算 2 + 3")
-        self.assertEqual(len(a_msgs), 3)
-        self.assertEqual(len(b_msgs), 3)
+        self.assertEqual(len(a_msgs), 2)
+        self.assertEqual(len(b_msgs), 2)
 
     def test_unknown_tool_no_partial_write(self):
         """未知工具时 Thread 不改变"""
@@ -192,7 +202,7 @@ class TestAgentThreadStoreIntegration(unittest.TestCase):
         ))
 
         class BoomModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 return ToolCall(name="boom", arguments={})
 
         store = _store_with_default()
@@ -233,13 +243,14 @@ class TestAgentThreadStoreIntegration(unittest.TestCase):
         agent = Agent(model=scripted, registry=create_default_registry(), store=store)
         agent.run("default", "计算 2 + 3")
 
-        # 第二次：模型应看到 上一轮的 user/tool/assistant + 本轮 user
+        # 第二次：模型应看到 上一轮的 user/assistant + 本轮 user
+        # （工具往返已随本轮结束丢弃，不会作为孤立 tool_result 传下去）
         second_scripted = ScriptedModel([FinalAnswer(content="收到历史了")])
         agent2 = Agent(model=second_scripted, registry=create_default_registry(), store=store)
         agent2.run("default", "再来一次")
         last_call = second_scripted.calls[0]
         roles = [m.role for m in last_call]
-        self.assertEqual(roles, ["user", "tool", "assistant", "user"])
+        self.assertEqual(roles, ["user", "assistant", "user"])
 
 
 if __name__ == "__main__":

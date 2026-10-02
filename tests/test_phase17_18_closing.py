@@ -53,7 +53,7 @@ class _CountingBlockingModel:
         self.released = threading.Event()
         _CountingBlockingModel.instances.append(self)
 
-    def decide(self, messages):
+    def decide(self, messages, tools=None):
         self.decide_calls += 1
         self.released.wait(timeout=5)
         return FinalAnswer(content="done")
@@ -257,7 +257,7 @@ class TestMiddlewareInAgentRealPath(unittest.TestCase):
         class FailOnceModel:
             def __init__(self):
                 self.call_count = 0
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 self.call_count += 1
                 if self.call_count == 1:
                     raise ConnectionError("temp network")
@@ -466,7 +466,7 @@ class _ScriptedModel:
     def __init__(self, decisions):
         self._queue = deque(decisions)
 
-    def decide(self, messages):
+    def decide(self, messages, tools=None):
         return self._queue.popleft()
 
 
@@ -493,7 +493,7 @@ class TestBudgetAtomicConsume(unittest.TestCase):
         class AlwaysFailModel:
             def __init__(self):
                 self.call_count = 0
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 self.call_count += 1
                 raise ConnectionError(f"fail-{self.call_count}")
 
@@ -574,7 +574,7 @@ class TestBudgetAtomicConsume(unittest.TestCase):
             def __init__(self, n_calls: int):
                 self._n_calls = n_calls
                 self.calls = 0
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 self.calls += 1
                 if self.calls < self._n_calls:
                     return ToolCall(name="noop", arguments={})

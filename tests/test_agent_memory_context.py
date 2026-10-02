@@ -33,7 +33,7 @@ class RecordingModel:
         self._decisions = list(decisions)
         self.calls: list[list[Message]] = []
 
-    def decide(self, messages: list[Message]) -> FinalAnswer | ToolCall:
+    def decide(self, messages: list[Message], tools=None) -> FinalAnswer | ToolCall:
         self.calls.append(list(messages))
         return self._decisions.pop(0)
 
@@ -225,9 +225,14 @@ class TestAgentContextIntegration(unittest.TestCase):
         second_call = model.calls[1]
         self.assertEqual(second_call[0].role, "system")
         self.assertEqual(second_call[0].content, "上下文")
-        # 第二次应该包含 tool response
-        self.assertEqual(second_call[-2].role, "user")
+
+        # 第二次应包含工具往返：… user 输入 → assistant(tool_use) → tool 结果
+        # （21B 起 Agent 会把模型发出的 tool_call 还原成 assistant 消息，
+        #   否则下一轮无法重建 tool_use/tool_result 配对）
+        self.assertEqual(second_call[-3].role, "user")
+        self.assertEqual(second_call[-2].role, "assistant")
         self.assertEqual(second_call[-1].role, "tool")
+        self.assertEqual(second_call[-1].content, "2")
 
 
 class TestAgentContextCallCount(unittest.TestCase):

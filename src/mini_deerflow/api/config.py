@@ -67,6 +67,10 @@ class ApiSettings:
     max_list_entries: int = 1000
     """文件列表最大条目数。"""
 
+    # ---- Thread 持久化（23）----
+    db_path: str | None = None
+    """SQLite 数据库路径。None = 内存 ThreadStore（开发/测试默认，重启即失）。"""
+
     def __post_init__(self) -> None:
         """从环境变量覆盖各字段。"""
         # 使用 object.__setattr__ 因为 frozen=True
@@ -93,6 +97,10 @@ class ApiSettings:
         env_list = _get_env("MAX_LIST_ENTRIES", None)
         if env_list is not None:
             object.__setattr__(self, "max_list_entries", int(env_list))
+        # Thread 持久化：未设置或空白 → 保持内存实现（默认行为不变）
+        env_db = _get_env("DB_PATH", None)
+        if env_db is not None and env_db.strip():
+            object.__setattr__(self, "db_path", env_db.strip())
         # 验证
         if self.max_upload_bytes < 0:
             raise ValueError(

@@ -7,6 +7,8 @@ import operator as op
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from mini_deerflow.models import ToolSpec
+
 # ast 节点 → 安全运算符映射
 _BINOPS: dict[type[ast.BinOp], op] = {
     ast.Add: op.add,
@@ -78,7 +80,65 @@ class ToolExecutionError(ToolRegistryError):
     """handler 执行出错时抛出，原异常保存在 __cause__。"""
 
 
+class ToolNotAllowedError(ToolRegistryError):
+    """工具不在允许清单内时抛出（Subagent `allowed_tools` 运行时强制）。
+
+    与 `ToolNotFoundError` 的区别很重要：
+    - `ToolNotFoundError` = 注册表里**没有**这个工具（名字压根不存在）
+    - `ToolNotAllowedError` = 注册表里**有**，但当前子任务没有权限调用
+
+    两者分开，日志与前端才能区分「模型叫错了名字」和「越权调用」。
+    """
+
+
 ToolHandler = Callable[[dict[str, object]], str]
+
+# 允许清单的两种取值语义（贯穿暴露限制与执行限制两层）：
+#   None → 不设限制，沿用调用方传入的注册表（既有默认策略）
+#   frozenset() → 空白名单，**任何工具都不允许**
+ToolAllowList = frozenset[str] | None
+
+
+def build_allow_list(allowed_tools: tuple[str, ...] | None) -> ToolAllowList:
+    """把 `SubagentContextPolicy.allowed_tools` 归一成内部判定期望的形态。
+
+    `None` 与 `[]` 必须**刻意区分**：前者是"不设限制"，后者是"全部禁止"。
+    用 `None` / `frozenset()` 承载，避免把"空列表"误判成"不过滤"。
+    """
+    if allowed_tools is None:
+        return None
+    return frozenset(allowed_tools)
+
+
+def filter_tool_specs(
+    specs: Sequence[ToolSpec],
+    allowed: ToolAllowList,
+) -> list[ToolSpec]:
+    """第一道防线（**暴露限制**）：只把允许的工具描述交给模型。
+
+    模型看不到的工具，正常情况下就不会被选中。但这只是降低概率——
+    模型可能凭上下文里出现过的名字"凭记忆"伪造调用，
+    所以还需要第二道防线 `ensure_tool_allowed()`。
+    """
+    if allowed is None:
+        return list(specs)
+    return [spec for spec in specs if spec.name in allowed]
+
+
+def ensure_tool_allowed(name: str, allowed: ToolAllowList) -> None:
+    """第二道防线（**执行限制**）：执行前再校验一次工具名。
+
+    与第一道防线构成纵深防御：
+    - 暴露限制挡的是"模型本不该知道有这个工具"
+    - 执行限制挡的是"模型编造了一个未授权的工具名"
+
+    任一层单独存在都不够——只做暴露限制，伪造名字即可绕过；
+    只做执行限制，模型仍会浪费轮次去猜不存在的工具。
+    """
+    if allowed is None:
+        return
+    if name not in allowed:
+        raise ToolNotAllowedError(f"工具不在允许清单内: {name}")
 
 
 @dataclass(frozen=True)
@@ -93,6 +153,18 @@ class Tool:
     def execute(self, arguments: dict[str, object]) -> str:
         """调用 handler 执行工具。"""
         return self.handler(arguments)
+
+    def to_spec(self) -> ToolSpec:
+        """生成面向模型的纯数据描述。
+
+        这是「可执行 Tool」与「给模型看的 ToolSpec」的唯一转换点：
+        handler 不会离开注册表，供应商适配层拿到的只有 name/description/input_schema。
+        """
+        return ToolSpec(
+            name=self.name,
+            description=self.description,
+            input_schema=dict(self.parameters),
+        )
 
 
 class ToolRegistry:
@@ -153,6 +225,14 @@ class ToolRegistry:
     def list_tools(self) -> list[Tool]:
         """按名称排序返回所有工具。"""
         return [self._tools[name] for name in sorted(self._tools)]
+
+    def tool_specs(self) -> list[ToolSpec]:
+        """按名称排序返回工具描述（provider-neutral，供 Agent 传给 Model）。
+
+        与 `list_tools()` 的区别：这里不暴露 handler，
+        调用方无法从中执行任何东西。
+        """
+        return [tool.to_spec() for tool in self.list_tools()]
 
 
 CALCULATOR_TOOL = Tool(

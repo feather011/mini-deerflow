@@ -16,6 +16,8 @@ from mini_deerflow.memory_extractor import RuleBasedMemoryExtractor
 from mini_deerflow.memory_manager import MemoryManager
 from mini_deerflow.memory_store_sqlite import SQLiteMemoryStore
 from mini_deerflow.models import FakeModel
+from mini_deerflow.mcp_config import load_mcp_config
+from mini_deerflow.model_config import load_model_settings
 from mini_deerflow.skill_catalog import SkillCatalog, SkillNotFoundError
 from mini_deerflow.skill_context import SkillContextBuilder
 from mini_deerflow.skill_loader import ProgressiveSkillLoader
@@ -400,9 +402,14 @@ def run_cli(
         memory_processor = memory_manager
 
     # 始终走 IntegratedAgent（即使没启用 Subagent）
+    # model_settings 走统一 Model Factory（21A）：默认 fake，选 minimax 时
+    # 缺 Key 会在 create_model 内 fail-closed 抛错，不静默降级。
     config = RuntimeConfig(
         subagent_enabled=False,
         trace_enabled=trace_enabled,
+        model_settings=load_model_settings(),
+        # 22：未配置 MINI_DEERFLOW_MCP_CONFIG 时返回 [] → 不启动任何 MCP
+        mcp_servers=load_mcp_config(),
     )
     ctx_runtime = create_runtime(
         store=thread_store,

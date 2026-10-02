@@ -33,8 +33,10 @@ from mini_deerflow.api.schemas.errors import (
     build_error_response,
     safe_message,
 )
+from mini_deerflow.mcp_config import load_mcp_config
+from mini_deerflow.model_config import load_model_settings
 from mini_deerflow.runtime import RuntimeConfig, create_runtime
-from mini_deerflow.thread_store import InMemoryThreadStore
+from mini_deerflow.thread_store import InMemoryThreadStore, SQLiteThreadStore
 from mini_deerflow.tools import create_default_registry
 
 
@@ -44,26 +46,52 @@ _LOGGER = logging.getLogger(__name__)
 RuntimeFactory = Callable[[], "RuntimeContext"]
 
 
-def _default_runtime_factory() -> "RuntimeContext":
+def _build_store(settings: ApiSettings):
+    """按配置选择 ThreadStore（23 生产持久化）。
+
+    - `MINI_DEERFLOW_DB_PATH` 未设置 → 内存实现（默认行为不变，测试零副作用）
+    - 设置了 → SQLite 持久化，容器/本机重启后 Thread 与消息仍在
+
+    放在 lifespan 内的工厂里执行，因此 `create_app()` 与模块 import
+    阶段既不建数据库文件也不碰文件系统。
+    """
+    if not settings.db_path:
+        return InMemoryThreadStore()
+    from pathlib import Path
+
+    # SQLite 不会自动建父目录；卷挂载点之外的路径要自己保证存在
+    Path(settings.db_path).expanduser().resolve().parent.mkdir(
+        parents=True, exist_ok=True
+    )
+    _LOGGER.info("ThreadStore = SQLite (%s)", settings.db_path)
+    return SQLiteThreadStore(settings.db_path)
+
+
+def _default_runtime_factory(
+    settings: ApiSettings | None = None,
+) -> "RuntimeContext":
     # 与 CLI 一致注入默认工具（create_default_registry）。
     # 裸 ToolRegistry() 是空表，会导致任何 ToolCall 都以 ToolNotFoundError 失败。
+    #
+    # model_settings 在此处（lifespan 内）才读取环境：create_app() 与 import
+    # 阶段既不读配置也不创建客户端，更不发网络请求。
+    resolved = settings or ApiSettings()
     return create_runtime(
-        store=InMemoryThreadStore(),
+        store=_build_store(resolved),
         registry=create_default_registry(),
-        config=RuntimeConfig(),
+        config=RuntimeConfig(
+            workspace_root=resolved.workspace_root,
+            workspace_max_upload_bytes=resolved.max_upload_bytes,
+            workspace_max_list_entries=resolved.max_list_entries,
+            model_settings=load_model_settings(),
+            # 22：未配置 MINI_DEERFLOW_MCP_CONFIG 时返回 [] → 不启动任何 MCP
+            mcp_servers=load_mcp_config(),
+        ),
     )
 
 
 def _settings_runtime_factory(settings: ApiSettings) -> "RuntimeContext":
-    return create_runtime(
-        store=InMemoryThreadStore(),
-        registry=create_default_registry(),
-        config=RuntimeConfig(
-            workspace_root=settings.workspace_root,
-            workspace_max_upload_bytes=settings.max_upload_bytes,
-            workspace_max_list_entries=settings.max_list_entries,
-        ),
-    )
+    return _default_runtime_factory(settings)
 
 
 def _build_factory(

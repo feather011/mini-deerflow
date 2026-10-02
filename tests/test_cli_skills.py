@@ -275,7 +275,7 @@ class TestHandleCommandSkills(unittest.TestCase):
         call_count = 0
 
         class CountingModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 nonlocal call_count
                 call_count += 1
                 return FakeModel().decide(messages)

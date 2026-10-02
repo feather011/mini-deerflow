@@ -1,0 +1,113 @@
+# ============================================================
+# Mini DeerFlow 生产 Compose（Phase 23）
+#
+# 定位：**单机私有 MVP**。不是公网多用户系统——无认证、无多租户、
+# 无分布式锁。默认端口只绑定 127.0.0.1，禁止在没有反向代理 + 认证的
+# 情况下直接暴露公网（详见 docs/deployment.md）。
+#
+# 服务：
+#   api  后端 FastAPI（非 root，SQLite + workspace 落在命名卷）
+#   web  nginx 静态站点 + /api 同源反代（非 root，8080）
+#
+# 数据：
+#   api-data      → /data       SQLite 数据库
+#   api-workspace → /workspace  上传文件与产物
+#
+# 凭据：
+#   .env 只在**运行时**通过 env_file 注入，永不进镜像。
+#   未提供 .env 时 MINI_DEERFLOW_MODEL_PROVIDER 缺省为 fake（离线）。
+#
+# 部署层与测试层分离：
+#   正常运行  docker compose up -d
+#   MCP smoke docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+#   本文件**不挂载任何仓库内宿主目录**（tests/ 等测试资源一律在
+#   docker-compose.test.yml 里），保证生产 Compose 的挂载面只有具名卷。
+# ============================================================
+
+name: mini-deerflow
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mini-deerflow-api:0.1.0
+    container_name: mini-deerflow-api
+
+    # 运行时注入：本地 .env 若存在则提供模型凭据；不存在也不影响启动。
+    # 路径可用 MINI_DEERFLOW_ENV_FILE 覆盖 —— 部署验收时指向只含
+    # provider=fake 的文件，保证自动化验收**不消耗真实额度**。
+    env_file:
+      - path: ${MINI_DEERFLOW_ENV_FILE:-.env}
+        required: false
+
+    environment:
+      # 生产数据一律写挂载卷，容器重建后仍然存在
+      MINI_DEERFLOW_DB_PATH: /data/mini-deerflow.db
+      MINI_DEERFLOW_WORKSPACE_ROOT: /workspace
+      # MCP（22）**默认关闭**：主文件连 MINI_DEERFLOW_MCP_CONFIG 都不设置，
+      # load_mcp_config() 读不到变量 → 返回 [] → 不建事件循环桥、不拉子进程。
+      # 需要真接 MCP 时由部署者自己的 .env 提供配置文件路径；
+      # 只是想跑 MCP smoke 请用 docker-compose.test.yml（见文件头）。
+      # 上传上限与列表上限用代码默认值即可；如需调整在此覆盖
+      # MINI_DEERFLOW_MAX_UPLOAD_BYTES: "10485760"
+
+    # 只绑定本机 127.0.0.1：无认证时不给局域网/公网任何入口。
+    # 宿主机端口可用 MINI_DEERFLOW_API_PORT 覆盖（默认 8000），
+    # 便于本机已有服务占用 8000 时并行验收。主机 IP 刻意写死在前面，
+    # 不做变量 —— 否则一个环境变量就能把它改成 0.0.0.0 对外暴露。
+    ports:
+      - "127.0.0.1:${MINI_DEERFLOW_API_PORT:-8000}:8000"
+
+    volumes:
+      - api-data:/data
+      - api-workspace:/workspace
+      # **只有**具名卷。这里刻意不挂任何仓库内的宿主目录：
+      # tests/ 之类的测试资源属于测试层，不该出现在正常部署的 Compose 里。
+
+    healthcheck:
+      # 镜像内只有 python，用标准库探活，避免为一个探针再装 curl
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import sys, urllib.request;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).status == 200 else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+    # 优雅退出：给 uvicorn 足够时间结束在跑的 run 与关闭 SQLite
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: mini-deerflow-web:0.1.0
+    container_name: mini-deerflow-web
+
+    ports:
+      - "127.0.0.1:${MINI_DEERFLOW_WEB_PORT:-8080}:8080"
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+volumes:
+  # 具名卷：docker compose down（不带 -v）不会删除，重启后数据仍在
+  api-data:
+  api-workspace:

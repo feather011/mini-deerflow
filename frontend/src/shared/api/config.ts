@@ -13,9 +13,16 @@
  */
 
 function normalizeBaseUrl(raw: string | undefined): string {
-  const fallback = 'http://127.0.0.1:8000'
-  const base = raw?.trim() || fallback
-  return base.replace(/\/$/, '')
+  // 未设置 → 开发环境回退到本机后端（.env.local 缺失时也能跑 dev server）
+  if (raw === undefined) {
+    return 'http://127.0.0.1:8000'
+  }
+  // 显式设置（含空串、"/"）→ 按同源处理：调用方传的路径**本身已带 /api 前缀**
+  // （如 apiGet('/api/health')），base 必须留空，最终拼出 /api/health。
+  //
+  // 切勿把生产 base 设成 '/api'：那样会拼成 /api/api/health，
+  // 后端没有这个路由 → 全部 404 → 页面白屏（实测踩过）。
+  return raw.trim().replace(/\/$/, '')
 }
 
 // Vite 环境变量通过 import.meta.env 访问

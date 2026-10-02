@@ -68,7 +68,10 @@ class SubagentContextPolicy:
     include_memory: bool = False
     include_skill_context: bool = False
     include_system_instruction: bool = False
-    # 工具白名单：None 表示仅基础工具（calculator），空 list 表示无工具
+    # 工具白名单（**运行时强制**，见 tools.build_allow_list / ensure_tool_allowed）：
+    #   None   → 不设限制，沿用提交时传入的注册表（既有默认策略）
+    #   []     → 空白名单，**任何工具都不允许**
+    #   [...]  → 只允许列出的工具；本地工具、mcp__* 工具、子代理工具一视同仁
     allowed_tools: tuple[str, ...] | None = None
     # 最大子任务深度（相对于此任务）
     max_child_depth: int = 0

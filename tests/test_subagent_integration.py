@@ -30,7 +30,7 @@ class ScriptedModel:
         self._queue = deque(decisions)
         self.received = []
 
-    def decide(self, messages):
+    def decide(self, messages, tools=None):
         self.received.append(list(messages))
         return self._queue.popleft()
 
@@ -93,7 +93,7 @@ class TestSubagentRealIntegration(unittest.TestCase):
         # 直接使用 manager.submit 传递工作模型
         from mini_deerflow.models import FinalAnswer
         class WorkingModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 return FinalAnswer(content="result")
 
         task = manager.submit(
@@ -112,7 +112,7 @@ class TestSubagentRealIntegration(unittest.TestCase):
         lock = threading.Lock()
 
         class TimingModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 with lock:
                     start_times.append(time.monotonic())
                 time.sleep(0.2)
@@ -147,7 +147,7 @@ class TestSubagentRealIntegration(unittest.TestCase):
 
         # 模型会检查取消信号
         class CancellableModel:
-            def decide(self, m):
+            def decide(self, m, tools=None):
                 return FinalAnswer(content="done")
 
         task = manager.submit(
@@ -227,7 +227,7 @@ class TestSubagentRealIntegration(unittest.TestCase):
         manager = self._make_manager()
 
         class SlowModel:
-            def decide(self, m):
+            def decide(self, m, tools=None):
                 time.sleep(0.5)
                 return FinalAnswer(content="slow")
 

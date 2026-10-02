@@ -9,6 +9,7 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "pyyaml>=6.0.3",
     "uvicorn>=0.54.0",
+    "mcp>=2.2.0",
 ]
 
 [build-system]
@@ -18,8 +19,14 @@ build-backend = "setuptools.build_meta"
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
+    "psutil>=7.2.2",
     "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+# 只收集 tests/：src 下的 *_test.py（如 mimo_smoke_test）是显式执行的
+# 真实联网 smoke，不进入默认测试套件。
+testpaths = ["tests"]
 
 [project.scripts]
 mini-deerflow = "mini_deerflow.cli:main"

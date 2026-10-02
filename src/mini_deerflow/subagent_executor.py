@@ -29,7 +29,13 @@ from mini_deerflow.subagent_models import (
 )
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import InMemoryThreadStore, ThreadStore
-from mini_deerflow.tools import Tool, ToolRegistry
+from mini_deerflow.tools import (
+    Tool,
+    ToolRegistry,
+    build_allow_list,
+    ensure_tool_allowed,
+    filter_tool_specs,
+)
 
 
 # --- Budget ---
@@ -112,7 +118,8 @@ class SubagentRunner:
                 self.budget,
             )
 
-            # 使用 budget-aware agent
+            # 使用 budget-aware agent；把 context_policy 里的工具白名单一并传下去，
+            # 让 allowed_tools 在**运行时**真正生效（而不是只做序列化存取）。
             actual_agent = _BudgetAwareAgent(
                 model=wrapped_model,
                 registry=self.registry,
@@ -121,6 +128,11 @@ class SubagentRunner:
                 budget=self.budget,
                 cancellation_token=self.cancellation_token,
                 timeout_seconds=self.task.timeout_seconds,
+                allowed_tools=(
+                    self.task.context_policy.allowed_tools
+                    if self.task.context_policy is not None
+                    else None
+                ),
             )
 
             # 检查取消（在开始前）
@@ -208,7 +220,7 @@ class _CancellableModel:
         self._token = token
         self._budget = budget
 
-    def decide(self, messages: list[Message]) -> ToolCall | FinalAnswer:
+    def decide(self, messages: list[Message], tools=None) -> ToolCall | FinalAnswer:
         if self._token.is_cancelled():
             raise _CancelledError()
         # 在真正发起 model 调用前原子消费额度
@@ -216,7 +228,9 @@ class _CancellableModel:
             self._budget.consume_model_call()
         except BudgetExceededError as e:
             raise _BudgetExhaustedError(str(e)) from e
-        return self._model.decide(messages)
+        # 必须把工具描述继续往下传：包装器若丢掉 tools，子代理的模型
+        # 就看不到任何可调用工具，Agent 的工具循环会在子代理里静默失效。
+        return self._model.decide(messages, tools)
 
 
 class _BudgetAwareAgent:
@@ -232,6 +246,7 @@ class _BudgetAwareAgent:
         budget: SubagentBudget,
         cancellation_token: CancellationToken,
         timeout_seconds: float | None = None,
+        allowed_tools: tuple[str, ...] | None = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -241,6 +256,9 @@ class _BudgetAwareAgent:
         self._budget = budget
         self._token = cancellation_token
         self._deadline: float | None = time.monotonic() + timeout_seconds if timeout_seconds else None
+        # 工具白名单（SubagentContextPolicy.allowed_tools 的运行时形态）。
+        # None = 不设限制（沿用传入的注册表）；frozenset() = 空白名单，全部禁止。
+        self._allowed = build_allow_list(allowed_tools)
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
@@ -256,6 +274,15 @@ class _BudgetAwareAgent:
         working_messages.append(user_message)
         pending.append(user_message)
 
+        # 21B：与主 Agent 同构——只把工具的**纯数据描述**交给模型，
+        # 注册表（含 handler）留在本地执行。缺了它，真实模型在子代理里
+        # 将看不到任何可调用工具，工具循环直接失效。
+        #
+        # 纵深防御第一层（暴露限制）：allowed_tools 之外的工具**根本不给模型看**。
+        # 本地工具、mcp__* 工具、子代理工具一视同仁——这里按名字过滤，
+        # 不区分来源，因此三类工具同时受限。
+        model_tools = filter_tool_specs(self._registry.tool_specs(), self._allowed)
+
         for step in range(1, self._max_steps + 1):
             # 取消检查
             if self._token.is_cancelled():
@@ -269,7 +296,7 @@ class _BudgetAwareAgent:
                 raise _BudgetExhaustedError(str(e)) from e
 
             model_messages = list(working_messages)
-            decision = self._model.decide(model_messages)
+            decision = self._model.decide(model_messages, model_tools)
 
             if isinstance(decision, FinalAnswer):
                 assistant_message = Message(role="assistant", content=decision.content)
@@ -285,10 +312,29 @@ class _BudgetAwareAgent:
                 except BudgetExceededError as e:
                     raise _BudgetExhaustedError(str(e)) from e
 
+                # 21B：与主 Agent 一致——先落 tool_use（带 call_id），
+                # 再落紧邻的 tool 结果，供下一轮 decide() 按 call_id 配对还原。
+                # 落库的 tool 消息不带 id，持久化形状与 21B 之前一致。
+                working_messages.append(Message(
+                    role="assistant",
+                    content=f"调用工具 {decision.name}，参数: {decision.arguments}",
+                    tool_call_id=decision.id,
+                    tool_name=decision.name,
+                    tool_arguments=dict(decision.arguments),
+                ))
+
+                # 纵深防御第二层（执行限制）：模型可能凭上下文里的名字
+                # "凭记忆"伪造一个未授权工具（暴露限制挡不住这种情况），
+                # 所以执行前必须再校验一次，越权直接抛 ToolNotAllowedError。
+                ensure_tool_allowed(decision.name, self._allowed)
+
                 result = self._registry.execute(decision.name, decision.arguments)
-                tool_message = Message(role="tool", content=result)
-                working_messages.append(tool_message)
-                pending.append(tool_message)
+                # 与主 Agent 一致：工具往返只留在 working_messages（本轮喂模型），
+                # **不写入 pending**——Thread 只提交 user 与最终 assistant，
+                # 避免落库一条没有配对 tool_use 的孤儿 tool_result。
+                working_messages.append(
+                    Message(role="tool", content=result, tool_call_id=decision.id)
+                )
 
         raise RuntimeError(f"Subagent 在 {self._max_steps} 步内未完成")
 

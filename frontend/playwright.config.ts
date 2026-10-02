@@ -11,8 +11,11 @@
  */
 import { defineConfig, devices } from '@playwright/test'
 
-const BACKEND_PORT = 8000
-const FRONTEND_PORT = 5173
+// 端口可用环境变量覆盖：开发机上常有 uvicorn :8000 / vite :5173 在跑，
+// 这里 reuseExistingServer 是 false，撞端口会直接起不来。
+// 换一组端口即可并行执行；不设置时与既有默认值完全一致。
+const BACKEND_PORT = Number(process.env.E2E_BACKEND_PORT ?? 8000)
+const FRONTEND_PORT = Number(process.env.E2E_FRONTEND_PORT ?? 5173)
 
 export default defineConfig({
   testDir: './e2e',
@@ -53,7 +56,8 @@ export default defineConfig({
       stderr: 'pipe',
     },
     {
-      command: 'npm run dev',
+      // --port 必须显式传：vite 默认占用 5173，撞上已在跑的 dev server 会失败
+      command: `npm run dev -- --port ${FRONTEND_PORT}`,
       cwd: '.',
       url: `http://localhost:${FRONTEND_PORT}`,
       reuseExistingServer: false,

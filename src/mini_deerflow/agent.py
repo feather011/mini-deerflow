@@ -103,6 +103,10 @@ class Agent:
         working_messages.append(user_message)
         pending.append(user_message)
 
+        # 21B：本轮可用工具的**纯数据描述**。注册表整体不外传——
+        # Tool 带 handler（可执行对象），交给模型适配层等于把可执行能力泄漏到传输层。
+        model_tools = self._registry.tool_specs()
+
         trace: list[dict] = []
 
         for step in range(1, self._max_steps + 1):
@@ -122,11 +126,15 @@ class Agent:
                 operation_name="model_decide",
                 budget=self._budget,
             )
-            def _do_model_call(_msgs=model_messages) -> ToolCall | FinalAnswer:
+            def _do_model_call(
+                _msgs=model_messages,
+                _tools=model_tools,
+            ) -> ToolCall | FinalAnswer:
                 # 真正发起调用前原子消费额度（成功/失败/Retry 每次都计）
                 if self._budget is not None:
                     self._budget.consume_model_call()
-                return self._model.decide(_msgs)
+                # 每轮都把当前允许的工具描述传下去，供应商适配层据此翻译成自己的 tools
+                return self._model.decide(_msgs, _tools)
             decision = self._run_via_pipeline(model_ctx, _do_model_call)
 
             if isinstance(decision, FinalAnswer):
@@ -148,11 +156,29 @@ class Agent:
                 return decision.content, trace
 
             if isinstance(decision, ToolCall):
+                tool_description = (
+                    f"调用工具 {decision.name}，参数: {decision.arguments}"
+                )
                 trace.append({
                     "step": step,
                     "action": "model_decision",
-                    "detail": f"调用工具 {decision.name}，参数: {decision.arguments}",
+                    "detail": tool_description,
                 })
+
+                # 21B：先把模型发出的 tool_use 还原成一条 assistant 消息，
+                # 与下面的 tool 结果**按 call_id 配对**。缺了这条，本轮
+                # decide() 无法重建 tool_use/tool_result，供应商会拒收该请求。
+                #
+                # **只进 working_messages**（本轮喂给模型）：pending（落库）
+                # 只保留 user 与最终 assistant，工具往返不进 ThreadState，
+                # 详见下方 tool 结果处的注释。
+                working_messages.append(Message(
+                    role="assistant",
+                    content=tool_description,
+                    tool_call_id=decision.id,
+                    tool_name=decision.name,
+                    tool_arguments=dict(decision.arguments),
+                ))
 
                 # Tool call：通过 middleware_pipeline 包装（含 budget 检查/记录）
                 tool_ctx = ExecutionContext(
@@ -177,9 +203,16 @@ class Agent:
                     "detail": {"name": decision.name, "args": decision.arguments, "result": result},
                 })
 
-                tool_message = Message(role="tool", content=result)
-                working_messages.append(tool_message)
-                pending.append(tool_message)
+                # 喂给模型的这条带 call_id，与上面的 assistant tool_use 配对。
+                #
+                # **不写入 pending**：Thread 只提交 user 与最终 assistant。
+                # 中间 tool 消息若单独落库（不带 call_id），会成为一条
+                # "孤儿 tool_result"——下一轮 working_messages 里没有与之配对的
+                # tool_use，供应商会拒收该轮请求。工具往返只保留在
+                # working_messages（本轮喂给模型）、Trace 与 SSE 事件里。
+                working_messages.append(
+                    Message(role="tool", content=result, tool_call_id=decision.id)
+                )
 
         raise RuntimeError(f"Agent 在 {self._max_steps} 步内未完成")
 

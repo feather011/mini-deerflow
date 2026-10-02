@@ -28,7 +28,7 @@ class CountingModel:
     def __init__(self) -> None:
         self.call_count = 0
 
-    def decide(self, messages: list[Message]) -> ToolCall | FinalAnswer:
+    def decide(self, messages: list[Message], tools=None) -> ToolCall | FinalAnswer:
         self.call_count += 1
         latest = messages[-1]
         if latest.role == "user":
@@ -41,7 +41,7 @@ class TwoStepModel:
     def __init__(self) -> None:
         self.calls = 0
 
-    def decide(self, messages: list[Message]) -> ToolCall | FinalAnswer:
+    def decide(self, messages: list[Message], tools=None) -> ToolCall | FinalAnswer:
         self.calls += 1
         if self.calls == 1:
             return FinalAnswer(content="step-1")
@@ -54,7 +54,7 @@ class ScriptedModel:
         self._queue: deque[FinalAnswer | ToolCall] = deque(decisions)
         self.received: list[list[Message]] = []
 
-    def decide(self, messages: list[Message]) -> ToolCall | FinalAnswer:
+    def decide(self, messages: list[Message], tools=None) -> ToolCall | FinalAnswer:
         self.received.append(list(messages))
         return self._queue.popleft()
 
@@ -190,7 +190,7 @@ class TestSubagentManagerConcurrency(unittest.TestCase):
         start_gate = threading.Event()
 
         class CountingModel:
-            def decide(self, m):
+            def decide(self, m, tools=None):
                 with lock:
                     running_count[0] += 1
                     max_seen[0] = max(max_seen[0], running_count[0])
@@ -227,7 +227,7 @@ class TestSubagentManagerConcurrency(unittest.TestCase):
 
         class SlowStartModel:
             """启动慢的模型"""
-            def decide(self, m):
+            def decide(self, m, tools=None):
                 start.wait(timeout=5)
                 return FinalAnswer(content="done")
 
@@ -287,7 +287,7 @@ class TestSubagentManagerConcurrency(unittest.TestCase):
         from mini_deerflow.models import FinalAnswer
 
         class QuickModel:
-            def decide(self, m):
+            def decide(self, m, tools=None):
                 return FinalAnswer(content="quick")
 
         # timeout=1 秒，足够完成任务
@@ -311,7 +311,7 @@ class TestSubagentManagerConcurrency(unittest.TestCase):
 
         class CountingModel:
             """每次 decide 都会被检查取消"""
-            def decide(self, m):
+            def decide(self, m, tools=None):
                 call_count[0] += 1
                 # 在第二次调用时返回（第一次在循环入口检查，第二次也在）
                 if call_count[0] >= 2:
@@ -368,7 +368,7 @@ class TestSubagentCollect(unittest.TestCase):
 
     def test_collect_wait(self):
         class DelayedModel:
-            def decide(self, m):
+            def decide(self, m, tools=None):
                 time.sleep(0.3)
                 return FinalAnswer(content="delayed")
 

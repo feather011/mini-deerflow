@@ -78,7 +78,7 @@ class RecordingModel:
         self._decisions = list(decisions)
         self.calls: list[list[Message]] = []
 
-    def decide(self, messages: list[Message]) -> FinalAnswer | ToolCall:
+    def decide(self, messages: list[Message], tools=None) -> FinalAnswer | ToolCall:
         self.calls.append(list(messages))
         return self._decisions.pop(0)
 
@@ -320,7 +320,7 @@ class TestAgentMemoryProcessingNotCalled(unittest.TestCase):
         store = _store_with_default()
 
         class UnknownToolModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 return ToolCall(name="hack", arguments={})
 
         agent = Agent(
@@ -349,7 +349,7 @@ class TestAgentMemoryProcessingNotCalled(unittest.TestCase):
         ))
 
         class BoomModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 return ToolCall(name="boom", arguments={})
 
         agent = Agent(
@@ -365,7 +365,7 @@ class TestAgentMemoryProcessingNotCalled(unittest.TestCase):
         """max_steps 时不调用。"""
 
         class AlwaysToolModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 return ToolCall(name="calculator", arguments={"expression": "1+1"})
 
         store = _store_with_default()
@@ -386,7 +386,7 @@ class TestAgentMemoryProcessingNotCalled(unittest.TestCase):
         """Model 异常时不调用。"""
 
         class FailingModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 raise RuntimeError("模型失败")
 
         store = _store_with_default()

@@ -39,7 +39,11 @@ from mini_deerflow.middleware import (
     TraceMiddleware,
     TraceSink,
 )
-from mini_deerflow.models import FakeModel, FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.mcp_config import MCPServerConfig
+from mini_deerflow.mcp_manager import MCPClientManager
+from mini_deerflow.model_config import ModelSettings
+from mini_deerflow.model_factory import create_model
+from mini_deerflow.models import FinalAnswer, Message, Model, ToolCall
 from mini_deerflow.subagent_executor import SubagentBudget, SubagentManager
 from mini_deerflow.subagent_tools import create_subagent_tools
 from mini_deerflow.thread_run_coordinator import (
@@ -83,6 +87,14 @@ class RuntimeConfig:
     workspace_root: str | None = None  # None = 临时目录
     workspace_max_upload_bytes: int = 10 * 1024 * 1024
     workspace_max_list_entries: int = 1000
+    # Model Provider（21A）
+    # 默认 ModelSettings() 即 provider="fake"，因此既有测试与本地开发
+    # 不读环境、不联网；CLI/FastAPI 会显式传入 load_model_settings()。
+    model_settings: ModelSettings = field(default_factory=ModelSettings)
+    # MCP 服务器（22）
+    # 默认空列表 = **不启用 MCP**（不连任何子进程、不建事件循环桥）。
+    # 由配置文件显式列出后才会启动，不存在"默认偷偷拉起外部进程"。
+    mcp_servers: list[MCPServerConfig] = field(default_factory=list)
 
 
 # =============================================================================
@@ -234,6 +246,7 @@ class RuntimeContext:
         stream_executor: ThreadPoolExecutor | None = None,
         agent_run_service: "AgentRunService | None" = None,
         file_service: "WorkspaceFileService | None" = None,
+        mcp_manager: MCPClientManager | None = None,
     ) -> None:
         self.store = store
         self.agent = agent
@@ -251,6 +264,8 @@ class RuntimeContext:
         self.agent_run_service = agent_run_service
         # 19E Workspace File Service
         self.file_service = file_service
+        # 22 MCP 客户端管理器（未启用时为 None 或空配置的管理器）
+        self.mcp_manager = mcp_manager
 
         # 注入 coordinator（构造期循环依赖，延后绑定）
         if self.agent_run_service is not None:
@@ -267,16 +282,33 @@ class RuntimeContext:
             3. manager.shutdown()；
             4. trace_sink.close()；
             5. lifecycle.close_all()。
+            6. store.close()（23）— SQLite 连接收尾；内存实现无此方法则跳过。
         """
         if hasattr(self, "thread_run_coordinator"):
             self.thread_run_coordinator.shutdown()
         if hasattr(self, "run_stream_manager") and self.run_stream_manager is not None:
             self.run_stream_manager.shutdown()
+        # 22：先关 MCP（它持有外部子进程与事件循环桥），再关本进程内的其他资源。
+        # 顺序反了会让 MCP 的收尾协程没有可用的桥去执行。
+        mcp = getattr(self, "mcp_manager", None)
+        if mcp is not None:
+            try:
+                mcp.stop()
+            except Exception:
+                _LOGGER.warning("MCP 关闭失败", exc_info=True)
         if self.manager:
             self.manager.shutdown()
         if self.trace_sink:
             self.trace_sink.close()
         self.lifecycle.close_all()
+        # 23：SQLite ThreadStore 必须显式关闭，否则容器停止时可能留下未 flush 的写入。
+        # 用 getattr 而不是直接调用：测试会构造不含 store 的 RuntimeContext。
+        close_store = getattr(getattr(self, "store", None), "close", None)
+        if callable(close_store):
+            try:
+                close_store()
+            except Exception:
+                _LOGGER.warning("ThreadStore 关闭失败", exc_info=True)
 
 
 def create_runtime(
@@ -351,8 +383,19 @@ def create_runtime(
     pipeline_middlewares.append(LoggingMiddleware())
     agent_pipeline = MiddlewarePipeline(pipeline_middlewares)
 
+    # 22：MCP 工具在 Agent 构造前注册进 registry。
+    # registry 就地变更、Agent 持有同一引用，因此先启动 MCP 再建 Agent 最直观。
+    # mcp_servers 为空（默认）时 start() 直接返回 0，不会创建任何子进程或线程。
+    mcp_manager = MCPClientManager(config.mcp_servers)
+    if config.mcp_servers:
+        # required 服务器失败会在这里 fail-closed 抛 MCPStartupError；
+        # start() 内部已自行清理事件循环桥与子进程，不留半开状态。
+        mcp_manager.start(registry)
+
     agent = Agent(
-        model=model or FakeModel(),
+        # 显式传入的 model 优先（测试注入 FakeModel 等）；
+        # 否则走统一 Model Factory，由 config.model_settings 决定 provider。
+        model=model or create_model(config.model_settings),
         registry=registry,
         store=store,
         max_steps=10,
@@ -422,6 +465,7 @@ def create_runtime(
         stream_executor=stream_executor,
         agent_run_service=agent_run_service,
         file_service=file_service,
+        mcp_manager=mcp_manager,
     )
 
 

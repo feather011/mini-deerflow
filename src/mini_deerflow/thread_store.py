@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -98,19 +99,33 @@ class InMemoryThreadStore:
 
 
 class SQLiteThreadStore:
-    """基于 SQLite 的 ThreadStore 实现：线程状态以 JSON 形式持久化到数据库。"""
+    """基于 SQLite 的 ThreadStore 实现：线程状态以 JSON 形式持久化到数据库。
+
+    线程安全（23）：FastAPI 的同步路由跑在线程池里，**同一个连接会被多个
+    线程使用**，而 sqlite3 默认 `check_same_thread=True` 会直接抛
+    `SQLite objects created in a thread can only be used in that same thread`。
+    因此这里同时做两件事：
+
+    - `check_same_thread=False`：允许跨线程使用（否则 API 侧根本跑不起来）
+    - `self._lock`：跨线程共用一个连接必须串行，否则并发写会
+      `database is locked` 或写坏状态
+
+    CLI 是单线程的，加锁对它没有额外开销（RLock 未争用时就是一次 CAS）。
+    """
 
     def __init__(self, database_path: str | Path) -> None:
         self._path = Path(database_path)
         self._closed = False
-        self._conn = sqlite3.connect(self._path)
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS threads ("
-            "  thread_id TEXT PRIMARY KEY,"
-            "  state_json TEXT NOT NULL"
-            ")"
-        )
-        self._conn.commit()
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        with self._lock:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS threads ("
+                "  thread_id TEXT PRIMARY KEY,"
+                "  state_json TEXT NOT NULL"
+                ")"
+            )
+            self._conn.commit()
 
     def __enter__(self) -> "SQLiteThreadStore":
         return self
@@ -120,9 +135,10 @@ class SQLiteThreadStore:
 
     def close(self) -> None:
         """关闭数据库连接；重复调用安全无副作用。"""
-        if not self._closed:
-            self._conn.close()
-            self._closed = True
+        with self._lock:
+            if not self._closed:
+                self._conn.close()
+                self._closed = True
 
     def _ensure_open(self) -> None:
         """操作前检查连接；已关闭时抛出清晰错误。"""
@@ -171,24 +187,26 @@ class SQLiteThreadStore:
 
     def create(self, thread_id: str) -> ThreadState:
         """创建新 Thread；重复 ID 抛出 ThreadAlreadyExistsError。"""
-        self._ensure_open()
         thread = ThreadState(thread_id=thread_id)
-        try:
-            with self._conn:
-                self._conn.execute(
-                    "INSERT INTO threads (thread_id, state_json) VALUES (?, ?)",
-                    (thread_id, self._serialize(thread)),
-                )
-        except sqlite3.IntegrityError:
-            raise ThreadAlreadyExistsError(f"线程已存在: {thread_id}") from None
+        with self._lock:
+            self._ensure_open()
+            try:
+                with self._conn:
+                    self._conn.execute(
+                        "INSERT INTO threads (thread_id, state_json) VALUES (?, ?)",
+                        (thread_id, self._serialize(thread)),
+                    )
+            except sqlite3.IntegrityError:
+                raise ThreadAlreadyExistsError(f"线程已存在: {thread_id}") from None
         return thread
 
     def get(self, thread_id: str) -> ThreadState:
         """获取已有 Thread；不存在时抛出 ThreadNotFoundError。"""
-        self._ensure_open()
-        row = self._conn.execute(
-            "SELECT state_json FROM threads WHERE thread_id = ?", (thread_id,)
-        ).fetchone()
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT state_json FROM threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
         if row is None:
             raise ThreadNotFoundError(f"未知线程: {thread_id}")
         return self._deserialize(row[0], thread_id)
@@ -199,39 +217,43 @@ class SQLiteThreadStore:
         整个写入在事务中执行：成功自动 commit，失败自动 rollback，
         不会出现只写入一半的数据。
         """
-        self._ensure_open()
         if not isinstance(thread, ThreadState):
             raise TypeError(f"只接受 ThreadState，收到: {type(thread).__name__}")
-        with self._conn:
-            cursor = self._conn.execute(
-                "UPDATE threads SET state_json = ? WHERE thread_id = ?",
-                (self._serialize(thread), thread.thread_id),
-            )
-            if cursor.rowcount == 0:
-                raise ThreadNotFoundError(f"未知线程: {thread.thread_id}")
+        with self._lock:
+            self._ensure_open()
+            with self._conn:
+                cursor = self._conn.execute(
+                    "UPDATE threads SET state_json = ? WHERE thread_id = ?",
+                    (self._serialize(thread), thread.thread_id),
+                )
+                if cursor.rowcount == 0:
+                    raise ThreadNotFoundError(f"未知线程: {thread.thread_id}")
 
     def delete(self, thread_id: str) -> None:
         """删除已有 Thread；不存在时抛出 ThreadNotFoundError。"""
-        self._ensure_open()
-        with self._conn:
-            cursor = self._conn.execute(
-                "DELETE FROM threads WHERE thread_id = ?", (thread_id,)
-            )
-            if cursor.rowcount == 0:
-                raise ThreadNotFoundError(f"未知线程: {thread_id}")
+        with self._lock:
+            self._ensure_open()
+            with self._conn:
+                cursor = self._conn.execute(
+                    "DELETE FROM threads WHERE thread_id = ?", (thread_id,)
+                )
+                if cursor.rowcount == 0:
+                    raise ThreadNotFoundError(f"未知线程: {thread_id}")
 
     def exists(self, thread_id: str) -> bool:
         """检查 Thread 是否存在；从不抛出 ThreadNotFoundError。"""
-        self._ensure_open()
-        row = self._conn.execute(
-            "SELECT 1 FROM threads WHERE thread_id = ? LIMIT 1", (thread_id,)
-        ).fetchone()
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT 1 FROM threads WHERE thread_id = ? LIMIT 1", (thread_id,)
+            ).fetchone()
         return row is not None
 
     def list_threads(self) -> tuple[ThreadState, ...]:
         """按 thread_id 排序返回所有 Thread；任一记录损坏则抛 ThreadDataCorruptedError。"""
-        self._ensure_open()
-        rows = self._conn.execute(
-            "SELECT thread_id, state_json FROM threads ORDER BY thread_id"
-        ).fetchall()
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                "SELECT thread_id, state_json FROM threads ORDER BY thread_id"
+            ).fetchall()
         return tuple(self._deserialize(raw, tid) for tid, raw in rows)

@@ -1,0 +1,15 @@
+{
+  "servers": [
+    {
+      "name": "smoke",
+      "command": "python",
+      "args": ["/mcp/fixtures/mcp_test_server.py"],
+      "env": {},
+      "enabled": true,
+      "required": false,
+      "startup_timeout": 30,
+      "call_timeout": 15,
+      "max_output_bytes": 65536
+    }
+  ]
+}

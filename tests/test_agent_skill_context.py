@@ -72,7 +72,7 @@ class RecordingModel:
         self._decisions = list(decisions)
         self.calls: list[list[Message]] = []
 
-    def decide(self, messages: list[Message]) -> FinalAnswer | ToolCall:
+    def decide(self, messages: list[Message], tools=None) -> FinalAnswer | ToolCall:
         self.calls.append(list(messages))
         return self._decisions.pop(0)
 

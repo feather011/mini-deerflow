@@ -196,14 +196,14 @@ class TestCommands(_TempDBTestCase):
         self.assertIn("空会话", out)
 
     def test_history_preserves_message_order(self):
-        """/history 按消息顺序显示"""
+        """/history 按消息顺序显示（工具结果只进 Trace，不进历史）"""
         out = self.run_main(["计算 1+1", "/history", "exit"])
         u = out.find("[user] 计算 1+1")
-        t = out.find("[tool]")
         a = out.find("[assistant]")
         self.assertGreater(u, -1)
-        self.assertGreater(t, u)
-        self.assertGreater(a, t)
+        self.assertGreater(a, u)
+        # 不再落库孤立的 tool 消息
+        self.assertEqual(out.find("[tool]"), -1)
 
     def test_delete_non_current_thread(self):
         """/delete 非当前 Thread 应成功"""
@@ -297,8 +297,9 @@ class TestPersistenceAcrossRuns(_TempDBTestCase):
         self.run_main(["/new math", "计算 10 + 20", "exit"])
         out = self.run_main(["/switch math", "/history", "exit"])
         self.assertIn("[user] 计算 10 + 20", out)
-        self.assertIn("[tool] 30", out)
         self.assertIn("[assistant] 计算结果: 30", out)
+        # 工具往返只在 Trace 里，历史里不应出现孤立 tool 消息
+        self.assertNotIn("[tool]", out)
 
 
 class TestStoreLifecycle(_TempDBTestCase):

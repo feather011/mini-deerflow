@@ -26,7 +26,7 @@ from mini_deerflow.tools import ToolRegistry
 
 class EchoModel:
     """确定性模型：接受 hello 返回固定 answer，模拟 Agent 执行。"""
-    def decide(self, messages: list[Message]) -> ToolCall | FinalAnswer:
+    def decide(self, messages: list[Message], tools=None) -> ToolCall | FinalAnswer:
         if not messages:
             return FinalAnswer(content="请输入内容")
         latest = messages[-1]

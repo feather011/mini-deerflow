@@ -62,7 +62,7 @@ class ScriptedModel:
         self._queue: deque[FinalAnswer | ToolCall] = deque(decisions)
         self.received_messages: list[list[Message]] = []
 
-    def decide(self, messages: list[Message]) -> FinalAnswer | ToolCall:
+    def decide(self, messages: list[Message], tools=None) -> FinalAnswer | ToolCall:
         self.received_messages.append(list(messages))
         return self._queue.popleft()
 
@@ -277,19 +277,22 @@ class TestAgentSandboxToolsIntegration(unittest.TestCase):
         for forbidden in ("--rm", "--network", "--memory", "--cap-drop", "--mount"):
             self.assertNotIn(forbidden, content)
 
-    def test_thread_saves_successful_tool_result(self):
+    def test_tool_result_kept_in_trace_not_thread(self):
+        """工具结果进 Trace，不进 ThreadState（避免孤儿 tool_result）。"""
         (self._workspace / "saved.txt").write_text("content", encoding="utf-8")
         agent, model, _, store = self._make_agent()
         model._queue = deque([
             ToolCall(name="sandbox_read_file", arguments={"path": "saved.txt"}),
             FinalAnswer(content="完成"),
         ])
-        agent.run("test", "读取")
+        _, trace = agent.run("test", "读取")
         snapshot = store.get("test").snapshot()
         roles = [m.role for m in snapshot]
-        self.assertIn("tool", roles)
-        tool_msg = next(m for m in snapshot if m.role == "tool")
-        self.assertIn("saved.txt", tool_msg.content)
+        self.assertEqual(roles, ["user", "assistant"])
+        # 结果没丢：Trace 的 tool_call 记录里能拿到
+        tool_entries = [t for t in trace if t.get("action") == "tool_call"]
+        self.assertEqual(len(tool_entries), 1)
+        self.assertIn("saved.txt", tool_entries[0]["detail"]["result"])
 
     def test_tool_call_message_order(self):
         (self._workspace / "order.txt").write_text("x", encoding="utf-8")
@@ -301,13 +304,13 @@ class TestAgentSandboxToolsIntegration(unittest.TestCase):
         agent.run("test", "读取")
         snapshot = store.get("test").snapshot()
         roles = [m.role for m in snapshot]
-        self.assertEqual(roles, ["user", "tool", "assistant"])
+        self.assertEqual(roles, ["user", "assistant"])
 
     def test_unknown_tool_raises(self):
         from mini_deerflow.tools import ToolNotFoundError
 
         class BadModel:
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 return ToolCall(name="sandbox_nonexistent", arguments={})
 
         agent, model, _, store = self._make_agent()
@@ -326,7 +329,7 @@ class TestAgentSandboxToolsIntegration(unittest.TestCase):
         class FailingModel:
             calls = 0
 
-            def decide(self, messages):
+            def decide(self, messages, tools=None):
                 FailingModel.calls += 1
                 if FailingModel.calls == 1:
                     return ToolCall(
