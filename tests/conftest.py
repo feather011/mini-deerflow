@@ -25,3 +25,7 @@ def _pin_fake_model_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     # MINI_DEERFLOW_DB_PATH，用例之间会共享同一个 SQLite 文件，
     # 出现跨用例串数据与"上个用例的 Thread 还在"这类假失败。
     monkeypatch.delenv("MINI_DEERFLOW_DB_PATH", raising=False)
+    # 24：同理钉死 ContextState 的持久化。共享文件会让摘要、Task Notes、
+    # 压缩水位跨用例残留，制造出与真实行为无关的假失败。
+    monkeypatch.delenv("MINI_DEERFLOW_CONTEXT_DB_PATH", raising=False)
+    monkeypatch.delenv("MINI_DEERFLOW_CONTEXT_ENABLED", raising=False)

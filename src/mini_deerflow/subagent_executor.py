@@ -17,10 +17,14 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, Future
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from mini_deerflow.agent import Agent
 from mini_deerflow.models import FakeModel, FinalAnswer, Message, Model, ToolCall
+
+if TYPE_CHECKING:
+    # 仅用于类型注解：运行时不导入，避免把上下文工程层拖进 Subagent 的导入链
+    from mini_deerflow.context_assembler import ContextAssembler
 from mini_deerflow.subagent_models import (
     SubagentContextPolicy,
     SubagentResult,
@@ -89,6 +93,9 @@ class SubagentRunner:
     # 用于 Trace 关联
     parent_run_id: str = ""
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # 24：可选。传入则子代理走统一上下文工程，并在结束时回收投影状态。
+    # 隔离靠 thread_id（`subagent-{task_id}`），不是靠另开一份 store。
+    context_assembler: ContextAssembler | None = None
 
     def run(self) -> SubagentResult:
         """执行子任务并返回结果。"""
@@ -133,6 +140,8 @@ class SubagentRunner:
                     if self.task.context_policy is not None
                     else None
                 ),
+                context_assembler=self.context_assembler,
+                run_id=self.run_id,
             )
 
             # 检查取消（在开始前）
@@ -174,6 +183,20 @@ class SubagentRunner:
                 error_message=str(e),
                 run_id=self.run_id,
             )
+
+        finally:
+            # 24：子代理生命周期结束（成功 / 取消 / 超时 / 失败）都要回收投影。
+            # ThreadState 留在本 Runner 的局部 store 里，随对象一起销毁；
+            # 但 ContextState 与向量索引写进了**共享** store，不显式删就成了
+            # 指向已消失线程的孤儿数据。
+            # 注意这只发生在整个子任务结束时，与「同一次 Run 内工具写入的
+            # Note 在后续步骤失败后仍保留」并不冲突——后者指 Run 尚未结束。
+            assembler = self.context_assembler
+            if assembler is not None:
+                try:
+                    assembler.drop_thread_projections(thread_id)
+                except Exception:  # 清理失败不应改变任务结果
+                    pass
 
     def _safe_transition(self, to: TaskStatus) -> None:
         """安全地转换状态。"""
@@ -247,6 +270,8 @@ class _BudgetAwareAgent:
         cancellation_token: CancellationToken,
         timeout_seconds: float | None = None,
         allowed_tools: tuple[str, ...] | None = None,
+        context_assembler: "ContextAssembler | None" = None,
+        run_id: str = "",
     ) -> None:
         self._model = model
         self._registry = registry
@@ -259,6 +284,13 @@ class _BudgetAwareAgent:
         # 工具白名单（SubagentContextPolicy.allowed_tools 的运行时形态）。
         # None = 不设限制（沿用传入的注册表）；frozenset() = 空白名单，全部禁止。
         self._allowed = build_allow_list(allowed_tools)
+        # 24：与父 Agent 共用同一个 assembler 实例。隔离靠 thread_id
+        # （`subagent-{task_id}`）而不是靠另一份 store——不同线程在同一个
+        # ContextStore 里本来就是不同的行，反之若复制 store 才会有状态漂移风险。
+        self._context_assembler = context_assembler
+        # 仅用于 Trace 关联；子代理的 run_id 由 SubagentRunner 生成。
+        self._run_id = run_id
+        self._last_assembled: "object | None" = None
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
@@ -268,6 +300,8 @@ class _BudgetAwareAgent:
     def run(self, thread_id: str, instruction: str) -> str:
         thread = self._store.get(thread_id)
         working_messages: list[Message] = list(thread.snapshot())
+        # 本轮开始前的历史长度：其后新增的都属于本轮 pending
+        history_len = len(working_messages)
         pending: list[Message] = []
 
         user_message = Message(role="user", content=instruction)
@@ -295,7 +329,21 @@ class _BudgetAwareAgent:
             except BudgetExceededError as e:
                 raise _BudgetExhaustedError(str(e)) from e
 
-            model_messages = list(working_messages)
+            if self._context_assembler is not None:
+                # 24：子代理走同一套上下文工程（摘要注入、按需压缩、笔记），
+                # 但 thread_id 是 `subagent-{task_id}`，状态与父线程完全隔离。
+                # 子代理不注入 Memory/Skill（沿用既有行为），因此两者留空。
+                assembled = self._context_assembler.assemble(
+                    thread_id=thread_id,
+                    thread=thread,
+                    pending=tuple(working_messages[history_len:]),
+                    tool_specs=model_tools,
+                    run_id=self._run_id,
+                )
+                model_messages = list(assembled.context.messages)
+                self._last_assembled = assembled
+            else:
+                model_messages = list(working_messages)
             decision = self._model.decide(model_messages, model_tools)
 
             if isinstance(decision, FinalAnswer):
@@ -361,6 +409,7 @@ class SubagentManager:
         default_timeout: float | None = 300.0,
         default_budget: SubagentBudget | None = None,
         shared_budget: SubagentBudget | None = None,
+        context_assembler: ContextAssembler | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency 必须 >= 1")
@@ -376,6 +425,10 @@ class SubagentManager:
         self._default_budget = default_budget or SubagentBudget()
         # 父子共享 Budget（若提供）。submit / 子任务 Model/Tool 都会 consume 它。
         self._shared_budget = shared_budget
+        # 24：所有子代理共用父级的 assembler 实例。每个子任务的
+        # thread_id 不同（`subagent-{task_id}`），因此摘要、Task Notes、
+        # 压缩水位与向量索引各自独立，父线程的 ContextState 不会被触碰。
+        self._context_assembler = context_assembler
 
         self._lock = threading.Lock()
         self._tasks: dict[str, SubagentTask] = {}
@@ -508,6 +561,7 @@ class SubagentManager:
                 budget=effective_budget,
                 cancellation_token=token,
                 parent_run_id=task.parent_run_id,
+                context_assembler=self._context_assembler,
             )
 
             result = runner.run()

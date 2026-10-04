@@ -200,8 +200,11 @@ class TestSSE事件:
         assert terminals == ["run.failed"]
         assert names[-1] == "run.failed"
 
-        # 模型确实看到了工具描述（Registry → ToolSpec → Model 的透传）
-        assert [spec.name for spec in model.tools_seen[0]] == ["boom"]
+        # 模型确实看到了工具描述（Registry → ToolSpec → Model 的透传）。
+        # 断言「包含」而非「恰好等于」：24 起 runtime 还会注册
+        # task_note / history_search / history_read，注册表不再只有测试注入的工具。
+        seen = [spec.name for spec in model.tools_seen[0]]
+        assert "boom" in seen
 
     def test_未知工具_终态唯一且文案安全(self) -> None:
         model = _ScriptedModel([ToolCall(name="nope", arguments={}, id="t1")])

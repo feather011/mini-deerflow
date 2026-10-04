@@ -24,6 +24,8 @@ class OperationType(Enum):
     MODEL_CALL = auto()
     TOOL_CALL = auto()
     SUBAGENT_TASK = auto()
+    # 24：上下文压缩走专用枚举，使它在 Trace 里能与普通决策调用区分
+    SUMMARIZATION = auto()
 
 
 @dataclass
@@ -385,9 +387,15 @@ class Budget:
     """执行预算。线程安全。
 
     唯一正式的 Budget 实现。提供原子 consume_* 语义：
-    consume_step / consume_model_call / consume_tool_call / consume_subagent_task。
-    每个 consume 在同一把锁内完成「检查额度 + 扣减 + 超限抛错」三步，
-    并发调用不会超卖。失败/异常也要计数（在 action 真正发起前 consume）。
+    consume_step / consume_model_call / consume_tool_call / consume_subagent_task /
+    consume_summary_call。每个 consume 在同一把锁内完成
+    「检查额度 + 扣减 + 超限抛错」三步，并发调用不会超卖。
+    失败/异常也要计数（在 action 真正发起前 consume）。
+
+    `summary_calls` 是 24 新增的**独立**限额：上下文压缩的摘要调用不与普通
+    Agent 决策调用共享 `model_calls`，否则一次长会话压缩会把决策额度吃光，
+    表现为「莫名其妙就到 max_model_calls 了」。总 Provider 消耗用
+    `total_provider_calls()` 观测。
 
     SubagentBudget 是本类的兼容别名（同一定义，两套名字可互换）。
     """
@@ -397,10 +405,13 @@ class Budget:
     max_subagent_tasks: int | None = None
     max_subagent_depth: int | None = None
     max_wall_time_seconds: float | None = None
+    # 24：摘要专用额度（None = 不限，与其它 max_* 语义一致）
+    max_summary_calls: int | None = None
     _steps: int = field(default=0, init=False)
     _model_calls: int = field(default=0, init=False)
     _tool_calls: int = field(default=0, init=False)
     _subagent_tasks: int = field(default=0, init=False)
+    _summary_calls: int = field(default=0, init=False)
     _max_depth_seen: int = field(default=0, init=False)
     _lock: Lock = field(default_factory=Lock, repr=False)
 
@@ -453,6 +464,20 @@ class Budget:
         with self._lock:
             return depth <= self.max_subagent_depth
 
+    def consume_summary_call(self) -> None:
+        """原子地：检查 summary_calls 额度 → 扣减 → 超限抛错。
+
+        在摘要请求真正发起前调用；格式失败后的修复重试同样计数
+        （重试也是真实 Provider 调用）。
+        """
+        with self._lock:
+            if (
+                self.max_summary_calls is not None
+                and self._summary_calls >= self.max_summary_calls
+            ):
+                raise BudgetExceededError("summary_calls", self.max_summary_calls)
+            self._summary_calls += 1
+
     # ------------------------------------------------------------------
     # 读访问器
     # ------------------------------------------------------------------
@@ -472,6 +497,20 @@ class Budget:
     def subagent_tasks(self) -> int:
         with self._lock:
             return self._subagent_tasks
+
+    def summary_calls(self) -> int:
+        """已消耗的摘要调用次数。"""
+        with self._lock:
+            return self._summary_calls
+
+    def total_provider_calls(self) -> int:
+        """总 Provider 调用量 = 决策调用 + 摘要调用。
+
+        两类限额分开，但对外的用量指标必须合起来看——否则压缩多的线程
+        会在账面上「看起来很省」。
+        """
+        with self._lock:
+            return self._model_calls + self._summary_calls
 
     def max_depth_seen(self) -> int:
         with self._lock:
@@ -511,6 +550,13 @@ class Budget:
         with self._lock:
             return self._subagent_tasks < self.max_subagent_tasks
 
+    def check_summary_call(self) -> bool:
+        """旧 API 风格的摘要额度检查（不扣减）。"""
+        if self.max_summary_calls is None:
+            return True
+        with self._lock:
+            return self._summary_calls < self.max_summary_calls
+
     def record_step(self) -> None:
         with self._lock:
             self._steps += 1
@@ -526,6 +572,11 @@ class Budget:
     def record_subagent_task(self) -> None:
         with self._lock:
             self._subagent_tasks += 1
+
+    def record_summary_call(self) -> None:
+        """旧 API 风格的摘要额度记录（不检查，直接累加）。"""
+        with self._lock:
+            self._summary_calls += 1
 
 
 class BudgetExceededError(Exception):

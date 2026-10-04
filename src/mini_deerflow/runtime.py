@@ -11,6 +11,7 @@ import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -39,6 +40,17 @@ from mini_deerflow.middleware import (
     TraceMiddleware,
     TraceSink,
 )
+from mini_deerflow.context_assembler import ContextAssembler
+from mini_deerflow.context_compactor import ContextCompactor
+from mini_deerflow.context_state import ContextPolicy
+from mini_deerflow.context_store import (
+    ContextStore,
+    InMemoryContextStore,
+    SQLiteContextStore,
+)
+from mini_deerflow.context_tools import build_task_note_tool
+from mini_deerflow.history_index import HistoryIndexService, HistoryVectorIndex
+from mini_deerflow.history_tools import build_history_read_tool, build_history_search_tool
 from mini_deerflow.mcp_config import MCPServerConfig
 from mini_deerflow.mcp_manager import MCPClientManager
 from mini_deerflow.model_config import ModelSettings
@@ -51,6 +63,7 @@ from mini_deerflow.thread_run_coordinator import (
     ThreadRunCoordinator,
 )
 from mini_deerflow.thread_store import ThreadStore
+from mini_deerflow.token_counter import HeuristicTokenCounter
 from mini_deerflow.tools import ToolRegistry
 
 
@@ -95,6 +108,17 @@ class RuntimeConfig:
     # 默认空列表 = **不启用 MCP**（不连任何子进程、不建事件循环桥）。
     # 由配置文件显式列出后才会启动，不存在"默认偷偷拉起外部进程"。
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
+    # Context Engineering（24）
+    # 默认启用，但 context_db_path=None → 内存 ContextStore，
+    # 因此短会话与既有测试的持久化行为完全不变。
+    context_enabled: bool = True
+    context_db_path: str | None = None  # None = 内存 ContextStore
+    context_max_tokens: int = 80000
+    context_reserved_output_tokens: int = 4096
+    context_safety_margin_tokens: int = 2048
+    context_compaction_threshold: float = 0.8
+    # 摘要专用 Provider 额度（与 max_model_calls 分开，见 Budget 说明）
+    context_max_summary_calls: int = 20
 
 
 # =============================================================================
@@ -220,7 +244,9 @@ class IntegratedAgent:
         pipeline = MiddlewarePipeline(self._middlewares)
 
         def action() -> tuple[str, list[dict]]:
-            return self._agent.run(thread_id, user_input)
+            # 传 run_id：上下文组装与压缩的 Trace 需要它关联到本轮 Run。
+            # Agent.run 的 run_id 有默认值，既有调用方不受影响。
+            return self._agent.run(thread_id, user_input, run_id=effective_run_id)
 
         return pipeline.execute(ctx, action)
 
@@ -247,6 +273,8 @@ class RuntimeContext:
         agent_run_service: "AgentRunService | None" = None,
         file_service: "WorkspaceFileService | None" = None,
         mcp_manager: MCPClientManager | None = None,
+        context_store: "ContextStore | None" = None,
+        context_assembler: "ContextAssembler | None" = None,
     ) -> None:
         self.store = store
         self.agent = agent
@@ -266,6 +294,9 @@ class RuntimeContext:
         self.file_service = file_service
         # 22 MCP 客户端管理器（未启用时为 None 或空配置的管理器）
         self.mcp_manager = mcp_manager
+        # 24 Context Engineering（context_enabled=False 时两者皆为 None）
+        self.context_store = context_store
+        self.context_assembler = context_assembler
 
         # 注入 coordinator（构造期循环依赖，延后绑定）
         if self.agent_run_service is not None:
@@ -301,6 +332,23 @@ class RuntimeContext:
         if self.trace_sink:
             self.trace_sink.close()
         self.lifecycle.close_all()
+        # 24：先清空向量索引，再关 ContextStore，最后关事实源 ThreadStore。
+        # 顺序从内到外——投影全部处理完，才轮到承载它们的存储。
+        index = getattr(getattr(getattr(self, "context_assembler", None),
+                                "history_service", None), "index", None)
+        clear_index = getattr(index, "clear", None)
+        if callable(clear_index):
+            try:
+                clear_index()
+            except Exception:
+                # 用 error 而非 warning：索引没清干净意味着 shutdown 未真正完成
+                _LOGGER.error("向量索引清理失败", exc_info=True)
+        close_context = getattr(getattr(self, "context_store", None), "close", None)
+        if callable(close_context):
+            try:
+                close_context()
+            except Exception:
+                _LOGGER.error("ContextStore 关闭失败", exc_info=True)
         # 23：SQLite ThreadStore 必须显式关闭，否则容器停止时可能留下未 flush 的写入。
         # 用 getattr 而不是直接调用：测试会构造不含 store 的 RuntimeContext。
         close_store = getattr(getattr(self, "store", None), "close", None)
@@ -309,6 +357,96 @@ class RuntimeContext:
                 close_store()
             except Exception:
                 _LOGGER.warning("ThreadStore 关闭失败", exc_info=True)
+
+
+def load_context_config(env: "Mapping[str, str] | None" = None) -> dict[str, object]:
+    """读取 24 上下文工程的环境变量，返回可直接 `**` 展开给 RuntimeConfig 的字典。
+
+    与 `create_runtime` 的关系：本函数**只读环境**——不建数据库连接、不起线程、
+    不发任何模型请求，因此模块 import 与 `create_app()` 阶段调用它也是安全的
+    （连接在 `create_runtime` 里才真正建立）。
+
+    数值非法时直接抛 `ValueError`：静默回退到默认值会让「配了但没生效」
+    这种问题拖到线上才发现，比启动即失败更贵。
+    """
+    resolved: Mapping[str, str] = os.environ if env is None else env
+
+    def _get(name: str) -> str | None:
+        raw = resolved.get(name)
+        if raw is None:
+            return None
+        value = raw.strip()
+        return value or None
+
+    def _get_int(name: str) -> int | None:
+        raw = _get(name)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} 必须是整数，收到 {raw!r}") from exc
+
+    def _get_float(name: str) -> float | None:
+        raw = _get(name)
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} 必须是数字，收到 {raw!r}") from exc
+
+    config: dict[str, object] = {}
+
+    enabled = _get("MINI_DEERFLOW_CONTEXT_ENABLED")
+    if enabled is not None:
+        lowered = enabled.lower()
+        if lowered in {"0", "false", "no", "off"}:
+            config["context_enabled"] = False
+        elif lowered in {"1", "true", "yes", "on"}:
+            config["context_enabled"] = True
+        else:
+            raise ValueError(
+                f"MINI_DEERFLOW_CONTEXT_ENABLED 只接受 0/1，收到 {enabled!r}"
+            )
+
+    db_path = _get("MINI_DEERFLOW_CONTEXT_DB_PATH")
+    if db_path is not None:
+        config["context_db_path"] = db_path
+
+    max_tokens = _get_int("MINI_DEERFLOW_CONTEXT_MAX_TOKENS")
+    if max_tokens is not None:
+        if max_tokens <= 0:
+            raise ValueError(
+                f"MINI_DEERFLOW_CONTEXT_MAX_TOKENS 必须为正，收到 {max_tokens}"
+            )
+        config["context_max_tokens"] = max_tokens
+
+    reserved = _get_int("MINI_DEERFLOW_CONTEXT_RESERVED_OUTPUT_TOKENS")
+    if reserved is not None:
+        if reserved < 0:
+            raise ValueError(
+                f"MINI_DEERFLOW_CONTEXT_RESERVED_OUTPUT_TOKENS 不能为负，收到 {reserved}"
+            )
+        config["context_reserved_output_tokens"] = reserved
+
+    margin = _get_int("MINI_DEERFLOW_CONTEXT_SAFETY_MARGIN_TOKENS")
+    if margin is not None:
+        if margin < 0:
+            raise ValueError(
+                f"MINI_DEERFLOW_CONTEXT_SAFETY_MARGIN_TOKENS 不能为负，收到 {margin}"
+            )
+        config["context_safety_margin_tokens"] = margin
+
+    threshold = _get_float("MINI_DEERFLOW_CONTEXT_COMPACTION_THRESHOLD")
+    if threshold is not None:
+        if not 0 < threshold <= 1:
+            raise ValueError(
+                f"MINI_DEERFLOW_CONTEXT_COMPACTION_THRESHOLD 必须在 (0, 1]，收到 {threshold}"
+            )
+        config["context_compaction_threshold"] = threshold
+
+    return config
 
 
 def create_runtime(
@@ -344,6 +482,69 @@ def create_runtime(
         max_subagent_depth=config.subagent_max_depth,
     )
 
+    # 24：上下文工程层。放在 SubagentManager 之前，因为子代理与主 Agent
+    # 共用同一个 assembler（按 thread_id 天然隔离，见 RuntimeContext 说明）。
+    # 默认启用，但 context_db_path=None → 内存 ContextStore，
+    # 因此短会话与既有测试的持久化行为完全不变。
+    #
+    # Model 只构造一次：Agent 决策与上下文压缩共用同一实例，
+    # 否则 provider 配置会在两条路径上漂移。
+    agent_model = model or create_model(config.model_settings)
+
+    context_store: ContextStore | None = None
+    context_assembler: ContextAssembler | None = None
+    if config.context_enabled:
+        if config.context_db_path:
+            context_store = SQLiteContextStore(config.context_db_path)
+        else:
+            context_store = InMemoryContextStore()
+
+        context_policy = ContextPolicy(
+            max_context_tokens=config.context_max_tokens,
+            reserved_output_tokens=config.context_reserved_output_tokens,
+            safety_margin_tokens=config.context_safety_margin_tokens,
+            compaction_threshold=config.context_compaction_threshold,
+        )
+        token_counter = HeuristicTokenCounter()
+        # 摘要用独立 Budget：压缩多的线程不能把决策额度吃光
+        summary_budget = Budget(max_summary_calls=config.context_max_summary_calls)
+        compactor = ContextCompactor(
+            model=agent_model,
+            counter=token_counter,
+            policy=context_policy,
+            trace_sink=trace_sink,
+            budget=summary_budget,
+        )
+        # 历史检索服务：先于 assembler 创建，这样线程销毁时
+        # assembler 能一并清理 ContextState 与向量索引两份投影。
+        history_service = HistoryIndexService(
+            index=HistoryVectorIndex(),
+            thread_store=store,
+            context_store=context_store,
+            trace_sink=trace_sink,
+        )
+        context_assembler = ContextAssembler(
+            policy=context_policy,
+            counter=token_counter,
+            context_store=context_store,
+            compactor=compactor,
+            trace_sink=trace_sink,
+            history_service=history_service,
+        )
+
+        # 三个按线程隔离的工具：thread_id 只能来自 ExecutionContext，
+        # 参数 schema 里刻意不暴露该字段。
+        context_tools = [
+            build_task_note_tool(context_store, trace_sink=trace_sink),
+            build_history_search_tool(history_service),
+            build_history_read_tool(history_service),
+        ]
+        # 调用方可能已注入同名工具（测试 / 自定义扩展），冲突时保留已注册的
+        registered_names = {tool.name for tool in registry.list_tools()}
+        registry.register_many(
+            [tool for tool in context_tools if tool.name not in registered_names]
+        )
+
     # SubagentManager
     manager: SubagentManager | None = None
     if config.subagent_enabled:
@@ -353,6 +554,10 @@ def create_runtime(
             max_tasks_per_parent=config.subagent_max_tasks_per_parent,
             default_timeout=config.subagent_default_timeout,
             shared_budget=budget,  # 父子共享同一 Budget
+            # 24：子代理复用同一 assembler。thread_id 形如
+            # `subagent-{task_id}`，因此 ContextState / 摘要 / 水位 / Task Notes
+            # 与父线程以及其它子代理天然隔离，无需另建 store。
+            context_assembler=context_assembler,
         )
         # 注册子任务工具
         tools = create_subagent_tools(
@@ -395,12 +600,13 @@ def create_runtime(
     agent = Agent(
         # 显式传入的 model 优先（测试注入 FakeModel 等）；
         # 否则走统一 Model Factory，由 config.model_settings 决定 provider。
-        model=model or create_model(config.model_settings),
+        model=agent_model,
         registry=registry,
         store=store,
         max_steps=10,
         middleware_pipeline=agent_pipeline,
         budget=budget,
+        context_assembler=context_assembler,
     )
 
     integrated_agent = IntegratedAgent(
@@ -466,6 +672,8 @@ def create_runtime(
         agent_run_service=agent_run_service,
         file_service=file_service,
         mcp_manager=mcp_manager,
+        context_store=context_store,
+        context_assembler=context_assembler,
     )
 
 

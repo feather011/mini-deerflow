@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import logging
 import uuid
 
 from mini_deerflow.thread_state import ThreadState
@@ -15,6 +16,8 @@ from mini_deerflow.thread_store import (
     ThreadNotFoundError as StoreNotFoundError,
     ThreadStore,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # --- 领域异常（与 HTTP 解耦） ---
@@ -46,8 +49,11 @@ class ThreadAlreadyExistsError(ThreadServiceError):
 class ThreadService:
     """线程领域服务；接受任意 ThreadStore 实现。"""
 
-    def __init__(self, store: ThreadStore) -> None:
+    def __init__(self, store: ThreadStore, context_assembler: object | None = None) -> None:
         self._store = store
+        # 24：可选。线程删除时同步回收 ContextState 与向量索引两份投影，
+        # 否则会留下指向已消失线程的孤儿数据。
+        self._context_assembler = context_assembler
 
     @staticmethod
     def generate_id() -> str:
@@ -82,3 +88,23 @@ class ThreadService:
             self._store.delete(thread_id)
         except StoreNotFoundError as exc:
             raise ThreadNotFoundError(thread_id) from exc
+        # 24：事实源删成功后再回收投影（ContextState + 向量索引）。
+        # 反过来会在线程仍然存在时丢掉摘要。
+        # 回收失败**不能只记日志就返回成功**——那等于告诉调用方「全清干净了」，
+        # 而共享 store 里其实还留着指向已消失线程的孤儿数据。因此：
+        #   · 日志里留完整细节（异常类型、栈、线程号）
+        #   · 对外抛错，让响应成为明确的失败
+        #   · 文案不带内部路径与异常类名（E2E 断言了响应不泄漏内部信息）
+        drop = getattr(self._context_assembler, "drop_thread_projections", None)
+        if callable(drop):
+            try:
+                drop(thread_id)
+            except Exception:
+                _LOGGER.error(
+                    "线程 %s 的事实源已删除，但上下文投影清理失败",
+                    thread_id,
+                    exc_info=True,
+                )
+                raise ThreadServiceError(
+                    f"线程 {thread_id} 已删除，但其上下文数据清理未完成"
+                ) from None

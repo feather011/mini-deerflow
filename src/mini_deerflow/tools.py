@@ -92,6 +92,19 @@ class ToolNotAllowedError(ToolRegistryError):
 
 
 ToolHandler = Callable[[dict[str, object]], str]
+"""普通工具签名：只拿到模型给的参数。
+
+绝大多数工具（calculator、sandbox_*、MCP 转发）都属于这类——
+它们不关心自己跑在哪个会话里。
+"""
+
+ContextAwareToolHandler = Callable[..., str]
+"""需要执行上下文的工具签名：`(arguments, context) -> str`。
+
+仅 `task_note` 这类**按线程隔离**的工具使用。thread_id 从 `ExecutionContext`
+取，**不接受模型传入**——否则模型写一句 `{"thread_id": "别人的线程"}` 就能
+跨会话读写笔记。
+"""
 
 # 允许清单的两种取值语义（贯穿暴露限制与执行限制两层）：
 #   None → 不设限制，沿用调用方传入的注册表（既有默认策略）
@@ -148,10 +161,29 @@ class Tool:
     name: str
     description: str
     parameters: dict[str, object]
-    handler: ToolHandler
+    handler: ToolHandler | ContextAwareToolHandler
+    needs_context: bool = False
+    """为 True 时 `execute` 会把 ExecutionContext 一并交给 handler。
 
-    def execute(self, arguments: dict[str, object]) -> str:
-        """调用 handler 执行工具。"""
+    默认 False：存量工具（calculator / sandbox / MCP）的签名完全不变，
+    只有明确按线程隔离的工具才打开这条通道。
+    """
+
+    def execute(
+        self,
+        arguments: dict[str, object],
+        context: object | None = None,
+    ) -> str:
+        """调用 handler 执行工具。
+
+        Args:
+            arguments: 模型给出的参数。
+            context: 执行上下文；仅 `needs_context=True` 时传递。
+                为 None 时不会悄悄改语义——context 工具拿不到 thread_id
+                应当明确失败，而不是落到某个默认线程上。
+        """
+        if self.needs_context:
+            return self.handler(arguments, context)  # type: ignore[call-arg]
         return self.handler(arguments)
 
     def to_spec(self) -> ToolSpec:
@@ -214,11 +246,21 @@ class ToolRegistry:
         except KeyError:
             raise ToolNotFoundError(f"未知工具: {name}") from None
 
-    def execute(self, name: str, arguments: dict[str, object]) -> str:
-        """查找并执行工具；handler 出错时包装为 ToolExecutionError。"""
+    def execute(
+        self,
+        name: str,
+        arguments: dict[str, object],
+        *,
+        context: object | None = None,
+    ) -> str:
+        """查找并执行工具；handler 出错时包装为 ToolExecutionError。
+
+        `context` 只会传给 `needs_context=True` 的工具；普通工具即使收到
+        也会被忽略，因此存量调用点不传也能照常工作。
+        """
         tool = self.get(name)
         try:
-            return tool.execute(arguments)
+            return tool.execute(arguments, context)
         except Exception as exc:
             raise ToolExecutionError(f"工具执行失败: {name}: {exc}") from exc
 

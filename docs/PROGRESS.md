@@ -18,6 +18,7 @@
 | 21C | 真实验收（2 轮，底层 3 次请求） | ✅ 纯文本 + 计算器闭环含 126 |
 | 22 | MCP 扩展（本地 stdio） | ✅ 定向 46 passed + 本地 smoke |
 | 23 | Docker Compose、持久化与最终验收 | ✅ 见下 |
+| 24 | Context Engineering（上下文工程） | ✅ 定向 329 passed（[phase-24-progress.md](phase-24-progress.md)） |
 | — | **Mini DeerFlow MVP** | **✅** 自动化 + Docker + 浏览器人工验收全部通过 |
 
 ---
@@ -567,3 +568,52 @@ Thread 不保存孤立 tool 消息              ✅  10 tests
 **仍待人工的一项（非 MVP 完成标准）**：`docs/phase-21-progress.md` 里 21A 遗留的
 「用真实模型在浏览器/CLI 里对话」尚未由人做过 —— 21C 的真实模型验收是脚本化的
 （`scripts/phase21c_acceptance.py`，真实调用 3 次）。该项如实保留为 ⏳，未标 ✅。
+
+---
+
+## Phase 24（Context Engineering）
+
+架构见 [context-engineering.md](context-engineering.md)，
+分阶段清单与验收见 [phase-24-progress.md](phase-24-progress.md)。
+
+**状态：✅ 已完成并通过审计**
+
+```
+Phase 24 Context Engineering             ✅
+
+后端基线：2290 passed + 42 subtests
+前端：250 passed（26 files）
+E2E：18 passed
+uv pip check：All installed packages are compatible
+
+下一阶段：尚未决定 / 等待用户选择
+```
+
+### 门禁
+
+| 命令 | 结果 |
+|------|------|
+| `uv run pytest tests/test_context_*.py`（定向） | **329 passed** |
+| `uv run pytest`（全量） | **2290 passed + 42 subtests** |
+| `uv pip check` | `All installed packages are compatible`（exit 0） |
+| `npx vitest run` | **250 passed / 26 files** |
+| `npx playwright test` | **18 passed** |
+
+基线 1961 → 2290，**新增 329 个 context 测试，零回归**。
+
+### 正确性审计发现并修复的 4 类生产问题
+
+| # | 问题 | 后果 |
+|---|------|------|
+| 1 | 重启后 `indexed_through` 已持久化但向量索引为空，`sync` 据此跳过重建 | `history_search` **静默返回空**，模型误以为历史里没有这件事 |
+| 2 | 软阈值判断用了分配与裁剪**之后**的 `breakdown.total` | 超长 Memory/Skill/历史先被砍掉，再「发现」没超阈值 → **绕过压缩** |
+| 3 | 弹性区块（Memory 等）被计入不可删除的 `required` | 一条长记忆直接抛 `ContextWindowExceededError`，与规格「有弹性上限」冲突 |
+| 4 | 摘要敏感信息过滤缺 Windows/POSIX 路径与私钥 | `/etc/shadow`、`~/.ssh/id_rsa` 等可被持久化进长期投影 |
+| 5 | `task_note list` 无分页与输出上限 | 500 条 Note 可一次灌入上百万字符 |
+| 6 | 投影清理失败仅记 warning 即返回成功 | **伪装全清**，共享 store 里留孤儿数据 |
+
+### 约束遵守
+
+- 未调用真实模型（conftest 钉死 `provider=fake`）
+- 未 commit / 未 push（归档提交另行执行）
+- 未修改 `.obsidian/workspace.json`

@@ -30,6 +30,7 @@ from mini_deerflow.api.services.threads import (
     ThreadAlreadyExistsError,
     ThreadNotFoundError,
     ThreadService,
+    ThreadServiceError,
 )
 from mini_deerflow.runtime import RuntimeContext
 
@@ -40,7 +41,9 @@ router = APIRouter(tags=["threads"])
 def get_thread_service(
     runtime: RuntimeContext = Depends(get_runtime),
 ) -> ThreadService:
-    return ThreadService(runtime.store)
+    # 传 context_assembler：删除线程时同步回收 ContextState 与向量索引。
+    # 用 getattr 容错：测试会注入不含该属性的 RuntimeContext 替身。
+    return ThreadService(runtime.store, getattr(runtime, "context_assembler", None))
 
 
 @router.post(
@@ -125,6 +128,7 @@ def get_thread(
     responses={
         204: {"description": "删除成功"},
         404: {"model": ErrorResponse, "description": "线程不存在"},
+        500: {"model": ErrorResponse, "description": "线程已删除，但上下文数据清理未完成"},
         503: {"model": ErrorResponse, "description": "Runtime 未就绪"},
     },
 )
@@ -138,5 +142,12 @@ def delete_thread(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"未知线程: {exc.thread_id}",
+        ) from exc
+    except ThreadServiceError as exc:
+        # 事实源已删、投影没删干净 → 明确失败，不返回 204 冒充全清。
+        # 文案不带内部路径 / 异常类名（响应不泄漏内部信息）。
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
         ) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)

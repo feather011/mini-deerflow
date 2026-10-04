@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Callable, TypeVar
 
+from mini_deerflow.context_assembler import AssembledContext, ContextAssembler
 from mini_deerflow.memory_manager import MemoryProcessor
 from mini_deerflow.memory_context import MemoryContextProvider
 from mini_deerflow.middleware import (
@@ -35,6 +36,7 @@ class Agent:
         skill_context_provider: SkillContextProvider | None = None,
         middleware_pipeline: MiddlewarePipeline | None = None,
         budget: Budget | None = None,
+        context_assembler: ContextAssembler | None = None,
     ):
         self._model = model
         self._registry = registry
@@ -45,6 +47,9 @@ class Agent:
         self._skill_context_provider = skill_context_provider
         self._middleware_pipeline = middleware_pipeline
         self._budget = budget
+        # 24：可选。None = 走原有拼装逻辑，短会话行为与 Phase 23 完全一致。
+        self._context_assembler = context_assembler
+        self._last_assembled: AssembledContext | None = None
 
     def _run_via_pipeline(
         self,
@@ -59,12 +64,20 @@ class Agent:
             return action()
         return self._middleware_pipeline.execute_with_retry(ctx, action)
 
-    def run(self, thread_id: str, user_input: str) -> tuple[str, list[dict]]:
-        """对指定 thread_id 执行一轮 Agent 循环；成功后原子写入，失败时 Thread 不变。"""
+    def run(
+        self, thread_id: str, user_input: str, run_id: str = ""
+    ) -> tuple[str, list[dict]]:
+        """对指定 thread_id 执行一轮 Agent 循环；成功后原子写入，失败时 Thread 不变。
+
+        Args:
+            run_id: 上层 Run 的标识，仅用于 Trace 关联上下文组装与压缩事件。
+                缺省为空串，保持既有调用方兼容。
+        """
         thread = self._store.get(thread_id)  # ThreadNotFoundError 原样传播
 
         # 构建上下文消息（只调用一次 context_provider.build()）
         memory_context_messages: list[Message] = []
+        memory_context_text = ""
         if self._context_provider is not None:
             memory_context = self._context_provider.build()
 
@@ -74,6 +87,7 @@ class Agent:
                 )
 
             memory_context = memory_context.strip()
+            memory_context_text = memory_context
             if memory_context:
                 memory_context_messages.append(
                     Message(role="system", content=memory_context)
@@ -81,6 +95,7 @@ class Agent:
 
         # 构建 Skill 上下文（只调用一次 skill_context_provider.build()）
         skill_context_messages: list[Message] = []
+        skill_context_text = ""
         if self._skill_context_provider is not None:
             skill_context = self._skill_context_provider.build(user_input)
 
@@ -90,6 +105,7 @@ class Agent:
                 )
 
             skill_context = skill_context.strip()
+            skill_context_text = skill_context
             if skill_context:
                 skill_context_messages.append(
                     Message(role="system", content=skill_context)
@@ -97,6 +113,8 @@ class Agent:
 
         # 读取历史为快照；working_messages 是本轮累计（喂给模型），pending 是待提交的本轮增量
         working_messages: list[Message] = list(thread.snapshot())
+        # 本轮开始前的历史长度：working_messages 中该位置之后的都属「本轮 pending」
+        history_len = len(working_messages)
         pending: list[Message] = []
 
         user_message = Message(role="user", content=user_input)
@@ -112,11 +130,26 @@ class Agent:
         for step in range(1, self._max_steps + 1):
             # 组合发送给模型的完整消息列表：Memory → Skill → history → user
             # 每次循环重新组合以包含新增的 tool messages
-            model_messages = [
-                *memory_context_messages,
-                *skill_context_messages,
-                *working_messages,
-            ]
+            if self._context_assembler is not None:
+                # 24：统一入口负责计量、注入摘要/笔记、按需压缩。
+                # pending = working_messages 中本轮新增的部分（user + 工具往返）
+                assembled = self._context_assembler.assemble(
+                    thread_id=thread_id,
+                    thread=thread,
+                    pending=tuple(working_messages[history_len:]),
+                    memory_context=memory_context_text,
+                    skill_context=skill_context_text,
+                    tool_specs=model_tools,
+                    run_id=run_id,
+                )
+                model_messages = list(assembled.context.messages)
+                self._last_assembled = assembled
+            else:
+                model_messages = [
+                    *memory_context_messages,
+                    *skill_context_messages,
+                    *working_messages,
+                ]
 
             # Model call：通过 middleware_pipeline 包装（原子 consume 预算）
             model_ctx = ExecutionContext(

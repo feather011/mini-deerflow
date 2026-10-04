@@ -35,7 +35,7 @@ from mini_deerflow.api.schemas.errors import (
 )
 from mini_deerflow.mcp_config import load_mcp_config
 from mini_deerflow.model_config import load_model_settings
-from mini_deerflow.runtime import RuntimeConfig, create_runtime
+from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_config
 from mini_deerflow.thread_store import InMemoryThreadStore, SQLiteThreadStore
 from mini_deerflow.tools import create_default_registry
 
@@ -86,6 +86,8 @@ def _default_runtime_factory(
             model_settings=load_model_settings(),
             # 22：未配置 MINI_DEERFLOW_MCP_CONFIG 时返回 [] → 不启动任何 MCP
             mcp_servers=load_mcp_config(),
+            # 24：上下文工程的环境变量（未设置即走代码默认值）
+            **load_context_config(),
         ),
     )
 

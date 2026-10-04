@@ -26,7 +26,7 @@ from mini_deerflow.skill import MarkdownSkillParser
 from mini_deerflow.skill_registry import SkillRegistry
 from mini_deerflow.skill_runtime import DefaultSkillContextProvider, SkillContextProvider
 from mini_deerflow.skill_selector import RuleBasedSkillSelector
-from mini_deerflow.runtime import RuntimeConfig, create_runtime
+from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_config
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import (
     SQLiteThreadStore,
@@ -230,6 +230,7 @@ def handle_command(
     skill_catalog: "SkillCatalog | None" = None,
     sandbox_status: "SandboxStatus | None" = None,
     registry: "ToolRegistry | None" = None,
+    context_assembler: object | None = None,
 ) -> None:
     """处理以 / 开头的命令。"""
     parts = raw.split(maxsplit=1)
@@ -298,6 +299,16 @@ def handle_command(
         except ThreadNotFoundError:
             print(f"未知线程: {arg}")
             return
+        # 24：事实源删成功后同步回收 ContextState 与向量索引。
+        # 回收失败**不能仍然打印「已删除」**——那会让用户以为全清了，
+        # 而共享 store 里还留着指向已消失线程的孤儿数据。
+        drop = getattr(context_assembler, "drop_thread_projections", None)
+        if callable(drop):
+            try:
+                drop(arg)
+            except Exception as exc:
+                print(f"线程 {arg} 已删除，但上下文数据清理未完成：{type(exc).__name__}: {exc}")
+                return
         print(f"已删除: {arg}")
 
     elif cmd == "/current":
@@ -410,6 +421,8 @@ def run_cli(
         model_settings=load_model_settings(),
         # 22：未配置 MINI_DEERFLOW_MCP_CONFIG 时返回 [] → 不启动任何 MCP
         mcp_servers=load_mcp_config(),
+        # 24：上下文工程的环境变量（未设置即走代码默认值）
+        **load_context_config(),
     )
     ctx_runtime = create_runtime(
         store=thread_store,
@@ -442,7 +455,7 @@ def run_cli(
         if raw.startswith("/"):
             handle_command(
                 raw, state, thread_store, agent, memory_store, skill_catalog,
-                sandbox_status, registry,
+                sandbox_status, registry, ctx_runtime.context_assembler,
             )
             continue
 
