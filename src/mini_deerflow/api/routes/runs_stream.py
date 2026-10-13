@@ -116,6 +116,41 @@ async def stream_agent_run(
     )
 
 
+@router.post(
+    "/threads/{thread_id}/runs/stop",
+    summary="停止运行中的 Agent Run",
+    description=(
+        "向指定 Thread 上正在运行的 Agent 发送取消信号。"
+        "CancellationToken.cancel() 会触发："
+        "① Agent.run 每步检查 is_cancelled() → BudgetExceededError 提前退出；"
+        "② project_execute 透传给 HarnessRunner → 子进程被回收；"
+        "③ 锁释放。"
+    ),
+    responses={
+        200: {"description": "已找到并取消"},
+        404: {"model": ErrorResponse, "description": "该 Thread 没有正在运行的 Run"},
+        503: {"model": ErrorResponse, "description": "Stream 服务未初始化"},
+    },
+)
+async def stop_agent_run(
+    thread_id: str,
+    runtime: RuntimeContext = Depends(get_runtime),
+):
+    manager = runtime.run_stream_manager
+    if manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Stream 服务未初始化",
+        )
+    stopped = manager.stop(thread_id)
+    if not stopped:
+        raise HTTPException(
+            status_code=404,
+            detail=f"线程 {thread_id} 没有正在运行的 Run",
+        )
+    return {"status": "stopped", "thread_id": thread_id}
+
+
 async def _iter_sse(handle, runtime: RuntimeContext) -> AsyncIterator[str]:
     q = handle.queue
     try:

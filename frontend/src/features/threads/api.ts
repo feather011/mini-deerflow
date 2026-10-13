@@ -44,6 +44,14 @@ export async function createThread(
   })
 }
 
+/** 获取指定项目的所有会话 */
+export async function getProjectThreads(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ThreadListResponse> {
+  return apiGet<ThreadListResponse>(`/api/projects/${encodeURIComponent(projectId)}/threads`, { signal })
+}
+
 /** GET /api/threads/{thread_id} — 读取详情 */
 export async function getThread(
   threadId: string,

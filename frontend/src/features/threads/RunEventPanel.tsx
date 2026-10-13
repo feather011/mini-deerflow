@@ -8,7 +8,7 @@
  * - 显示停止接收按钮
  * - 显示终态错误和 Request ID
  */
-import type { RunEvent, RunEventType } from '../../shared/types/events'
+import type { RunEvent } from '../../shared/types/events'
 import type { StreamStatus } from './useAgentStream'
 import styles from './RunEventPanel.module.css'
 
@@ -42,22 +42,6 @@ const STATUS_LABELS: Record<StreamStatus, string> = {
   error: '连接错误',
 }
 
-/** 事件类型中文标签 */
-const EVENT_LABELS: Record<RunEventType, string> = {
-  'run.started': 'Run 开始',
-  'model.started': '模型开始',
-  'model.completed': '模型完成',
-  'model.failed': '模型失败',
-  'tool.started': '工具开始',
-  'tool.completed': '工具完成',
-  'tool.failed': '工具失败',
-  'run.completed': 'Run 完成',
-  'run.failed': 'Run 失败',
-  'run.timed_out': 'Run 超时',
-  'run.cancelled': 'Run 取消',
-  'heartbeat': '心跳',
-}
-
 export function RunEventPanel({
   status,
   events,
@@ -68,6 +52,13 @@ export function RunEventPanel({
   onStop,
 }: RunEventPanelProps) {
   const isRunning = status === 'streaming' || status === 'connecting'
+  // 从已收到的事件中提取最后一个错误信息（给摘要行显示）
+  const latestError = (() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]!.error) return events[i]!.error
+    }
+    return null
+  })()
 
   return (
     <div className={styles.panel}>
@@ -92,16 +83,16 @@ export function RunEventPanel({
         )}
       </div>
 
-      {/* 事件列表 */}
-      <div className={styles.eventList}>
-        {events.length === 0 && status === 'idle' && (
-          <div className={styles.emptyHint}>等待事件…</div>
-        )}
-
-        {events.map((event, index) => (
-          <EventItem key={index} event={event} />
-        ))}
-      </div>
+      {/* 事件摘要行（明细下沉到 TaskInspector「过程」Tab）
+          有事件时显示计数；空态时隐藏（避免与 header statusText 重复） */}
+      {events.length > 0 && (
+        <div className={styles.summary}>
+          <span>已接收 {events.length} 条事件</span>
+          {latestError && (
+            <span className={styles.eventError}>{latestError}</span>
+          )}
+        </div>
+      )}
 
       {/* 错误信息 */}
       {errorMessage && (
@@ -121,37 +112,6 @@ export function RunEventPanel({
           <div className={styles.answerLabel}>最终回答</div>
           <pre className={styles.answerText}>{terminalEvent.answer}</pre>
         </div>
-      )}
-    </div>
-  )
-}
-
-/** 单条事件项 */
-function EventItem({ event }: { event: RunEvent }) {
-  const label = EVENT_LABELS[event.event_type] ?? event.event_type
-  const isTerminal = event.event_type.startsWith('run.')
-
-  return (
-    <div className={`${styles.eventItem} ${isTerminal ? styles.terminal : ''}`}>
-      <span className={styles.eventLabel}>{label}</span>
-      {event.operation && (
-        <span className={styles.eventField}>操作: {event.operation}</span>
-      )}
-      {event.tool_name && (
-        <span className={styles.eventField}>工具: {event.tool_name}</span>
-      )}
-      {/* 用 typeof 判空：后端在事件里会直接省略这两个字段（undefined），
-          仅写 !== null 会让 .toFixed 在 undefined 上崩溃，把整个应用带进 ErrorBoundary */}
-      {typeof event.attempt === 'number' && (
-        <span className={styles.eventField}>尝试: {event.attempt}</span>
-      )}
-      {typeof event.duration_seconds === 'number' && (
-        <span className={styles.eventField}>
-          耗时: {event.duration_seconds.toFixed(1)}s
-        </span>
-      )}
-      {event.error && (
-        <span className={styles.eventError}>错误: {event.error}</span>
       )}
     </div>
   )

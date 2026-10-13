@@ -72,7 +72,7 @@ def test_post_threads_returns_201_with_empty_thread() -> None:
         response = client.post("/api/threads", json={})
     assert response.status_code == 201
     body = response.json()
-    assert set(body) == {"thread_id", "messages"}
+    assert set(body) == {"thread_id", "messages", "project_id"}
     assert body["messages"] == []
 
 
@@ -317,13 +317,13 @@ def test_routes_use_runtime_store_not_concrete_class() -> None:
             self._data: dict[str, list[dict[str, str]]] = {}
             self.create_calls = 0
 
-        def create(self, thread_id: str):
+        def create(self, thread_id: str, project_id: str | None = None):
             if thread_id in self._data:
                 raise ThreadAlreadyExistsError(f"dup {thread_id}")
             self._data[thread_id] = []
             self.create_calls += 1
             from mini_deerflow.thread_state import ThreadState
-            return ThreadState(thread_id=thread_id)
+            return ThreadState(thread_id=thread_id, project_id=project_id)
 
         def get(self, thread_id: str):
             if thread_id not in self._data:

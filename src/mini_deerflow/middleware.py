@@ -578,6 +578,98 @@ class Budget:
         with self._lock:
             self._summary_calls += 1
 
+    # ------------------------------------------------------------------
+    # restore_usage：从持久化恢复使用量（用于重启恢复场景）
+    # 只能调用一次，用于将 Budget 恢复到历史记录的消费状态
+    # ------------------------------------------------------------------
+
+    def restore_usage(
+        self,
+        *,
+        steps: int | None = ...,
+        model_calls: int | None = ...,
+        tool_calls: int | None = ...,
+        subagent_tasks: int | None = ...,
+        summary_calls: int | None = ...,
+    ) -> None:
+        """恢复使用量（用于从持久化存储恢复状态）。
+
+        只能调用一次，用于在重启后将 Budget 恢复到历史记录的消费状态。
+        参数值直接设置为内部计数器，不做上限检查（超限由下一次 consume 报错）。
+
+        Args:
+            steps: 恢复的 step 消耗
+            model_calls: 恢复的模型调用消耗
+            tool_calls: 恢复的工具调用消耗
+            subagent_tasks: 恢复的子任务消耗
+            summary_calls: 恢复的摘要调用消耗
+
+        Raises:
+            RuntimeError: 如果已经调用过 restore_usage
+            RuntimeError: 如果已有消耗记录（尚未消费过）
+            TypeError: 如果参数类型不是整数
+            ValueError: 如果参数为负数
+        """
+        # 先验证所有参数（失败时不标记已调用，以便测试重试）
+        if steps is not ...:
+            if not isinstance(steps, int) or isinstance(steps, bool):
+                raise TypeError("steps 必须是整数")
+            if steps < 0:
+                raise ValueError("steps 不能为负")
+
+        if model_calls is not ...:
+            if not isinstance(model_calls, int) or isinstance(model_calls, bool):
+                raise TypeError("model_calls 必须是整数")
+            if model_calls < 0:
+                raise ValueError("model_calls 不能为负")
+
+        if tool_calls is not ...:
+            if not isinstance(tool_calls, int) or isinstance(tool_calls, bool):
+                raise TypeError("tool_calls 必须是整数")
+            if tool_calls < 0:
+                raise ValueError("tool_calls 不能为负")
+
+        if subagent_tasks is not ...:
+            if not isinstance(subagent_tasks, int) or isinstance(subagent_tasks, bool):
+                raise TypeError("subagent_tasks 必须是整数")
+            if subagent_tasks < 0:
+                raise ValueError("subagent_tasks 不能为负")
+
+        if summary_calls is not ...:
+            if not isinstance(summary_calls, int) or isinstance(summary_calls, bool):
+                raise TypeError("summary_calls 必须是整数")
+            if summary_calls < 0:
+                raise ValueError("summary_calls 不能为负")
+
+        with self._lock:
+            # 检查是否已经调用过
+            if hasattr(self, "_restore_usage_called") and self._restore_usage_called:
+                raise RuntimeError("restore_usage 只能调用一次")
+
+            # 验证：检查是否已有消耗记录
+            for field_name in ("_steps", "_model_calls", "_tool_calls", "_subagent_tasks", "_summary_calls"):
+                if getattr(self, field_name, 0) > 0:
+                    raise RuntimeError("restore_usage 必须在尚未消费过任何资源时调用")
+
+            # 设置标志（防止重复调用）- 仅在所有验证通过后设置
+            self._restore_usage_called = True
+
+            # 设置计数器值（只处理显式传入的值）
+            if steps is not ...:
+                self._steps = steps
+
+            if model_calls is not ...:
+                self._model_calls = model_calls
+
+            if tool_calls is not ...:
+                self._tool_calls = tool_calls
+
+            if subagent_tasks is not ...:
+                self._subagent_tasks = subagent_tasks
+
+            if summary_calls is not ...:
+                self._summary_calls = summary_calls
+
 
 class BudgetExceededError(Exception):
     """预算耗尽。"""

@@ -101,17 +101,17 @@ describe('RunEventPanel', () => {
       />,
     )
 
-    const labels = screen.getAllByText(/^(Run 开始|模型开始|工具开始|工具完成|模型完成)$/)
-    expect(labels.map((n) => n.textContent)).toEqual([
-      'Run 开始',
-      '模型开始',
-      '工具开始',
-      '工具完成',
-      '模型完成',
-    ])
+    // 明细已折叠为摘要行；不再逐条渲染 EventItem
+    expect(screen.getByText('已接收 5 条事件')).toBeInTheDocument()
+    // 确认明细标签不在 DOM 中（EventItem 未渲染）
+    expect(screen.queryByText('Run 开始')).not.toBeInTheDocument()
+    expect(screen.queryByText('模型开始')).not.toBeInTheDocument()
+    expect(screen.queryByText('工具开始')).not.toBeInTheDocument()
+    expect(screen.queryByText('工具完成')).not.toBeInTheDocument()
+    expect(screen.queryByText('模型完成')).not.toBeInTheDocument()
   })
 
-  it('唯一终态：只显示一个 run.completed 标签', () => {
+  it('唯一终态：摘要行显示事件数，answerBar 显示最终回答（EventItem 折叠）', () => {
     const events: RunEvent[] = [
       ev({ sequence: 0, event_type: 'run.started' }),
       ev({ sequence: 1, event_type: 'model.started' }),
@@ -130,25 +130,37 @@ describe('RunEventPanel', () => {
       />,
     )
 
-    expect(screen.getAllByText('Run 完成')).toHaveLength(1)
-    expect(screen.getAllByText('最终回答')).toHaveLength(2)
+    // 摘要行显示收到的事件数
+    expect(screen.getByText('已接收 3 条事件')).toBeInTheDocument()
+    // EventItem 折叠：run.completed 标签不逐条渲染
+    expect(screen.queryByText('Run 完成')).not.toBeInTheDocument()
+    // answerBar 展示最终回答：标签 <div> + 内容 <pre> 两处，均包含相同文字
+    const all = screen.queryAllByText('最终回答')
+    expect(all).toHaveLength(2)
+    // 内容 <pre> 中的文本就是答案本身
+    expect(all[1]!.tagName.toLowerCase()).toBe('pre')
   })
 
   it('run.failed 状态显示"执行失败"且展示错误信息', () => {
+    const failedEvent = ev({ event_type: 'run.failed', error: 'something went wrong' })
+
     render(
       <RunEventPanel
         status="failed"
-        events={[ev({ event_type: 'run.failed', error: 'something went wrong' })]}
+        events={[failedEvent]}
         runId="run-1"
         errorMessage="Agent 执行失败"
         requestId={null}
-        terminalEvent={ev({ event_type: 'run.failed', error: 'something went wrong' })}
+        terminalEvent={failedEvent}
         onStop={vi.fn()}
       />,
     )
 
     expect(screen.getByText('执行失败')).toBeInTheDocument()
-    expect(screen.getByText(/错误: something went wrong/)).toBeInTheDocument()
+    // 错误详情折叠在摘要行：event.error 显示为 eventError 样式（非正则跨元素匹配）
+    expect(screen.getByText('已接收 1 条事件')).toBeInTheDocument()
+    expect(document.querySelector('[class*="eventError"]')?.textContent).toContain('something went wrong')
+    // props.errorMessage → errorBar 独立展示
     expect(screen.getByText('Agent 执行失败')).toBeInTheDocument()
   })
 
@@ -257,7 +269,7 @@ describe('RunEventPanel', () => {
     expect(screen.getByText('这是 Agent 的最终回答')).toBeInTheDocument()
   })
 
-  it('后端省略可选字段（undefined）时不崩溃', () => {
+  it('后端省略可选字段（undefined）时不崩溃且摘要行正常显示', () => {
     // 真实 SSE 不会带 attempt / duration_seconds / error / tool_name，
     // 类型标的是 | null 但运行时是 undefined，曾导致 .toFixed 崩溃。
     const event = {
@@ -281,8 +293,11 @@ describe('RunEventPanel', () => {
       />,
     )
 
-    expect(screen.getByText('模型开始')).toBeInTheDocument()
-    // 不应渲染出 "尝试: undefined" / "耗时: undefineds"
+    // 摘要行正常渲染，不崩溃
+    expect(screen.getByText('已接收 1 条事件')).toBeInTheDocument()
+    // EventItem 已折叠，不再逐条渲染标签
+    expect(screen.queryByText('模型开始')).not.toBeInTheDocument()
+    // 摘要行中不应出现 undefined 字样
     expect(screen.queryByText(/undefined/)).not.toBeInTheDocument()
   })
 })

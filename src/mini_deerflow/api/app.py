@@ -14,12 +14,19 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator, Callable
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
+
+# 加载 .env：ApiSettings 只读 os.environ，不自己调 load_dotenv。
+# 显式给绝对路径——app.py 在 src/mini_deerflow/api/，向上四级到仓库根，
+# 保证 cwd 在哪都能加载到。
+load_dotenv(Path(__file__).parent.parent.parent.parent / ".env")
 
 from mini_deerflow.api.config import ApiSettings
 from mini_deerflow.api.middleware.request_id import RequestIdMiddleware
@@ -28,6 +35,8 @@ from mini_deerflow.api.routes.runs import router as runs_router
 from mini_deerflow.api.routes.runs_stream import router as runs_stream_router
 from mini_deerflow.api.routes.threads import router as threads_router
 from mini_deerflow.api.routes.files import router as files_router
+from mini_deerflow.api.routes.context_usage import router as context_usage_router
+from mini_deerflow.api.routes.projects import router as projects_router
 from mini_deerflow.api.schemas.errors import (
     ErrorCode,
     build_error_response,
@@ -37,6 +46,7 @@ from mini_deerflow.mcp_config import load_mcp_config
 from mini_deerflow.model_config import load_model_settings
 from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_config
 from mini_deerflow.thread_store import InMemoryThreadStore, SQLiteThreadStore
+from mini_deerflow.project_store import InMemoryProjectStore, SQLiteProjectStore
 from mini_deerflow.tools import create_default_registry
 
 
@@ -57,7 +67,6 @@ def _build_store(settings: ApiSettings):
     """
     if not settings.db_path:
         return InMemoryThreadStore()
-    from pathlib import Path
 
     # SQLite 不会自动建父目录；卷挂载点之外的路径要自己保证存在
     Path(settings.db_path).expanduser().resolve().parent.mkdir(
@@ -65,6 +74,18 @@ def _build_store(settings: ApiSettings):
     )
     _LOGGER.info("ThreadStore = SQLite (%s)", settings.db_path)
     return SQLiteThreadStore(settings.db_path)
+
+
+def _build_project_store(settings: ApiSettings):
+    """按配置选择 ProjectStore；与 ThreadStore 用同一个数据库文件。
+
+    项目与线程本来就是一对多，共享一个 SQLite 文件省掉一处连接管理，
+    也让「删项目级联删会话」在同一个事务边界内可见。
+    """
+    if not settings.db_path:
+        return InMemoryProjectStore()
+    _LOGGER.info("ProjectStore = SQLite (%s)", settings.db_path)
+    return SQLiteProjectStore(settings.db_path)
 
 
 def _default_runtime_factory(
@@ -76,19 +97,22 @@ def _default_runtime_factory(
     # model_settings 在此处（lifespan 内）才读取环境：create_app() 与 import
     # 阶段既不读配置也不创建客户端，更不发网络请求。
     resolved = settings or ApiSettings()
+    ws_root = resolved.workspaces_root
     return create_runtime(
         store=_build_store(resolved),
+        project_store=_build_project_store(resolved),
         registry=create_default_registry(),
         config=RuntimeConfig(
             workspace_root=resolved.workspace_root,
             workspace_max_upload_bytes=resolved.max_upload_bytes,
             workspace_max_list_entries=resolved.max_list_entries,
             model_settings=load_model_settings(),
-            # 22：未配置 MINI_DEERFLOW_MCP_CONFIG 时返回 [] → 不启动任何 MCP
             mcp_servers=load_mcp_config(),
-            # 24：上下文工程的环境变量（未设置即走代码默认值）
+            harness_root=resolved.harness_root,
+            harness_timeout_seconds=resolved.harness_timeout_seconds,
             **load_context_config(),
         ),
+        workspaces_root=ws_root,
     )
 
 
@@ -253,6 +277,14 @@ def create_app(
     )
     app.include_router(
         files_router,
+        prefix=resolved_settings.api_prefix,
+    )
+    app.include_router(
+        context_usage_router,
+        prefix=resolved_settings.api_prefix,
+    )
+    app.include_router(
+        projects_router,
         prefix=resolved_settings.api_prefix,
     )
 

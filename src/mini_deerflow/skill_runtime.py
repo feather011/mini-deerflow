@@ -23,11 +23,12 @@ class SkillContextProvider(Protocol):
     - 不持久化状态到 ThreadState
     """
 
-    def build(self, user_input: str) -> str:
+    def build(self, user_input: str, thread_id: str = "") -> str:
         """根据用户输入构建并返回 Skill 上下文文本。
 
         Args:
             user_input: 本轮用户原始输入
+            thread_id: 当前线程 ID（可选，供需要区分项目会话的 Provider 使用）
 
         Returns:
             Skill 上下文文本，无选中 Skill 时返回空字符串
@@ -61,7 +62,7 @@ class DefaultSkillContextProvider:
         self._loader = loader
         self._builder = builder
 
-    def build(self, user_input: str) -> str:
+    def build(self, user_input: str, thread_id: str = "") -> str:
         """根据用户输入构建 Skill 上下文。
 
         执行顺序：
@@ -70,6 +71,10 @@ class DefaultSkillContextProvider:
         3. 无选择时返回 ""
         4. 有选择时调用 loader.load_selected()
         5. 调用 builder.build() 构建上下文并返回
+
+        Args:
+            user_input: 本轮用户原始输入
+            thread_id: 当前线程 ID（可选）
         """
         if not isinstance(user_input, str):
             raise TypeError(

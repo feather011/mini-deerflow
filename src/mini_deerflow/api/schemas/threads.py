@@ -1,4 +1,4 @@
-"""Thread REST API 的 Pydantic Schema（19B 阶段）。
+"""Thread REST API Pydantic Schema (19B 阶段).
 
 设计原则：
 - 公开契约只暴露稳定字段；ThreadState 内部的 schema_version 不外泄。
@@ -33,6 +33,7 @@ class ThreadDetail(BaseModel):
     """详情：thread_id + 完整消息列表。"""
 
     thread_id: str
+    project_id: str | None = None  # 如果属于项目，则为项目 ID
     messages: list[MessageResponse] = Field(default_factory=list)
 
 
@@ -43,12 +44,13 @@ class ThreadListResponse(BaseModel):
 
 
 class CreateThreadRequest(BaseModel):
-    """POST /api/threads 请求体。thread_id 可选；缺省由服务端生成。"""
+    """POST /api/threads 请求体。thread_id 可选；缺省由服务端生成 UUID4 风格的 ID。
 
-    thread_id: str | None = Field(
-        default=None,
-        description="可选客户端 ID；缺省时由服务端生成 UUID4 风格的 ID。",
-    )
+    project_id 可选；指定时创建项目内会话。
+    """
+
+    thread_id: str | None = Field(default=None)
+    project_id: str | None = Field(default=None)
 
 
 def message_to_response(role: str, content: str) -> MessageResponse:
@@ -64,6 +66,7 @@ def thread_to_summary(thread_id: str) -> ThreadSummary:
 def thread_to_detail(
     thread_id: str,
     messages: list[tuple[str, str]],
+    project_id: str | None = None,
 ) -> ThreadDetail:
     """由 ID + 消息字段列表构造详情。
 
@@ -71,5 +74,6 @@ def thread_to_detail(
     """
     return ThreadDetail(
         thread_id=thread_id,
+        project_id=project_id,
         messages=[message_to_response(role, content) for role, content in messages],
     )

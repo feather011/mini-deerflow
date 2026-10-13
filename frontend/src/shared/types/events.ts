@@ -36,6 +36,7 @@ export type RunEventType =
   | 'tool.started'
   | 'tool.completed'
   | 'tool.failed'
+  | 'run.result'
   | 'run.completed'
   | 'run.failed'
   | 'run.timed_out'
@@ -68,6 +69,8 @@ export interface RunEvent {
   tool_name: string | null
   /** 持续时间（可选） */
   duration_seconds: number | null
+  /** run.result 事件携带 project_execute 结构化结果（JSON 字符串） */
+  tool_result?: string | null
 }
 
 /** 判断事件是否为终态 */

@@ -40,9 +40,10 @@ from mini_deerflow.middleware import (
     TraceMiddleware,
     TraceSink,
 )
-from mini_deerflow.context_assembler import ContextAssembler
+from mini_deerflow.context_assembler import AssembledContext, ContextAssembler
 from mini_deerflow.context_compactor import ContextCompactor
 from mini_deerflow.context_state import ContextPolicy
+from mini_deerflow.context_usage import ContextUsageSnapshot
 from mini_deerflow.context_store import (
     ContextStore,
     InMemoryContextStore,
@@ -64,7 +65,24 @@ from mini_deerflow.thread_run_coordinator import (
 )
 from mini_deerflow.thread_store import ThreadStore
 from mini_deerflow.token_counter import HeuristicTokenCounter
+from mini_deerflow.project_store import (
+    InMemoryProjectStore,
+    ProjectStore,
+    SQLiteProjectStore,
+)
 from mini_deerflow.tools import ToolRegistry
+
+# 项目锁：所有 RuntimeContext 实例共用同一进程级字典
+_PROJECT_LOCKS: dict[str, Lock] = {}
+_PROJECT_LOCKS_LOCK = Lock()
+
+
+def _get_project_lock(project_id: str) -> Lock:
+    """返回项目锁（惰性创建）。Agent 工具层与 API 层共用同一字典。"""
+    with _PROJECT_LOCKS_LOCK:
+        if project_id not in _PROJECT_LOCKS:
+            _PROJECT_LOCKS[project_id] = Lock()
+        return _PROJECT_LOCKS[project_id]
 
 
 if TYPE_CHECKING:
@@ -119,6 +137,11 @@ class RuntimeConfig:
     context_compaction_threshold: float = 0.8
     # 摘要专用 Provider 额度（与 max_model_calls 分开，见 Budget 说明）
     context_max_summary_calls: int = 20
+    # WM-3C Harness 执行器（未配置时不注册 project_execute 工具）
+    harness_root: str | None = None
+    harness_timeout_seconds: float = 600.0
+    # 模型调用真实超时（秒），0 = 不启用（使用 SDK 自带 timeout）
+    model_timeout_seconds: float = 0.0
 
 
 # =============================================================================
@@ -201,6 +224,10 @@ class IntegratedAgent:
         self._run_id_counter = 0
         self._run_id_lock = Lock()
         self._middlewares: list[Middleware] = []
+        # 按线程保存最近一次 run 捕获的上下文用量快照
+        self._last_usage_by_thread: dict[str, ContextUsageSnapshot] = {}
+        # 最近一次已捕获的 AssembledContext 引用（对象身份比较用）
+        self._last_captured_snapshot: "AssembledContext | None" = None
 
         # 构建中间件列表
         if trace_sink:
@@ -208,6 +235,37 @@ class IntegratedAgent:
         if extra_middlewares:
             self._middlewares.extend(extra_middlewares)
         self._middlewares.append(LoggingMiddleware())
+
+    def get_last_usage(self, thread_id: str) -> ContextUsageSnapshot | None:
+        """读取该 Thread 最近一次 run 捕获的上下文用量快照。
+
+        未发送过消息（或未启用 ContextAssembler）时返回 None。
+        """
+        return self._last_usage_by_thread.get(thread_id)
+
+    def _capture_last_usage(self, thread_id: str, run_id: str) -> None:
+        """run 结束后（含失败）捕获一次新的 assemble 快照。
+
+        用对象身份判断本轮是否产生了新的 AssembledContext：
+        Agent.run 只在 assemble() 成功返回后更新 `_last_assembled`，
+        因此 assemble 抛错时引用不变，`is` 比较为 True → 跳过捕获，
+        上一轮快照不被覆盖。
+        """
+        assembled = self._agent.last_assembled
+        if assembled is None or assembled is self._last_captured_snapshot:
+            return
+        # assembler 是注入 Agent 的同一个实例；它的 policy 即输入预算来源。
+        assembler = self._agent._context_assembler
+        if assembler is None:
+            return
+        snapshot = ContextUsageSnapshot.from_assembled(
+            thread_id=thread_id,
+            policy=assembler.policy,
+            assembled=assembled,
+            run_id=run_id,
+        )
+        self._last_usage_by_thread[thread_id] = snapshot
+        self._last_captured_snapshot = assembled
 
     def _next_run_id(self) -> str:
         with self._run_id_lock:
@@ -219,6 +277,7 @@ class IntegratedAgent:
         thread_id: str,
         user_input: str,
         run_id: str | None = None,
+        cancellation_token: "CancellationToken | None" = None,
     ) -> tuple[str, list[dict]]:
         """执行 Agent，带 Middleware。
 
@@ -227,6 +286,8 @@ class IntegratedAgent:
             user_input: 用户输入文本。
             run_id: 可选；调用方提供时原样使用（用于跨层 ID 贯通），
                 缺省时由本方法自动生成（向后兼容 CLI / 旧调用方）。
+            cancellation_token: 可选取消令牌；主任务停止时置位，
+                Agent 在每步开始检查，工具调用链透传给 HarnessRunner。
 
         Returns:
             (final_answer, trace_events) 元组。
@@ -239,16 +300,26 @@ class IntegratedAgent:
             thread_id=thread_id,
             operation=OperationType.AGENT_RUN,
             operation_name="agent_run",
+            cancellation_token=cancellation_token,
         )
 
         pipeline = MiddlewarePipeline(self._middlewares)
 
         def action() -> tuple[str, list[dict]]:
-            # 传 run_id：上下文组装与压缩的 Trace 需要它关联到本轮 Run。
-            # Agent.run 的 run_id 有默认值，既有调用方不受影响。
-            return self._agent.run(thread_id, user_input, run_id=effective_run_id)
+            # 传 run_id 和 cancellation_token：上下文组装与压缩需要前者，
+            # 步骤预算与停止传播需要后者。
+            return self._agent.run(
+                thread_id, user_input,
+                run_id=effective_run_id,
+                cancellation_token=cancellation_token,
+            )
 
-        return pipeline.execute(ctx, action)
+        # finally 捕获：即便 run 失败，本轮已完成的 assemble 快照也要保留
+        #（用于诊断；assemble 本身失败时由身份比较跳过，见 _capture_last_usage）。
+        try:
+            return pipeline.execute(ctx, action)
+        finally:
+            self._capture_last_usage(thread_id, effective_run_id)
 
 
 # =============================================================================
@@ -275,6 +346,9 @@ class RuntimeContext:
         mcp_manager: MCPClientManager | None = None,
         context_store: "ContextStore | None" = None,
         context_assembler: "ContextAssembler | None" = None,
+        project_store: ProjectStore | None = None,
+        project_roots: tuple[str, ...] = (),
+        workspaces_root: str | None = None,
     ) -> None:
         self.store = store
         self.agent = agent
@@ -297,12 +371,21 @@ class RuntimeContext:
         # 24 Context Engineering（context_enabled=False 时两者皆为 None）
         self.context_store = context_store
         self.context_assembler = context_assembler
+        # WM-4 Project Store（未启用时为 None）
+        self.project_store = project_store
+        self.project_roots = project_roots
+        # Phase 1：后端托管工作区目录
+        self._workspaces_root = Path(workspaces_root).expanduser().resolve() if workspaces_root else Path.home() / ".mini-deerflow" / "workspaces"
 
         # 注入 coordinator（构造期循环依赖，延后绑定）
         if self.agent_run_service is not None:
             self.agent_run_service._coordinator = self.thread_run_coordinator
         if self.run_stream_manager is not None:
             self.run_stream_manager._coordinator = self.thread_run_coordinator
+
+    def get_project_lock(self, project_id: str) -> Lock:
+        """返回项目锁（惰性创建）。Agent 工具层与 API 层共用同一字典。"""
+        return _get_project_lock(project_id)
 
     def shutdown(self) -> None:
         """关闭所有资源；幂等，重复调用安全。
@@ -455,6 +538,9 @@ def create_runtime(
     config: RuntimeConfig,
     run_id: str = "main",
     model: Model | None = None,
+    project_store: ProjectStore | None = None,
+    project_roots: tuple[str, ...] = (),
+    workspaces_root: str | None = None,
 ) -> RuntimeContext:
     """创建集成运行时。"""
     lifecycle = LifecycleManager()
@@ -545,6 +631,9 @@ def create_runtime(
             [tool for tool in context_tools if tool.name not in registered_names]
         )
 
+    # 项目锁字典（工具层与 API 层共用）
+    _project_locks: dict[str, Lock] = {}
+
     # SubagentManager
     manager: SubagentManager | None = None
     if config.subagent_enabled:
@@ -566,6 +655,37 @@ def create_runtime(
             parent_thread_id="default",
         )
         registry.register_many(tools)
+
+    # WM-3B：项目只读工具（始终注册，由 compute_thread_tool_allow_list 过滤可见性）
+    from mini_deerflow.project_tools import create_project_read_tools
+    if project_store is not None:
+        read_tools = create_project_read_tools(
+            thread_store=store,
+            project_store=project_store,
+        )
+        existing = {tool.name for tool in registry.list_tools()}
+        registry.register_many([t for t in read_tools if t.name not in existing])
+
+    # WM-3C：Harness 执行器（未配置时跳过工具注册）
+    harness_runner = None
+    if config.harness_root:
+        from mini_deerflow.harness_runner import HarnessRunner
+        harness_runner = HarnessRunner(
+            harness_root=config.harness_root,
+            timeout_seconds=config.harness_timeout_seconds,
+            max_tool_calls=50,
+        )
+        from mini_deerflow.project_tools import create_project_execute_tool
+        if project_store is not None:
+            tools = [
+                create_project_execute_tool(
+                    thread_store=store,
+                    project_store=project_store,
+                    runner=harness_runner,
+                    get_lock=_get_project_lock,
+                )
+            ]
+            registry.register_many([t for t in tools if t.name not in {tool.name for tool in registry.list_tools()}])
 
     # Agent（带 Middleware pipeline：Logging + Trace + Retry + Budget）
     # 19D：额外注入 RunEventMiddleware（同一实例同时挂在 IntegratedAgent.pipeline，
@@ -607,6 +727,7 @@ def create_runtime(
         middleware_pipeline=agent_pipeline,
         budget=budget,
         context_assembler=context_assembler,
+        model_timeout_seconds=config.model_timeout_seconds,
     )
 
     integrated_agent = IntegratedAgent(
@@ -674,6 +795,9 @@ def create_runtime(
         mcp_manager=mcp_manager,
         context_store=context_store,
         context_assembler=context_assembler,
+        project_store=project_store,
+        project_roots=project_roots,
+        workspaces_root=workspaces_root,
     )
 
 

@@ -17,6 +17,7 @@ class ThreadState:
 
     thread_id: str
     messages: list[Message] = field(default_factory=list)
+    project_id: str | None = None  # 关联的项目 ID（Phase 1 新字段）
 
     def __post_init__(self) -> None:
         if not isinstance(self.thread_id, str):
@@ -54,11 +55,14 @@ class ThreadState:
 
     def to_dict(self) -> dict[str, object]:
         """ThreadState 转字典；通过 snapshot() 读取消息，不暴露内部列表。"""
-        return {
+        d: dict[str, object] = {
             "schema_version": SCHEMA_VERSION,
             "thread_id": self.thread_id,
             "messages": [m.to_dict() for m in self.snapshot()],
         }
+        if self.project_id is not None:
+            d["project_id"] = self.project_id
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "ThreadState":
@@ -99,6 +103,7 @@ class ThreadState:
 
         # 原子恢复：先全部恢复为 Message，验证通过再写入 Thread
         messages = [Message.from_dict(m) for m in raw_messages]
-        thread = cls(thread_id=thread_id)
+        project_id = data.get("project_id")
+        thread = cls(thread_id=thread_id, project_id=project_id)
         thread.extend(messages)
         return thread

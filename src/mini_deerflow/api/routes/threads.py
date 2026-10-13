@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from mini_deerflow.api.dependencies import get_runtime
@@ -43,7 +45,28 @@ def get_thread_service(
 ) -> ThreadService:
     # 传 context_assembler：删除线程时同步回收 ContextState 与向量索引。
     # 用 getattr 容错：测试会注入不含该属性的 RuntimeContext 替身。
-    return ThreadService(runtime.store, getattr(runtime, "context_assembler", None))
+    # 传 workspaces_root + project_store：Thread 创建时分配 sessions 目录。
+    return ThreadService(
+        runtime.store,
+        getattr(runtime, "context_assembler", None),
+        getattr(runtime, "_workspaces_root", None),
+        getattr(runtime, "project_store", None),
+    )
+
+
+def get_project_service(
+    runtime: RuntimeContext = Depends(get_runtime),
+) -> "ProjectService":
+    """获取 ProjectService（用于查询项目内线程）。"""
+    from mini_deerflow.api.services.projects import ProjectService
+
+    ws_root = getattr(runtime, "_workspaces_root", None)
+    return ProjectService(
+        runtime.project_store,
+        str(ws_root) if ws_root else str(Path.home() / ".mini-deerflow" / "workspaces"),
+        runtime.store,
+        getattr(runtime, "context_assembler", None),
+    )
 
 
 @router.post(
@@ -63,15 +86,16 @@ def create_thread(
     service: ThreadService = Depends(get_thread_service),
 ) -> ThreadDetail:
     requested_id = payload.thread_id if payload else None
+    requested_project_id = payload.project_id if payload else None
     try:
-        thread = service.create(requested_id)
+        thread = service.create(requested_id, requested_project_id)
     except ThreadAlreadyExistsError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"线程已存在: {exc.thread_id}",
         ) from exc
     messages = [(m.role, m.content) for m in thread.snapshot()]
-    return thread_to_detail(thread.thread_id, messages)
+    return thread_to_detail(thread.thread_id, messages, thread.project_id)
 
 
 @router.get(
@@ -116,7 +140,7 @@ def get_thread(
             detail=f"未知线程: {exc.thread_id}",
         ) from exc
     messages = [(m.role, m.content) for m in thread.snapshot()]
-    return thread_to_detail(thread.thread_id, messages)
+    return thread_to_detail(thread.thread_id, messages, thread.project_id)
 
 
 @router.delete(
@@ -151,3 +175,41 @@ def delete_thread(
             detail=str(exc),
         ) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- 项目内线程路由（在 projects.py 中注册） ---
+
+
+def register_project_threads_router(
+    project_router: "APIRouter",
+    thread_service_fn,
+) -> None:
+    """在项目路由下注册项目内线程列表端点。
+
+    这个函数由 projects.py 调用，用于避免循环导入。
+    """
+    @project_router.get(
+        "/projects/{project_id}/threads",
+        response_model=ThreadListResponse,
+        summary="列出项目内线程",
+        description="返回属于指定项目的所有线程。",
+        responses={
+            200: {"description": "线程列表（可能为空）"},
+            404: {"description": "项目不存在"},
+        },
+    )
+    def list_project_threads(
+        project_id: str,
+    ) -> ThreadListResponse:
+        service = thread_service_fn()
+        try:
+            threads = service.list_project_threads(project_id)
+        except Exception as exc:
+            # ProjectNotFoundError 等
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        return ThreadListResponse(
+            threads=[thread_to_summary(t.thread_id) for t in threads],
+        )

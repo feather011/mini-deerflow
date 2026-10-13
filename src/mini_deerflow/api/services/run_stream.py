@@ -35,6 +35,7 @@ from mini_deerflow.api.services.agent_runs import (
     AgentRunTimeoutError,
 )
 from mini_deerflow.api.services.event_broker import RunEventBroker, iter_run_events
+from mini_deerflow.middleware import CancellationToken
 from mini_deerflow.thread_run_coordinator import ThreadRunCoordinator, ThreadRunConflictError
 
 
@@ -95,6 +96,8 @@ class RunStreamManager:
         self._service = agent_run_service
         self._coordinator = coordinator
         self._executor = executor
+        # 按 thread_id 存储取消令牌（一次只有一个 run）
+        self._tokens: dict[str, CancellationToken] = {}
 
     # ---------------------------------------------------------------- entry
 
@@ -126,15 +129,23 @@ class RunStreamManager:
         # 5. 订阅（必须在 executor.submit 之前）
         q = self._broker.subscribe(run_id)
 
-        # 6. 提交阻塞任务
-        future = self._executor.submit(self._execute, thread_id, message, run_id)
+        # 6. 创建取消令牌并注册
+        token = CancellationToken()
+        self._tokens[thread_id] = token
+
+        # 7. 提交阻塞任务（传入取消令牌）
+        future = self._executor.submit(
+            self._execute, thread_id, message, run_id, token
+        )
 
         return StreamHandle(run_id=run_id, queue=q, future=future, thread_id=thread_id)
 
     # ---------------------------------------------------------------- execution
 
-    def _execute(self, thread_id: str, message: str, run_id: str) -> None:
-        """在线程池 worker 中执行 Agent.run。
+    def _execute(
+        self, thread_id: str, message: str, run_id: str, token: CancellationToken
+    ) -> None:
+        """在线程池 worker 中执行 Agent.run（含取消令牌链路）。
 
         异常分类：
         - 同步返回 AgentRunResult → 发出 run.completed；
@@ -143,7 +154,9 @@ class RunStreamManager:
         - 其他异常 → 兜底 run.failed（安全文案）。
         """
         try:
-            result = self._service.run(thread_id, message, run_id=run_id)
+            result = self._service.run(
+                thread_id, message, run_id=run_id, cancellation_token=token
+            )
         except AgentRunTimeoutError as exc:
             self._emit_terminal(
                 run_id,
@@ -197,6 +210,25 @@ class RunStreamManager:
             answer=answer,
         )
         self._broker.publish_terminal(run_id, event)
+        # 清理取消令牌
+        self._tokens.pop(thread_id, None)
+
+    # ---------------------------------------------------------------- stop
+
+    def stop(self, thread_id: str) -> bool:
+        """停止指定 Thread 上的运行中的 run。
+
+        找到对应 token 并 cancel()：Agent.run 每步检查 is_cancelled()，
+        project_execute 透传给 HarnessRunner，子进程被回收。
+
+        Returns:
+            True = 已找到并取消；False = 该 Thread 没有正在运行的 run。
+        """
+        token = self._tokens.get(thread_id)
+        if token is None:
+            return False
+        token.cancel()
+        return True
 
     # ---------------------------------------------------------------- shutdown
 

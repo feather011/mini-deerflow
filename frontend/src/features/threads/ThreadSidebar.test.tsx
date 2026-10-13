@@ -9,7 +9,7 @@
  * vi.mock 会被 hoisted，mock 函数必须用 vi.hoisted() 声明。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -64,6 +64,7 @@ function makeQueryResult(overrides: {
 function renderSidebar(
   activeThreadId: string | null = null,
   initialPath = '/',
+  extraProps: { onOpenArtifacts?: () => void; onOpenSettings?: () => void } = {},
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -79,7 +80,10 @@ function renderSidebar(
       </MemoryRouter>
     )
   }
-  render(<ThreadSidebar activeThreadId={activeThreadId} />, { wrapper: Wrapper })
+  render(
+    <ThreadSidebar activeThreadId={activeThreadId} {...extraProps} />,
+    { wrapper: Wrapper },
+  )
 }
 
 beforeEach(() => {
@@ -273,5 +277,133 @@ describe('ThreadSidebar — 刷新', () => {
     mockUseThreads.mockReturnValue(makeQueryResult({ isLoading: true }))
     renderSidebar()
     expect(screen.getByLabelText('刷新会话列表')).toBeDisabled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 分组
+// ---------------------------------------------------------------------------
+
+describe('ThreadSidebar — 分组', () => {
+  it('project_id 非空归入「项目会话」，无字段或空值归入「普通会话」', () => {
+    mockUseThreads.mockReturnValue(makeQueryResult({
+      data: [
+        { thread_id: 'normal-1', messages: [] },
+        // 旧数据无 project_id 字段 → 普通会话
+        { thread_id: 'legacy-1', messages: [] },
+        { thread_id: 'proj-1', messages: [], project_id: 'p1' },
+        // 空字符串 → 普通会话
+        { thread_id: 'proj-empty', messages: [], project_id: '' },
+      ],
+    }))
+    renderSidebar()
+
+    const normalGroup = screen.getByText('普通会话').closest('section')
+    const projectGroup = screen.getByText('项目会话').closest('section')
+    if (!normalGroup || !projectGroup) {
+      throw new Error('分组容器未渲染为 section')
+    }
+
+    expect(within(normalGroup).getByText('normal-1')).toBeInTheDocument()
+    expect(within(normalGroup).getByText('legacy-1')).toBeInTheDocument()
+    expect(within(normalGroup).getByText('proj-empty')).toBeInTheDocument()
+    expect(within(normalGroup).queryByText('proj-1')).not.toBeInTheDocument()
+
+    expect(within(projectGroup).getByText('proj-1')).toBeInTheDocument()
+    expect(within(projectGroup).queryByText('normal-1')).not.toBeInTheDocument()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 搜索
+// ---------------------------------------------------------------------------
+
+describe('ThreadSidebar — 搜索', () => {
+  function mockThreadList() {
+    mockUseThreads.mockReturnValue(makeQueryResult({
+      data: [
+        { thread_id: 'alpha-chat', messages: [] },
+        { thread_id: 'beta-chat', messages: [{ role: 'user', content: '深度调研报告' }] },
+      ],
+    }))
+  }
+
+  it('按标题过滤会话列表', async () => {
+    mockThreadList()
+    renderSidebar()
+
+    await userEvent.type(screen.getByPlaceholderText('搜索会话'), 'alpha')
+    expect(screen.getByText('alpha-chat')).toBeInTheDocument()
+    expect(screen.queryByText('beta-chat')).not.toBeInTheDocument()
+  })
+
+  it('按最后一条消息过滤', async () => {
+    mockThreadList()
+    renderSidebar()
+
+    await userEvent.type(screen.getByPlaceholderText('搜索会话'), '调研报告')
+    expect(screen.getByText('beta-chat')).toBeInTheDocument()
+    expect(screen.queryByText('alpha-chat')).not.toBeInTheDocument()
+  })
+
+  it('无匹配显示空态「没有匹配的会话」', async () => {
+    mockThreadList()
+    renderSidebar()
+
+    await userEvent.type(screen.getByPlaceholderText('搜索会话'), 'zzz')
+    expect(screen.getByText('没有匹配的会话')).toBeInTheDocument()
+    expect(screen.queryByText('alpha-chat')).not.toBeInTheDocument()
+    expect(screen.queryByText('beta-chat')).not.toBeInTheDocument()
+  })
+
+  it('清空搜索恢复完整列表', async () => {
+    mockThreadList()
+    renderSidebar()
+
+    const input = screen.getByPlaceholderText('搜索会话')
+    await userEvent.type(input, 'alpha')
+    await userEvent.clear(input)
+
+    expect(screen.getByText('alpha-chat')).toBeInTheDocument()
+    expect(screen.getByText('beta-chat')).toBeInTheDocument()
+    expect(screen.queryByText('没有匹配的会话')).not.toBeInTheDocument()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 底部入口（成果库 / 设置）
+// ---------------------------------------------------------------------------
+
+describe('ThreadSidebar — 底部入口', () => {
+  it('点击「成果库」调用 onOpenArtifacts', async () => {
+    const onOpenArtifacts = vi.fn()
+    const onOpenSettings = vi.fn()
+    renderSidebar(null, '/', { onOpenArtifacts, onOpenSettings })
+
+    await userEvent.click(screen.getByRole('button', { name: '成果库' }))
+    expect(onOpenArtifacts).toHaveBeenCalledTimes(1)
+    expect(onOpenSettings).not.toHaveBeenCalled()
+  })
+
+  it('点击「设置」调用 onOpenSettings', async () => {
+    const onOpenArtifacts = vi.fn()
+    const onOpenSettings = vi.fn()
+    renderSidebar(null, '/', { onOpenArtifacts, onOpenSettings })
+
+    await userEvent.click(screen.getByRole('button', { name: '设置' }))
+    expect(onOpenSettings).toHaveBeenCalledTimes(1)
+    expect(onOpenArtifacts).not.toHaveBeenCalled()
+  })
+
+  it('未传回调时不渲染底部入口按钮', () => {
+    renderSidebar()
+    expect(screen.queryByRole('button', { name: '成果库' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '设置' })).not.toBeInTheDocument()
+  })
+
+  it('只传一个回调时只渲染对应按钮', () => {
+    renderSidebar(null, '/', { onOpenArtifacts: vi.fn() })
+    expect(screen.getByRole('button', { name: '成果库' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '设置' })).not.toBeInTheDocument()
   })
 })

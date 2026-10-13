@@ -28,6 +28,7 @@ class RunEventType(str, Enum):
     TOOL_STARTED = "tool.started"
     TOOL_COMPLETED = "tool.completed"
     TOOL_FAILED = "tool.failed"
+    RUN_RESULT = "run.result"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
     RUN_TIMED_OUT = "run.timed_out"
@@ -53,6 +54,9 @@ class RunEvent(BaseModel):
     operation: str | None = None
     tool_name: str | None = None
     duration_seconds: float | None = None
+
+    # run.result 事件携带 project_execute 的结构化结果（JSON 字符串形式）
+    tool_result: str | None = None
 
 
 def encode_sse(event: RunEvent) -> str:

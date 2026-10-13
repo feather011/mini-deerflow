@@ -491,7 +491,7 @@ def test_run_stream_manager_shutdown_never_waits(fresh_broker):
     store = InMemoryThreadStore()
     store.create("t1")
 
-    def slow_runner(thread_id, user_input, run_id=None):
+    def slow_runner(thread_id, user_input, run_id=None, cancellation_token=None):
         time.sleep(5.0)
         return ("reply", [])
 
@@ -847,7 +847,7 @@ def _build_manager(broker):
     store = InMemoryThreadStore()
     store.create("t1")
 
-    def runner(thread_id, user_input, run_id=None):
+    def runner(thread_id, user_input, run_id=None, cancellation_token=None):
         return (f"reply:{user_input}", [])
 
     coord = ThreadRunCoordinator()

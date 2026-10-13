@@ -29,10 +29,12 @@ export function useThreads() {
     queryKey: threadKeys.list(),
     queryFn: async ({ signal }) => {
       const res = await listThreads(signal)
-      // 列表项只有 thread_id，获取详情用于渲染
-      return Promise.all(
+      // 获取所有线程详情，过滤掉项目会话（只显示普通会话）
+      const all = await Promise.all(
         res.threads.map((s) => getThread(s.thread_id, signal)),
       )
+      // 只返回没有 project_id 的普通会话
+      return all.filter((t) => !t.project_id)
     },
   })
 }
@@ -67,9 +69,9 @@ export interface CreateThreadResult {
 export function useCreateThread() {
   const queryClient = useQueryClient()
 
-  return useMutation<ThreadDetail, ApiError, { signal?: AbortSignal }>({
-    mutationFn: async ({ signal }: { signal?: AbortSignal } = {}) =>
-      createThread(undefined, signal),
+  return useMutation<ThreadDetail, ApiError, { projectId?: string; signal?: AbortSignal }>({
+    mutationFn: async ({ projectId, signal }: { projectId?: string; signal?: AbortSignal } = {}) =>
+      createThread(projectId ? { project_id: projectId } : undefined, signal),
 
     onSuccess: () => {
       // 创建只改变 Thread 列表，已有 Thread 详情仍然有效

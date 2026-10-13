@@ -23,3 +23,5 @@ export {
 } from './hooks'
 export { useAgentStream } from './useAgentStream'
 export { getRunErrorMessage } from './runErrors'
+export { useContextUsage } from './useContextUsage'
+export { ContextUsageIndicator } from './ContextUsageIndicator'

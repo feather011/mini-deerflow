@@ -41,7 +41,7 @@ class ThreadDataCorruptedError(ThreadStoreError, ValueError):
 class ThreadStore(Protocol):
     """线程仓库：管理 ThreadState 的创建、读取、更新、删除与列表。"""
 
-    def create(self, thread_id: str) -> ThreadState: ...
+    def create(self, thread_id: str, project_id: str | None = None) -> ThreadState: ...
     def get(self, thread_id: str) -> ThreadState: ...
     def save(self, thread: ThreadState) -> None: ...
     def delete(self, thread_id: str) -> None: ...
@@ -58,11 +58,11 @@ class InMemoryThreadStore:
     def __init__(self) -> None:
         self._threads: dict[str, ThreadState] = {}
 
-    def create(self, thread_id: str) -> ThreadState:
+    def create(self, thread_id: str, project_id: str | None = None) -> ThreadState:
         """创建并保存新 Thread；重复 ID 抛出 ThreadAlreadyExistsError。"""
         if thread_id in self._threads:
             raise ThreadAlreadyExistsError(f"线程已存在: {thread_id}")
-        thread = ThreadState(thread_id=thread_id)
+        thread = ThreadState(thread_id=thread_id, project_id=project_id)
         self._threads[thread_id] = thread
         return thread
 
@@ -185,9 +185,9 @@ class SQLiteThreadStore:
 
         return restored
 
-    def create(self, thread_id: str) -> ThreadState:
+    def create(self, thread_id: str, project_id: str | None = None) -> ThreadState:
         """创建新 Thread；重复 ID 抛出 ThreadAlreadyExistsError。"""
-        thread = ThreadState(thread_id=thread_id)
+        thread = ThreadState(thread_id=thread_id, project_id=project_id)
         with self._lock:
             self._ensure_open()
             try:

@@ -30,10 +30,13 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
+    "concurrently": "^10.0.6",
+    "cross-env": "^10.1.0",
     "jsdom": "^29.1.1",
     "oxlint": "^1.81.0",
     "typescript": "~6.0.2",
     "vite": "^8.3.0",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.2",
+    "wait-on": "^9.5.1"
   }
 }

@@ -73,6 +73,7 @@ class FakeAgent:
         thread_id: str,
         user_input: str,
         run_id: str | None = None,
+        cancellation_token=None,
     ) -> tuple[str, list[dict]]:
         with self.lock:
             self.call_count += 1
@@ -771,7 +772,7 @@ def test_real_agent_failure_leaves_thread_unchanged() -> None:
 
     # 通过 monkey-patch integrated_agent.run 注入会失败的 FakeAgent
     class FailingAgent:
-        def __call__(self, thread_id, user_input, run_id=None):
+        def __call__(self, thread_id, user_input, run_id=None, cancellation_token=None):
             raise RuntimeError("agent internal failure")
 
     runtime.integrated_agent.run = FailingAgent()  # type: ignore[method-assign]

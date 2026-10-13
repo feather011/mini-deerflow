@@ -29,12 +29,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from datetime import timedelta
 from typing import Any, Mapping
 
-from mcp import Client
-from mcp.client.stdio import StdioServerParameters, get_default_environment
-from mcp.shared.exceptions import MCPError
-from mcp.types import REQUEST_TIMEOUT
+import anyio
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
+from mcp.shared.exceptions import McpError
 
 from mini_deerflow.mcp_adapter import MCPToolAdapter, detect_conflicts
 from mini_deerflow.mcp_bridge import (
@@ -71,6 +72,7 @@ def build_child_env(whitelist: Mapping[str, str]) -> dict[str, str]:
 async def _session_task(
     params: StdioServerParameters,
     call_timeout: float,
+    init_timeout: float,
     ctx: dict[str, Any],
     ready: threading.Event,
     errors: list[BaseException],
@@ -86,16 +88,46 @@ async def _session_task(
     """
     # asyncio.Event 必须在**事件循环线程内**创建；同步侧通过
     # portal.call(event.set) 触发，不会跨线程改状态。
+    _LOGGER.debug("MCP session task starting: server=%s", getattr(params, 'command', params.args[-1] if hasattr(params, 'args') else 'unknown'))
     stopping = asyncio.Event()
     ctx["stopping"] = stopping
     try:
-        async with Client(params, read_timeout_seconds=call_timeout) as client:
-            ctx["client"] = client
-            ready.set()
-            await stopping.wait()
+        # MCP 2.x: stdio_client 是 async generator，yield (read_stream, write_stream, process)
+        async with stdio_client(params) as (read_stream, write_stream):
+            client = ClientSession(
+                read_stream,
+                write_stream,
+                read_timeout_seconds=timedelta(seconds=init_timeout),
+            )
+            async with client:
+                # MCP 2.x: ClientSession 不会自动初始化，需要显式调用
+                await client.initialize()
+                ctx["client"] = client
+                ctx["init_ok"] = True  # 标记初始化成功，cleanup 时的 BrokenResourceError 不影响
+                ready.set()
+                await stopping.wait()
     except BaseException as exc:  # noqa: BLE001 - 记录后原样上抛
-        errors.append(exc)
-        raise
+        # 忽略 subprocess 正常退出导致的 BrokenResourceError（stdio_client 清理竞态，
+        # 不影响实际工具调用）。BrokenResourceError 可能直接抛出，也可能被包在
+        # ExceptionGroup 里。
+        should_raise = True
+        if isinstance(exc, ExceptionGroup):
+            broken = [e for e in exc.exceptions if isinstance(e, BrokenResourceError)]
+            if broken and len(broken) == len(exc.exceptions):
+                # 全部子异常都是 BrokenResourceError → 忽略
+                should_raise = False
+            elif broken:
+                # 混合异常：只去掉 BrokenResourceError，其余上抛
+                remaining = [e for e in exc.exceptions if not isinstance(e, BrokenResourceError)]
+                if not remaining:
+                    should_raise = False
+                elif remaining:
+                    exc = ExceptionGroup(str(exc), remaining)  # type: ignore
+        if should_raise:
+            errors.append(exc)
+            raise
+        # BrokenResourceError 被忽略：finally 照常执行，但 ready 置位后
+        # _start_one 会看到 ctx["init_ok"] 不为 True → 走 client is None 分支
     finally:
         # 连接失败时也走到这里，确保等待方不会卡到超时
         ready.set()
@@ -173,14 +205,26 @@ class MCPClientManager:
         for config in self._configs:
             try:
                 registered += self._start_one(config, registry)
-            except Exception as exc:  # noqa: BLE001 - 逐服务器隔离失败
+            except BaseException as exc:  # noqa: BLE001 - 逐服务器隔离失败
+                # 解包 ExceptionGroup，逐个记录子异常
+                if isinstance(exc, ExceptionGroup):
+                    for sub_exc in exc.exceptions:
+                        _LOGGER.warning(
+                            "MCP 服务器启动失败: server=%s required=%s error=%s",
+                            config.name,
+                            config.required,
+                            _safe_error(sub_exc),
+                        )
+                    exc = exc.exceptions[0]  # type: ignore
                 _LOGGER.warning(
                     "MCP 服务器启动失败: server=%s required=%s error=%s",
                     config.name,
                     config.required,
                     _safe_error(exc),
+                    exc_info=True,
                 )
                 if config.required:
+                    failed_required.append(config.name)
                     failed_required.append(config.name)
 
         self._started = True
@@ -210,7 +254,7 @@ class MCPClientManager:
         errors: list[BaseException] = []
 
         future = self._portal.submit(
-            _session_task(params, config.call_timeout, ctx, ready, errors)
+            _session_task(params, config.call_timeout, config.startup_timeout, ctx, ready, errors)
         )
         session = _Session(future, errors)
 
@@ -227,9 +271,14 @@ class MCPClientManager:
 
         session.client = ctx.get("client")
         session.stopping = ctx.get("stopping")
-        if session.client is None:
+        init_ok = ctx.get("init_ok")
+        if not init_ok or session.client is None:
+            _LOGGER.warning(
+                "MCP 服务器初始化未完成: server=%s init_ok=%s client=%s errors=%s",
+                config.name, init_ok, session.client is not None, errors,
+            )
             self._discard(config.name)
-            raise MCPStartupError(f"服务器 {config.name} 连接后未返回 client")
+            raise MCPStartupError(f"服务器 {config.name} 连接后未完成初始化")
 
         self._sessions[config.name] = session
 
@@ -243,6 +292,11 @@ class MCPClientManager:
             raise
 
         mcp_tools = getattr(tools, "tools", None) or []
+        _LOGGER.info(
+            "MCP 服务器已就绪: server=%s tools=%s",
+            config.name,
+            [t.name for t in mcp_tools],
+        )
         adapter = MCPToolAdapter(
             server_name=config.name,
             call_timeout=config.call_timeout,
@@ -289,6 +343,17 @@ class MCPClientManager:
 
     # ---------------------------------------------------------------- 调用
 
+    async def _call_with_timeout(self, coro: Coroutine, timeout: float) -> Any:
+        """带独立 timeout scope 的协程调用。
+
+        独立 scope 意味着：cancel 只传播到本协程，不杀死外层 session。
+        """
+        try:
+            async with asyncio.timeout(timeout):
+                return await coro
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"MCP 操作超过 {timeout} 秒未返回") from None
+
     def _invoke(self, qualified_name: str, arguments: Mapping[str, Any],
                 timeout: float) -> str:
         """Tool.handler 的回调：同步调用异步 MCP。
@@ -297,11 +362,11 @@ class MCPClientManager:
 
         超时为什么有两层、且必须归一：
         - `read_timeout_seconds` 是协议层超时，会干净地结束这次请求；
-        - `portal.run(timeout=...)` 是外层兜底，防止事件循环整体卡死。
+        - portal.run(timeout=...) 是外层兜底，防止事件循环整体卡死。
         两者若都取同一个值，**谁先到就有随机性**，于是同一个"调用超时"
-        有时抛 `TimeoutError`、有时抛 MCP 协议错误。这里把外层放宽
-        `+_TIMEOUT_BACKSTOP` 秒（协议层先到），并把协议层的
-        `REQUEST_TIMEOUT` 也映射成 `TimeoutError`，让调用方只面对一种语义。
+        有时抛 TimeoutError、有时抛 MCP 协议错误。这里把外层放宽
+        +_TIMEOUT_BACKSTOP 秒（协议层先到），并把协议层的
+        REQUEST_TIMEOUT 也映射成 TimeoutError，让调用方只面对一种语义。
         """
         entry = self._tools.get(qualified_name)
         if entry is None:
@@ -314,22 +379,25 @@ class MCPClientManager:
             raise PortalClosedError("MCP 客户端管理器未启动或已关闭")
 
         try:
+            coro = session.client.call_tool(
+                original_name,
+                dict(arguments),
+                read_timeout_seconds=timedelta(seconds=timeout),
+            )
+            # 独立 timeout scope：只 cancel 这一个 tool call，不杀死 session
             result = portal.run(
-                session.client.call_tool(
-                    original_name,
-                    dict(arguments),
-                    read_timeout_seconds=timeout,
-                ),
-                timeout=timeout + _TIMEOUT_BACKSTOP,
+                self._call_with_timeout(coro, timeout + _TIMEOUT_BACKSTOP),
+                timeout=timeout + _TIMEOUT_BACKSTOP + 5,
             )
         except PortalTimeoutError as exc:
             raise TimeoutError(str(exc)) from None
-        except MCPError as exc:
-            if getattr(exc, "code", None) == REQUEST_TIMEOUT:
-                # from None：不把 SDK 协议栈带进 traceback，只保留稳定语义
-                raise TimeoutError(
-                    f"MCP 工具调用超时（{timeout}s，{qualified_name}）"
-                ) from None
+        except asyncio.CancelledError:
+            # Tool call 被独立 scope cancel，不杀死 session
+            raise TimeoutError(f"MCP 操作超过 {timeout} 秒未返回") from None
+        except McpError as exc:
+            # MCP 层也可能有超时（如 "Timed out while waiting for response"）
+            if "timed out" in str(exc).lower() or "timeout" in str(exc).lower():
+                raise TimeoutError(str(exc)) from None
             raise
 
         return _render_result(result)

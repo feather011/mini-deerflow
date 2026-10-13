@@ -9,9 +9,11 @@ import type { ErrorDetail } from './index'
 /**
  * POST /api/threads 请求体
  * thread_id 为可选字段；不指定时由服务端生成 UUID4 风格的 ID。
+ * project_id 为可选字段；指定时创建项目内会话。
  */
 export interface CreateThreadRequest {
   thread_id?: string
+  project_id?: string
 }
 
 /**
@@ -34,6 +36,7 @@ export interface ThreadSummary {
  */
 export interface ThreadDetail {
   thread_id: string
+  project_id?: string | null  // 如果属于项目，则为项目 ID
   messages: MessageResponse[]
 }
 

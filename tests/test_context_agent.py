@@ -350,7 +350,7 @@ def test_memory_and_skill_injected_exactly_once() -> None:
             return "MEMORY_CONTEXT_MARK"
 
     class SkillProvider:
-        def build(self, user_input: str) -> str:
+        def build(self, user_input: str, thread_id: str = "") -> str:
             return "SKILL_CONTEXT_MARK"
 
     assembler = _assembler(store, model, enable_compaction=False)

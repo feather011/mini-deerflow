@@ -57,11 +57,11 @@ class RecordingSkillProvider:
     def __init__(self, context: str) -> None:
         self._context = context
         self.call_count = 0
-        self.calls: list[tuple[str, ...]] = []
+        self.calls: list[tuple[str, str]] = []
 
-    def build(self, user_input: str) -> str:
+    def build(self, user_input: str, thread_id: str = "") -> str:
         self.call_count += 1
-        self.calls.append((user_input,))
+        self.calls.append((user_input, thread_id))
         return self._context
 
 
@@ -80,14 +80,14 @@ class RecordingModel:
 class FailingSkillProvider:
     """总是抛异常的 SkillContextProvider。"""
 
-    def build(self, user_input: str) -> str:
+    def build(self, user_input: str, thread_id: str = "") -> str:
         raise RuntimeError("SkillProvider 失败")
 
 
 class NonStringSkillProvider:
     """返回非字符串的 SkillContextProvider。"""
 
-    def build(self, user_input: str) -> str:
+    def build(self, user_input: str, thread_id: str = "") -> str:
         return 123  # type: ignore
 
 

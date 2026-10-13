@@ -4,6 +4,7 @@
 - AGENT_RUN：run.started / run.completed / run.failed（仅 started/completed；终态失败由 RunStreamManager 统一发）
 - MODEL_CALL：model.started / model.completed / model.failed
 - TOOL_CALL：tool.started / tool.completed / tool.failed
+- project_execute 工具成功：额外发出 run.result（携带 changes/verification 等结构化结果）
 
 挂载点：
 - 必须挂在 Agent 的 pipeline（看到 MODEL/TOOL）
@@ -125,6 +126,15 @@ class RunEventMiddleware(Middleware[Any]):
                 operation="tool",
                 tool_name=ctx.operation_name,
             )
+            # 25：project_execute 成功时发出 run.result（携带 changes/verification）
+            # 只在返回字符串且形似 JSON 时发出；其余工具直接忽略
+            if ctx.operation_name == "project_execute" and isinstance(result, str) and result.strip().startswith("{"):
+                self._publish(
+                    run_id,
+                    thread_id,
+                    RunEventType.RUN_RESULT,
+                    tool_result=result,
+                )
         return result
 
     def error(self, ctx: ExecutionContext, exc: Exception) -> Exception:

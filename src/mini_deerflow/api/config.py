@@ -71,6 +71,17 @@ class ApiSettings:
     db_path: str | None = None
     """SQLite 数据库路径。None = 内存 ThreadStore（开发/测试默认，重启即失）。"""
 
+    # ---- 项目工作模式（第 2 步 → 托管工作区）----
+    workspaces_root: str | None = None
+    """托管工作区根目录。None = ~/.mini-deerflow/workspaces（自动 resolve）。"""
+
+    # ---- Harness 执行器（WM-3C 项目工作模式）----
+    harness_root: str | None = None
+    """Harness 非交互入口所在仓库根目录。设置后 project_execute 工具才注册。
+    None = 不启用执行器（普通讨论/澄清/只读探索模式）。"""
+    harness_timeout_seconds: float = 600.0
+    """单次 project_execute 任务的硬超时（秒），超时后强制终止进程树。"""
+
     def __post_init__(self) -> None:
         """从环境变量覆盖各字段。"""
         # 使用 object.__setattr__ 因为 frozen=True
@@ -101,6 +112,24 @@ class ApiSettings:
         env_db = _get_env("DB_PATH", None)
         if env_db is not None and env_db.strip():
             object.__setattr__(self, "db_path", env_db.strip())
+        # 项目工作区根目录
+        env_ws_root = _get_env("WORKSPACES_ROOT", None)
+        if env_ws_root is not None and env_ws_root.strip():
+            object.__setattr__(self, "workspaces_root", env_ws_root.strip())
+        # Harness 执行器根目录
+        env_harness_root = _get_env("HARNESS_ROOT", None)
+        if env_harness_root is not None and env_harness_root.strip():
+            object.__setattr__(self, "harness_root", env_harness_root.strip())
+        env_harness_timeout = _get_env("HARNESS_TIMEOUT_SECONDS", None)
+        if env_harness_timeout is not None and env_harness_timeout.strip():
+            try:
+                object.__setattr__(
+                    self, "harness_timeout_seconds", float(env_harness_timeout.strip())
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"环境变量 MINI_DEERFLOW_HARNESS_TIMEOUT_SECONDS 必须为数字，当前值: {env_harness_timeout!r}"
+                ) from exc
         # 验证
         if self.max_upload_bytes < 0:
             raise ValueError(

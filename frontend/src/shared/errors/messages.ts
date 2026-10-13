@@ -8,7 +8,13 @@
  * 4. status=0 表示网络层失败（fetch reject / CORS），不是 HTTP 状态码。
  */
 
-export type ErrorContext = 'run' | 'file' | 'thread' | 'health' | 'generic'
+export type ErrorContext =
+  | 'run'
+  | 'file'
+  | 'thread'
+  | 'project'
+  | 'health'
+  | 'generic'
 
 /** 默认文案（未知上下文时使用） */
 const DEFAULT_MESSAGES: Record<number, string> = {
@@ -47,6 +53,13 @@ const CONTEXT_MESSAGES: Record<ErrorContext, Partial<Record<number, string>>> = 
     500: '会话服务异常',
     503: '会话服务暂不可用',
   },
+  project: {
+    400: '仓库路径非法或不是 Git 仓库',
+    404: '项目不存在或已被删除',
+    409: '该仓库已被其他项目绑定',
+    500: '项目服务异常',
+    503: '项目服务暂不可用',
+  },
   health: {
     503: '后端尚未就绪',
     500: '后端健康检查异常',
@@ -59,6 +72,7 @@ const CONTEXT_FALLBACK: Record<ErrorContext, string> = {
   run: '运行失败，请稍后重试',
   file: '操作失败，请稍后重试',
   thread: '加载失败，请稍后重试',
+  project: '项目操作失败，请稍后重试',
   health: '后端连接异常',
   generic: '操作失败，请稍后重试',
 }

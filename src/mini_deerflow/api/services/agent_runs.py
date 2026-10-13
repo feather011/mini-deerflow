@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
-from mini_deerflow.middleware import BudgetExceededError
+from mini_deerflow.middleware import BudgetExceededError, CancellationToken
 from mini_deerflow.thread_run_coordinator import ThreadRunCoordinator
 from mini_deerflow.thread_store import ThreadNotFoundError, ThreadStore
 
@@ -37,6 +37,7 @@ class Runner(Protocol):
         thread_id: str,
         user_input: str,
         run_id: str | None = None,
+        cancellation_token: "CancellationToken | None" = None,
     ) -> tuple[str, list[dict]]: ...
 
 
@@ -179,6 +180,7 @@ class AgentRunService:
         message: str,
         *,
         run_id: str | None = None,
+        cancellation_token: CancellationToken | None = None,
     ) -> AgentRunResult:
         """执行 Agent run；包含线程存在校验、并发占用、执行、释放。
 
@@ -213,9 +215,16 @@ class AgentRunService:
 
         try:
             try:
-                # 关键：把 run_id 透传给 Runner；Runner 不再生成第二个 ID
-                answer, _trace = self._runner(thread_id, message, run_id=run_id)
+                # 把 cancellation_token 透传给 IntegratedAgent.run → Agent.run → 工具
+                answer, _trace = self._runner(
+                    thread_id, message, run_id=run_id, cancellation_token=cancellation_token
+                )
             except BudgetExceededError as exc:
+                # 根据 resource 区分"主动停止"与"模型超时"
+                if exc.resource == "model_call_timeout":
+                    raise AgentRunTimeoutError(
+                        thread_id, run_id, timeout=None
+                    ) from exc
                 raise AgentBudgetExceededError(exc.resource, exc.limit) from exc
             except TimeoutError as exc:
                 # 底层抛 TimeoutError 但未携带真实时长；保留 None 以诚实表达
