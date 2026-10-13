@@ -1,0 +1,410 @@
+/* TaskInspector — 任务审查右侧面板（WM-FE1 子任务 B）
+ * 宽度规则来自原型：默认 365px；≥1500px 加宽 410px；≤1050px 收窄 320px。
+ * 颜色优先取全局 CSS 变量（styles.css），缺失的语义色局部定义（浅色主题）。 */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  width: 365px;
+  flex-shrink: 0;
+  min-height: 0;
+  height: 100%;
+  background: var(--color-bg, #ffffff);
+  border-left: 1px solid var(--color-border, #e5e7eb);
+  font-family: var(--font-sans, system-ui, sans-serif);
+  color: var(--color-text, #111827);
+}
+
+/* ---- 头部 ---- */
+
+.header {
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+  flex-shrink: 0;
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.title {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtitle {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--color-text-muted, #6b7280);
+  line-height: 1.5;
+}
+
+.closeBtn {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--color-text-muted, #6b7280);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.closeBtn:hover {
+  background: var(--color-bg-subtle, #f9fafb);
+  color: var(--color-text, #111827);
+}
+
+/* ---- 状态 pill（success/warning/danger 语义色，沿用原型语义） ---- */
+
+.pill {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1.2;
+  border-radius: 6px;
+  padding: 4px 7px;
+  white-space: nowrap;
+  background: var(--color-bg-subtle, #f9fafb);
+  color: var(--color-text-muted, #6b7280);
+}
+
+.pill[data-tone='success'] {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.pill[data-tone='warning'] {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.pill[data-tone='danger'] {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+/* ---- 页签 ---- */
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+  flex-shrink: 0;
+}
+
+.tab {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--color-text-muted, #6b7280);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--color-text, #111827);
+}
+
+.tabActive {
+  color: var(--color-text, #111827);
+  border-bottom-color: #16a34a;
+}
+
+/* ---- 内容区 ---- */
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.empty {
+  padding: 30px 8px;
+  color: var(--color-text-muted, #6b7280);
+  font-size: 12px;
+  text-align: center;
+  line-height: 1.9;
+}
+
+/* ---- 变化页签 ---- */
+
+.summary {
+  font-size: 12px;
+  color: var(--color-text-muted, #6b7280);
+  margin-bottom: 12px;
+}
+
+.fileList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.fileButton {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 11px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 7px;
+  cursor: pointer;
+  color: inherit;
+}
+
+.fileButtonActive {
+  background: #f0fdf4;
+  border-color: #86efac;
+}
+
+.fileSymbol {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: #16a34a;
+}
+
+.filePath {
+  flex: 1;
+  min-width: 0;
+  font-family: Consolas, 'SFMono-Regular', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fileCounts {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #16a34a;
+  white-space: nowrap;
+}
+
+/* ---- diff 渲染 ---- */
+
+.diff {
+  margin-top: 14px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.diffHead {
+  padding: 8px 10px;
+  font-size: 10px;
+  font-family: Consolas, 'SFMono-Regular', monospace;
+  color: var(--color-text-muted, #6b7280);
+  background: var(--color-bg-subtle, #f9fafb);
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+  overflow-wrap: anywhere;
+}
+
+.diffLines {
+  font-family: Consolas, 'SFMono-Regular', monospace;
+  font-size: 11px;
+  line-height: 1.85;
+  overflow-x: auto;
+  padding: 6px 0;
+}
+
+.diffLine {
+  display: flex;
+  white-space: pre;
+  min-width: max-content;
+  padding: 0 8px;
+}
+
+.diffLine[data-line-type='add'] {
+  background: #ecfdf5;
+}
+
+.diffLine[data-line-type='add'] .lineText {
+  color: #166534;
+}
+
+.diffLine[data-line-type='remove'] {
+  background: #fef2f2;
+}
+
+.diffLine[data-line-type='remove'] .lineText {
+  color: #991b1b;
+}
+
+.lineNo {
+  width: 26px;
+  flex-shrink: 0;
+  color: #9ca3af;
+  text-align: right;
+  padding-right: 8px;
+  user-select: none;
+}
+
+.lineText {
+  color: var(--color-text, #111827);
+}
+
+/* ---- 验证页签 ---- */
+
+.validationCard {
+  padding: 12px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 9px;
+  margin-bottom: 12px;
+}
+
+.validationHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.validationCommand {
+  font-family: Consolas, 'SFMono-Regular', monospace;
+  font-size: 10px;
+  color: var(--color-text-muted, #6b7280);
+  overflow-wrap: anywhere;
+}
+
+.validationOutput {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  font-family: Consolas, 'SFMono-Regular', monospace;
+  font-size: 11px;
+  line-height: 1.8;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--color-bg-subtle, #f9fafb);
+  border-radius: 6px;
+  color: var(--color-text, #111827);
+}
+
+.validationNote {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--color-text-muted, #6b7280);
+  line-height: 1.7;
+}
+
+.validationHint {
+  font-size: 11px;
+  color: var(--color-text-muted, #6b7280);
+  line-height: 1.8;
+  margin-top: 8px;
+}
+
+/* ---- 过程页签 ---- */
+
+.eventList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.event {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 9px;
+  font-size: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--color-border, #f3f4f6);
+}
+
+.event:last-child {
+  border-bottom: none;
+}
+
+.eventTime {
+  font-size: 10px;
+  font-family: Consolas, 'SFMono-Regular', monospace;
+  color: var(--color-text-muted, #6b7280);
+  padding-top: 2px;
+}
+
+.eventTitle {
+  font-weight: 500;
+}
+
+.eventDesc {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--color-text-muted, #6b7280);
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.eventError {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--color-red, #dc2626);
+  font-weight: 500;
+}
+
+.eventTerminal {
+  background: var(--color-bg-secondary, #f9fafb);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 4px 0;
+}
+
+.realEventsHeader {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-muted, #6b7280);
+  padding: 8px 0 4px;
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mockDivider {
+  font-size: 11px;
+  color: var(--color-text-muted, #6b7280);
+  padding: 8px 0;
+  margin: 0;
+  border-top: 1px dashed var(--color-border, #e5e7eb);
+  margin-top: 8px;
+}
+
+/* ---- 底部固定说明 ---- */
+
+.footer {
+  flex-shrink: 0;
+  padding: 10px 16px;
+  border-top: 1px solid var(--color-border, #e5e7eb);
+  font-size: 10px;
+  color: var(--color-text-muted, #6b7280);
+  line-height: 1.7;
+}
+
+/* ---- 响应式（原型规则） ---- */
+
+@media (min-width: 1500px) {
+  .panel {
+    width: 410px;
+  }
+}
+
+@media (max-width: 1050px) {
+  .panel {
+    width: 320px;
+  }
+}

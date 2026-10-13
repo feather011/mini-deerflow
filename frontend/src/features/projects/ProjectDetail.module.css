@@ -1,0 +1,35 @@
+/* ProjectDetail styles */
+
+.container {
+  padding: 24px;
+  max-width: 600px;
+}
+
+.header {
+  margin-bottom: 24px;
+}
+
+.title {
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--color-text-primary, #111827);
+  margin: 0 0 8px 0;
+}
+
+.meta {
+  font-size: 14px;
+  color: var(--color-text-secondary, #6b7280);
+  margin: 0;
+}
+
+.info {
+  padding: 16px;
+  background: var(--color-bg-secondary, #f9fafb);
+  border-radius: 8px;
+}
+
+.hint {
+  font-size: 14px;
+  color: var(--color-text-secondary, #6b7280);
+  margin: 0;
+}

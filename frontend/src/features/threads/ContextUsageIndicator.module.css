@@ -1,0 +1,398 @@
+/* ContextUsageIndicator — 圆环 + 浮层样式 */
+
+/* ========== 圆环按钮 ==========
+   结构：[小环(内含占比数字)] 状态文字 —— 两者横向排列，互不遮挡。 */
+.wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ringBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px 0 7px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 17px;
+  background: var(--color-bg, #fff);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  outline: none;
+  color: inherit;
+}
+
+.ringBtn:hover {
+  border-color: var(--color-border-strong, #cbd5e1);
+}
+
+.ringBtn:focus-visible {
+  outline: 2px solid var(--color-primary, #2563eb);
+  outline-offset: 2px;
+}
+
+.ringWrap {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ringSvg {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.ringTrack {
+  stroke: var(--color-border, #e5e7eb);
+}
+
+.ringFill {
+  stroke: currentColor;
+  transition: stroke-dasharray 0.2s;
+}
+
+.ringNumber {
+  position: relative;
+  z-index: 1;
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.ringStatus {
+  font-size: 11px;
+  line-height: 1;
+  color: var(--color-text-muted, #6b7280);
+  white-space: nowrap;
+}
+
+/* ========== 状态色：数字、环弧、状态文字三处同色，颜色与文字互相印证 ========== */
+.tone_error .ringNumber,
+.tone_error .ringStatus {
+  color: #b91c1c;
+}
+
+.tone_error .ringFill {
+  stroke: #ef4444;
+}
+
+.tone_error .ringBtn {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.tone_empty .ringNumber {
+  color: var(--color-text-muted, #6b7280);
+}
+
+.tone_empty .ringFill {
+  stroke: var(--color-text-muted, #9ca3af);
+}
+
+.tone_safe .ringNumber,
+.tone_safe .ringStatus {
+  color: #047857;
+}
+
+.tone_safe .ringFill {
+  stroke: #10b981;
+}
+
+.tone_warn .ringNumber,
+.tone_warn .ringStatus {
+  color: #b45309;
+}
+
+.tone_warn .ringFill {
+  stroke: #f59e0b;
+}
+
+.tone_critical .ringNumber,
+.tone_critical .ringStatus {
+  color: #b91c1c;
+}
+
+.tone_critical .ringFill {
+  stroke: #ef4444;
+}
+
+/* ========== 浮层 ========== */
+.popup {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  width: 300px;
+  background: var(--color-bg, #fff);
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+  padding: 14px 14px 10px;
+  z-index: 50;
+  text-align: left;
+  font-size: 13px;
+  color: var(--color-text, #1f2937);
+}
+
+.popupHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.popupTitle {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.popupBadge {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 500;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+
+.tone_safe.popupBadge {
+  color: #047857;
+  background: #ecfdf5;
+}
+
+.tone_warn.popupBadge {
+  color: #b45309;
+  background: #fffbeb;
+}
+
+.tone_critical.popupBadge {
+  color: #b91c1c;
+  background: #fef2f2;
+}
+
+.tone_error.popupBadge {
+  color: #b91c1c;
+  background: #fef2f2;
+}
+
+.tone_empty.popupBadge {
+  color: var(--color-text-muted, #6b7280);
+  background: var(--color-bg-subtle, #f9fafb);
+}
+
+/* ===== 头部：大号占用率 + 已使用/预算 ===== */
+.headline {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.headlinePct {
+  font-size: 26px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  /* 状态色：与圆环、badge 同一套语义，不是分类色 */
+  color: inherit;
+}
+
+.headlineUsed {
+  font-size: 12px;
+  color: var(--color-text-muted, #6b7280);
+  font-variant-numeric: tabular-nums;
+}
+
+.headlineMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--color-text-muted, #6b7280);
+}
+
+/* ===== 分段进度条 =====
+   每段宽度 = 分类值 / 输入预算（与占用率同口径）；
+   段间 2px 表面色间隙——用空白分隔，不给色块描边。 */
+.segTrack {
+  display: flex;
+  align-items: stretch;
+  height: 8px;
+  border-radius: 999px;
+  /* 轨道必须与面板底色拉得开：占用率常常只有 1%，
+     若轨道也接近白色，整条进度条会「看起来没画」。 */
+  background: var(--color-border, #e5e7eb);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.seg {
+  height: 100%;
+  flex: 0 0 auto;
+  transition: opacity 0.15s;
+}
+
+.seg:first-child {
+  border-top-left-radius: 999px;
+  border-bottom-left-radius: 999px;
+}
+
+.segDim {
+  opacity: 0.35;
+}
+
+.segActive {
+  opacity: 1;
+}
+
+/* ===== 压缩行 ===== */
+.compactionRow {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 6px 8px;
+  background: var(--color-bg-subtle, #f9fafb);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.compactionLabel {
+  color: var(--color-text-muted, #6b7280);
+  flex-shrink: 0;
+}
+
+.compactionValue {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.compactionDelta {
+  color: var(--color-text-muted, #6b7280);
+  font-size: 11px;
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== 分区明细：圆点 + 标签 …… 数值 · 百分比（9 项全显示，含 0%） ===== */
+.breakdownTitle {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--color-text-muted, #6b7280);
+}
+
+.breakdown {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.breakdownRow {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  padding: 2px 4px;
+  margin: 0 -4px;
+  border-radius: 4px;
+  cursor: default;
+}
+
+.breakdownRowActive {
+  background: var(--color-bg-subtle, #f9fafb);
+}
+
+/* 圆点带 2px 表面色 ring：与分段重叠时仍可辨认 */
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--color-bg, #fff);
+  flex-shrink: 0;
+}
+
+.breakdownLabel {
+  color: var(--color-text, #1f2937);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.breakdownValue {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* tokens 是次要信息；百分比是右对齐的阅读主入口 */
+.breakdownTokens {
+  color: var(--color-text-muted, #6b7280);
+  font-size: 11px;
+  min-width: 44px;
+  text-align: right;
+}
+
+.breakdownRatio {
+  color: var(--color-text, #1f2937);
+  font-weight: 600;
+  min-width: 38px;
+  text-align: right;
+}
+
+.popupFooter {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--color-border, #e5e7eb);
+  font-size: 10px;
+  color: var(--color-text-muted, #9ca3af);
+}
+
+/* ===== 空态 / 错误态 ===== */
+.emptyState,
+.errorState {
+  padding: 4px 0;
+}
+
+.errorState .emptyTitle {
+  color: var(--color-danger, #b91c1c);
+}
+
+.emptyTitle {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.emptyHint {
+  font-size: 12px;
+  color: var(--color-text-muted, #6b7280);
+  line-height: 1.4;
+}
+
+/* ========== 窄屏 ==========
+   圆环位于输入框右下角，浮层相对它向上弹出（right:0 即右对齐圆环右缘，
+   而圆环本身距视口右缘只有输入区内边距），因此 absolute 定位不会横向溢出。
+   这里只补一条：浮层不得宽过视口。 */
+@media (max-width: 480px) {
+  .popup {
+    width: min(300px, calc(100vw - 24px));
+    max-height: calc(100vh - 140px);
+    overflow-y: auto;
+  }
+}

@@ -1,0 +1,337 @@
+/* ProjectSidebar — 项目列表侧边栏（展开结构） */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.sidebarHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+  flex-shrink: 0;
+}
+
+.sidebarTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary, #111827);
+  margin: 0;
+}
+
+.sidebarActions {
+  display: flex;
+  gap: 4px;
+}
+
+/* 按钮基础样式 */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 6px;
+  background: var(--color-bg, #fff);
+  color: var(--color-text-secondary, #374151);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+  line-height: 1.5;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--color-bg-hover, #f9fafb);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btnPrimary {
+  background: var(--color-primary, #2563eb);
+  border-color: var(--color-primary, #2563eb);
+  color: #fff;
+}
+
+.btnPrimary:hover:not(:disabled) {
+  background: var(--color-primary-hover, #1d4ed8);
+}
+
+.btnDanger {
+  color: var(--color-danger, #dc2626);
+  border-color: transparent;
+  background: transparent;
+  padding: 4px 6px;
+  min-width: 28px;
+}
+
+.btnDanger:hover:not(:disabled) {
+  background: #fef2f2;
+}
+
+.btnIcon {
+  padding: 4px 8px;
+  min-width: 24px;
+  font-weight: bold;
+}
+
+/* 列表区域 */
+.list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 项目项 */
+.projectItem {
+  display: flex;
+  flex-direction: column;
+}
+
+.projectRow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.projectRow:hover {
+  background: var(--color-bg-hover, #f9fafb);
+}
+
+.expandBtn {
+  background: none;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.chevron {
+  display: inline-block;
+  transition: transform 0.2s;
+}
+
+.chevronExpanded {
+  transform: rotate(90deg);
+}
+
+.projectName {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-primary, #111827);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.projectActions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.projectRow:hover .projectActions {
+  opacity: 1;
+}
+
+/* 会话列表 */
+.threadList {
+  padding-left: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.threadItem {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.threadItem:hover {
+  background: var(--color-bg-hover, #f9fafb);
+}
+
+.threadItemActive {
+  background: #eff6ff;
+  border: 1px solid var(--color-primary, #2563eb);
+}
+
+.threadItemActive .threadName {
+  color: var(--color-primary, #2563eb);
+  font-weight: 500;
+}
+
+.threadName {
+  flex: 1;
+  font-size: 13px;
+  color: var(--color-text-secondary, #374151);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.threadItem:hover .threadName {
+  color: var(--color-text-primary, #111827);
+}
+
+/* 加载状态 */
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 13px;
+  gap: 8px;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--color-border, #e5e7eb);
+  border-top-color: var(--color-primary, #2563eb);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+.spinnerSm {
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--color-border, #e5e7eb);
+  border-top-color: var(--color-primary, #2563eb);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  display: inline-block;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.threadLoading {
+  display: flex;
+  align-items: center;
+  padding: 8px 10px;
+  color: var(--color-text-secondary, #6b7280);
+  font-size: 12px;
+  gap: 6px;
+}
+
+/* 空状态 */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  gap: 8px;
+  text-align: center;
+  flex: 1;
+}
+
+.emptyIcon {
+  font-size: 32px;
+  opacity: 0.4;
+}
+
+.emptyTitle {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text-primary, #111827);
+  margin: 0;
+}
+
+.emptyBody {
+  font-size: 12px;
+  color: var(--color-text-secondary, #374151);
+  margin: 0;
+  max-width: 200px;
+}
+
+.emptyThreads {
+  padding: 8px 10px;
+  color: var(--color-text-muted, #9ca3af);
+  font-size: 12px;
+}
+
+/* 错误状态 */
+.error {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  margin: 8px;
+  border-radius: 6px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+}
+
+.threadError {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  margin: 4px 0;
+  border-radius: 6px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+}
+
+.retryBtn {
+  background: none;
+  border: 1px solid var(--color-border, #e5e7eb);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--color-text-secondary, #374151);
+}
+
+.retryBtn:hover {
+  background: var(--color-bg-hover, #f9fafb);
+}
+
+/* 删除确认 */
+.confirmDelete {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
