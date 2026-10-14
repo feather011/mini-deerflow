@@ -7,3 +7,15 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv/
+
+# 调试文件（已清理的诊断脚本）
+tests/debug_*.py
+tests/test_e2e_snapshot_sse.py
+
+# 运行时工作目录
+workmode/
+workspaces/
+
+# 前端临时目录
+frontend/pnpm-lock.yaml
+frontend/node_modules/

@@ -106,4 +106,66 @@ describe('MessageList', () => {
     expect(screen.getByText('tool')).toBeInTheDocument()
     expect(screen.getByText('tool result')).toBeInTheDocument()
   })
+
+  // ====== UX-1 子任务 3：乐观消息渲染与去重 ======
+
+  it('乐观消息正常渲染并显示 role=user', () => {
+    const serverMessages: MessageResponse[] = []
+    const optimistic = {
+      clientId: 'local-abc123',
+      content: '发送中的消息',
+      status: 'pending' as const,
+      createdAt: Date.now(),
+    }
+    render(<MessageList messages={serverMessages} optimisticMessage={optimistic} />)
+    expect(screen.getByText('发送中的消息')).toBeInTheDocument()
+    const msgEl = screen.getByText('发送中的消息').closest('[data-role]')
+    expect(msgEl).toHaveAttribute('data-role', 'user')
+  })
+
+  it('乐观消息有正确的 data-submit-status 属性', () => {
+    const optimistic = {
+      clientId: 'local-abc123',
+      content: '发送中的消息',
+      status: 'pending' as const,
+      createdAt: Date.now(),
+    }
+    render(<MessageList messages={[]} optimisticMessage={optimistic} />)
+    const msgEl = document.querySelector('[data-submit-status]')
+    expect(msgEl).toBeInTheDocument()
+    expect(msgEl).toHaveAttribute('data-submit-status', 'pending')
+  })
+
+  it('服务端历史已含同 content 的 user 消息时，乐观消息不重复渲染', () => {
+    const serverMessages: MessageResponse[] = [
+      { role: 'user', content: '发送中的消息' },
+      { role: 'assistant', content: '服务端回复' },
+    ]
+    const optimistic = {
+      clientId: 'local-abc123',
+      content: '发送中的消息',
+      status: 'submitted' as const,
+      createdAt: Date.now(),
+    }
+    render(<MessageList messages={serverMessages} optimisticMessage={optimistic} />)
+    // 只有一条"发送中的消息"（来自服务端），没有重复
+    expect(screen.getAllByText('发送中的消息')).toHaveLength(1)
+    expect(screen.getByText('服务端回复')).toBeInTheDocument()
+  })
+
+  it('服务端无匹配时，乐观消息追加在列表末尾', () => {
+    const serverMessages: MessageResponse[] = [
+      { role: 'user', content: '上一条消息' },
+    ]
+    const optimistic = {
+      clientId: 'local-xyz789',
+      content: '发送中的消息',
+      status: 'pending' as const,
+      createdAt: Date.now(),
+    }
+    render(<MessageList messages={serverMessages} optimisticMessage={optimistic} />)
+    expect(screen.getAllByText('发送中的消息')).toHaveLength(1)
+    // 列表中有两条消息
+    expect(screen.getAllByText(/发送中的消息|上一条消息/)).toHaveLength(2)
+  })
 })

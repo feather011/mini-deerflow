@@ -2005,3 +2005,144 @@ test_run_result_事件出现在_SSE_流中  ✅ PASS
 ### 遗留说明
 
 三项实测覆盖"明确执行意图"场景。更广泛的模型可靠性（不同措辞、边界情况）继续纳入任务评测；WM-BUG-01A/01B 这组复现场景已关闭。
+
+
+## UX 阶段：输入与发送体验（2026-10-14 起）
+
+Mini-DeerFlow 进入用户体验阶段，第一轮为“输入与发送体验”。
+本阶段以“保留已交付能力 + 修补四个缺口”为原则；不改 SSE 协议、不动后端、不引入自动重试。
+
+### 状态分离原则（强制）
+
+首版即明确：**消息是否已提交、任务是否成功、连接是否正常是三个独立状态，不能混为一谈。**
+
+| 维度 | 状态机 |
+|------|--------|
+| **消息提交** | `pending`（提交中）→ `submitted`（服务端确认）/ `unknown`（连接中断但提交状态不明）/ `failed`（明确提交失败，如网络层确认拒绝） |
+| **任务结果** | `idle` / `running` / `succeeded` / `failed` / `stopped`（独立维度；与消息提交解耦） |
+| **SSE 连接** | `idle` / `connecting` / `streaming` / `closed` / `errored` |
+
+UI 表现：
+- 提交状态独立成用户消息气泡的“已发送/未知/失败”标记；连接断了不动用户消息状态。
+- `run.failed` ≠ 用户消息没发出去。用户气泡保留 `submitted`；任务失败另行展示在任务/工具维度。
+- SSE 断开 → 消息状态为 `unknown`；**不**立刻标 `failed`、**不**立刻开 `canSend=true` 引导重复执行。
+
+### 现有能力核查（12 项）
+
+| # | 能力 | 状态 | 证据 |
+|---|------|------|------|
+| 1 | 点击发送 | ✅ 已有 | `MessageComposer.tsx:69` 受 `canSend` 门控 |
+| 2 | Enter 发送 | ✅ 已有 | `MessageComposer.tsx:41-45` 拦截非 Shift 的 Enter |
+| 3 | Shift+Enter 换行 | ✅ 已有 | 同上，浏览器默认行为保留 |
+| 4 | 中文输入法选字不误发送 | ❌ 未实现 | 无 `onCompositionStart/End` 守卫，无 keyboard `isComposing` 检查 |
+| 5 | 空消息保护 | ✅ 已有 | `MessageComposer.tsx:26` `isEmpty + isPending` |
+| 6 | 防重复提交 | ⚠️ 部分实现 | 依赖 React render 后 `disabled`；无入口处即时守卫 |
+| 7 | 用户消息立即显示 | ⚠️ 部分实现 | 输入框立即清空；`MessageList` 取缓存，终态才显示 |
+| 8 | 发送/等待状态分离 | ⚠️ 部分实现 | 当前状态机混淆提交/任务/连接三者 |
+| 9 | 失败保留输入 | ❌ 未实现 | `handleSend` 提前 `setValue('')`；无回填路径 |
+| 10 | 结果不明不自动重发 | ✅ 已有 | `useAgentStream` 无 retry/reconnect |
+| 11 | 现有停止入口 | ✅ 已有 | e2e Test5 已验证 |
+| 12 | 窄屏按钮可访问 | ❓ 待核查 | CSS 无断点规则；待实际验证 |
+
+**汇总**：6 已有 + 3 部分实现 + 2 未实现 + 1 待核查。本轮范围仅覆盖需要修补的入口；其余保持不动。
+
+### 范围（5 个子任务）
+
+1. **IME 选字保护**：补 `onCompositionStart/End` 守卫 + keyboard 事件 `isComposing` 检查；期间 Enter 不发、`canSend` 维持 false。
+2. **防重复提交（立即守卫）**：发送入口（onClick / onKeyDown / onSubmit）在入口处立即检查“已提交”标志位（ref / 本地变量），不依赖 React render 同步的 disabled 属性。
+3. **状态机分离**：用户消息提交状态 / 任务结果状态 / SSE 连接状态三层解耦；前端有独立显示区；`run.failed` 不动用户消息状态。
+4. **乐观气泡 + 去重 + 归属**：
+   - 用户消息分配 `clientId = local-${nanoid}`，切到 `pending` 立即渲染本地副本。
+   - 服务端历史回来后按 `clientId` + 内容匹配 client 侧条目，替换/合并为真实条目，避免显示两条。
+   - 切换 thread 后，旧流 run.* 事件不能修改新 thread 的乐观气泡或草稿（按 threadId 过滤）。
+5. **草稿保护（按 threadId 分键）**：
+   - 每个 thread 单独保留草稿（sessionStorage）。
+   - 失败/中断时若该 thread 已有新草稿 → 保留新草稿，并把原消息放到“恢复”入口（轻量提示 + 单击恢复按钮）。
+   - 明确“重新打开仍可见”范围：**默认覆盖切换会话后回到该 thread、刷新页面（sessionStorage 范围）；跨标签页或登录态变化不在范围**。
+
+### 不做项
+
+- 不重做 Enter/Shift+Enter、`canSend`、停止入口（已确认无缺陷）。
+- 不扩展 SSE 事件、不新增后端接口。
+- 不引入自动重试 / 重发按钮（属 UX-2）。
+- 不新增 toast/snackbar；状态仅靠气泡样式 + 输入框恢复提示呈现。
+- 不预设窄屏必须单列布局；先核查实际问题再改。
+- 保留正在进行的流式输出改动：不修改 `useAgentStream` reducer 主链、`streamClient.ts` 的 SSE 解析路径、`run.*` 事件名含义。
+
+### 依赖
+
+- 前端：`MessageComposer.tsx`/`test.tsx`、`AgentChatPanel.tsx`、`useAgentStream.ts`、`MessageList.tsx`、`MessageComposer.module.css`。
+- 新增：`useDraftStore.ts`（sessionStorage + threadKey 维度）。
+- 接口：`useAgentStream.start(message, options?)` 当前已暴露 `streamStatus` / `streamError` / `runId` / `cancel`；如乐观渲染需要 clientId 透传，仍在 hook 签名内（不改后端协议）。
+- 数据通道：本地 sessionStorage（thread key = threadId）；不写 localStorage，避免跨账户污染。
+
+### 验收（自动测试 + 真实模型 + 人工视觉分别记录）
+
+- **自动（vitest + @testing-library/user-event）**：
+  - IME：dispatch `compositionstart` + Enter → 断言未触发 onSend；`compositionend` 后 Enter 正常发送。
+  - IME：keyboard 事件 `isComposing=true` 时同样不发送。
+  - 防重复：连发两次 onClick（不论 canSend 渲染状态）→ 只触发一次 onSend。
+  - 状态分离：发送后气泡显示 `pending`；mock `submitted` 后切 `submitted`；mock `run.failed` 后气泡仍 `submitted`，独立区域显示任务失败。
+  - 乐观去重：服务端历史包含同 `clientId` → 最终列表只有一条。
+  - 旧流隔离：mock 切 thread 后旧流的 `run.completed` 不能修改新 thread 的乐观气泡 / 草稿。
+  - 草稿保护：thread A 发送中断后输入恢复；切到 thread B 输入新内容；切回 thread A 草稿仍为旧消息且含“恢复新消息”按钮。
+
+- **E2E（Playwright `frontend/e2e/run-sse.spec.ts`）**：
+  - Test3 加：用户气泡立刻出现且带 `pending → submitted`。
+  - Test6（新增）：断 SSE（关后端）后气泡停留为 `unknown`，不标 `failed`，输入恢复；后端重新可达时按真实模型回填。
+  - Test7（新增）：切 thread 后旧流事件不污染新 thread UI。
+  - Test8（新增）：刷新页面后草稿仍可见（sessionStorage 范围）。
+
+- **真实模型**：断流但后端仍执行（基于 `wm_bug01b_realmodel` 测试用例验证：发出去的消息仍在服务端日志中能查到，UI 不会把它误判为失败）。
+
+- **人工视觉**：三档断点（≥1280 / ≥768 ≤1280 / ≤640），逐项验证 IME、防重复、状态分离、草稿恢复；窄屏按钮可访问性按真实交互记录问题，无问题记录“未发现问题”。
+
+### 状态
+
+- **IN_PROGRESS → DONE**（子任务 1+2+3 已完成；子任务 4+5 已完成；bug 已修复；门禁见下方）
+
+### 门禁结果
+
+| 门禁 | 结果 |
+|------|------|
+| threads 模块全量测试 | 192/192 passed |
+| TypeScript 类型检查 | 0 错误 |
+| Playwright responsive E2E | 4 passed / 3 failed（后端端口冲突；非代码问题） |
+
+### 改动文件清单
+
+- `MessageComposer.tsx`：IME composition 守卫 + 防重复 submittingRef + 受控 value/onValueChange + hasPendingRestore/onRestore
+- `MessageComposer.test.tsx`：+8 用例
+- `MessageComposer.module.css`：restoreBtn 样式
+- `types.ts`（新增）：OptimisticMessage / UserSubmitStatus / MessageResponseLocal / generateClientId
+- `MessageList.tsx`：optimisticMessage prop + 去重 + data-submit-status
+- `MessageList.test.tsx`：+4 用例
+- `AgentChatPanel.tsx`：submitStatus 状态机 + useDraftStore 接入 + handleRestore
+- `AgentChatPanel.test.tsx`：+5 用例
+- `useDraftStore.ts`（新增）：sessionStorage Hook
+- `useDraftStore.test.ts`（新增）：10 用例
+
+### 发现并修复的 Bug
+
+- `canRestore` 原检查 `!draft.current`，导致有新草稿时恢复按钮消失。已修正为仅检查 `pendingSent !== null`。
+- `handleRestore` 未释放 `submittingRef`，恢复后无法再发。已修正为在 `handleRestore` 中设置 `submittingRef.current = false`。
+
+### 已验证的行为（按设计）
+
+- 新草稿不被 streaming/completed 清除（`clearPendingSent` 只清 `pendingSent`）。
+- 恢复后 `submittingRef` 释放，发送按钮恢复可用，unknown 重发限制正确解除。
+- unknown + 有新草稿时恢复按钮仍显示，textarea 保持新草稿。
+
+### 未修改的部分（保持无缺陷）
+
+- Enter 发送 / Shift+Enter 换行（已有）
+- 空消息保护（已有）
+- 停止入口（已有）
+- 流式输出（保留）
+
+### 已知限制（首版边界）
+
+- 乐观消息仅前端可见；服务端日志仍是权威。
+- sessionStorage 范围仅限同标签页同源；刷新保留，关闭标签页丢失（按当前产品范围）。
+- 草稿“恢复”入口仅前端；服务端不感知。
+- “断流但已收到服务端回执”的边界仍需运行真实模型实测验证（mimo 平台已具备条件）。
