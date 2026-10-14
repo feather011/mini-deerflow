@@ -1003,9 +1003,11 @@ def create_project_execute_tool(
         name=PROJECT_EXECUTE_TOOL_NAME,
         description=(
             "在绑定仓库内执行编码任务（调用 harness 执行器）。"
+            "当任务涉及创建文件、修改代码、运行程序或验证输出时，应使用本工具。"
             "task 为任务描述；context 为补充背景（如相关文件、之前的讨论等）。"
             "scope 为任务范围约束（可选，如'单文件输出'）；"
             "acceptance 为验收条件（可选，如'运行后输出正确'）。"
+            "返回包含 files_written、verification（含退出码）和 changes diff。"
             "已有改动会被保留；不自动提交或推送。只能由项目会话调用。"
         ),
         parameters={
@@ -1013,7 +1015,10 @@ def create_project_execute_tool(
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "要执行的编码任务描述",
+                    "description": (
+                        "要执行的编码任务描述。"
+                        "当涉及写文件、修改代码、运行程序或验证输出时应填写本参数。"
+                    ),
                 },
                 "context": {
                     "type": "string",

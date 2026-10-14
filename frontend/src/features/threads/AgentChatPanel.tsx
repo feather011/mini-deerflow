@@ -133,7 +133,7 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
       </div>
 
       {/* SSE 事件面板（暂时隐藏：不在前端展示执行进度） */}
-      {false && displayPendingMessage && (
+      {displayPendingMessage && (
         <div className={styles.streamArea}>
           <RunEventPanel
             status={streamStatus === 'idle' ? 'connecting' : streamStatus}

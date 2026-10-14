@@ -35,7 +35,10 @@ from typing import Any, Mapping
 import anyio
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
-from mcp.shared.exceptions import McpError
+try:
+    from mcp.shared.exceptions import MCPError as _MCPBaseError
+except ImportError:
+    from mcp.shared.exceptions import McpError as _MCPBaseError  # type: ignore[attr-defined,assignment]
 
 from mini_deerflow.mcp_adapter import MCPToolAdapter, detect_conflicts
 from mini_deerflow.mcp_bridge import (
@@ -394,7 +397,7 @@ class MCPClientManager:
         except asyncio.CancelledError:
             # Tool call 被独立 scope cancel，不杀死 session
             raise TimeoutError(f"MCP 操作超过 {timeout} 秒未返回") from None
-        except McpError as exc:
+        except _MCPBaseError as exc:
             # MCP 层也可能有超时（如 "Timed out while waiting for response"）
             if "timed out" in str(exc).lower() or "timeout" in str(exc).lower():
                 raise TimeoutError(str(exc)) from None

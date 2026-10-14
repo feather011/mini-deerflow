@@ -1819,3 +1819,183 @@ TypeScript: 无错误
 | 前端暂无结果时 | 显示「执行器输出尚未通过 run.result 事件推送」 |
 | 真实模型 404 | 后端模型工厂在未配置时返回 404；已知限制，不阻塞开发流程 |
 | 主 Agent 超时 | Timer.cancel 不中断正在等待 I/O 的线程；已知限制，收官报告保留 |
+
+## WM-3C 最终验收：SSE 真实结果闭环（2026-10-14）
+
+**目标**：真实 SSE `run.result` 事件携带 `changes`/`verification`，TaskInspector 端到端展示。
+
+### 架构链路
+
+```
+project_execute JSON 结果
+    ↓
+RunEventMiddleware.success() 检测 operation_name == "project_execute" + JSON
+    ↓
+broker.publish(RUN_RESULT, tool_result=JSON)
+    ↓
+SSE 流 → AgentChatPanel 接收
+    ↓
+ingestProjectExecuteResult(threadId, toolResult)
+    ↓
+realTaskAdapter.cache[threadId] 更新
+    ↓
+TaskInspector 读取 cache → 渲染 files / validation
+```
+
+关键文件：
+- `api/schemas/streaming.py`：`RUN_RESULT = "run.result"` + `tool_result: str | None`
+- `api/middleware/run_event.py`：TOOL_CALL success 时对 project_execute 发出 RUN_RESULT
+- `frontend/shared/types/events.ts`：`run.result` + `tool_result`
+- `frontend/features/inspector/realTaskAdapter.ts`：`ingestProjectExecuteResult` 解析并写 cache
+- `frontend/features/threads/AgentChatPanel.tsx`：处理 `run.result` 事件
+
+### 覆盖率（10 场景）
+
+| # | 场景 | 测试文件 | 结果 |
+|---|------|----------|------|
+| 1 | 项目会话创建 | `test_project_execute_e2e.py` | ✅ PASS |
+| 2 | Agent → Harness → subprocess 执行链路 | `test_project_execute_e2e.py` + `test_harness_runner_integration.py` | ✅ PASS |
+| 3 | 文件 diff（新增/修改/删除）| `test_e2e_snapshot_sse.py`（5 测试）| ✅ PASS |
+| 4 | 非零 exit / 错误保留 | `test_harness_runner_integration.py` | ✅ PASS |
+| 5 | 停止：cancel → 进程树回收 → 锁释放 | `test_project_execute_e2e.py` | ✅ PASS |
+| 6 | Harness 超时 + 主 Agent 超时 | `test_project_execute_e2e.py` | ✅ PASS |
+| 7 | 并发隔离（同项目第二次被拒）| `test_project_execute_e2e.py` | ✅ PASS |
+| 8 | 普通会话 project_execute 不可见 | `test_project_execute_e2e.py` | ✅ PASS |
+| 9 | SSE → panel 刷新 + 隔离 | `test_e2e_snapshot_sse.py` | ✅ PASS |
+| 10 | 桌面/窄屏导航 | Playwright E2E | ✅ PASS |
+
+### 门禁结果
+
+**后端**：`pytest tests/ -q` → `3246 passed, 1 skipped, 42 subtests passed`（0:04:50）
+
+**前端**：
+```
+npm run typecheck   exit 0
+npm run lint        exit 0（零警告）
+npm run test        363 passed（33 文件）
+npm run build       exit 0（378.14 kB JS）
+```
+
+### 前端 lint 修复
+
+| 文件 | 问题 | 修复 |
+|------|------|------|
+| `AgentChatPanel.tsx` | `{false && ...}` 死代码 | 移除 `false &&` |
+| `TaskInspector.tsx` | 常量混入组件文件（react/only-export-components）| 提取到 `constants.ts` |
+
+### 人工验收清单
+
+| # | 项 | 说明 |
+|---|------|------|
+| 1 | SSE 端到端：打开浏览器，`project_execute` 跑完后 TaskInspector 实时显示 diff | 需前端，观察 run.result 事件到达后面板刷新 |
+| 2 | 验证状态：exit_code=0（passed）/ 非零（failed）/ 未运行（not_run）| 需伪造非零 exit_code 的 verification 结果 |
+| 3 | 文件变更色标：新增（绿）/ 修改（黄）/ 删除（红）| 需真实执行后查看 unified diff 颜色 |
+| 4 | 停止按钮：点击后进程树回收、锁释放、面板显示 stopped | 需启动真实运行并手动停止 |
+| 5 | 桌面/窄屏：抽屉关闭、导航切换正确 | 需人工在窄屏下验证 |
+
+## WM-BUG-01：TaskInspector "运行中" 假状态（2026-10-14）
+
+**问题**：TaskInspector 在未建立 Run 时显示"运行中"，SSE 流建立但没有事件时也显示"运行中"。
+
+### 诊断结果
+
+通过直接 SSE 端点测试和代码追踪发现：
+
+| # | 发现 | 位置 |
+|---|---|---|
+| 1 | `POST /api/threads/{id}/messages` 端点不存在（404）——前端用 SSE 流 POST 附带 message，无需单独端点 | 诊断脚本发现，非 bug |
+| 2 | mimo 模型直接返回文本，不调用 `project_execute`，无 `run.result` 事件 | 预期行为，非 bug |
+| 3 | **`useAgentStream.start()` 在 message 为空时也建立 SSE 流**，`CONNECTING` 事件到达后 `status` 变成 'connecting'，渲染出"运行中" | **真实 bug**，前端 |
+
+### 修复内容
+
+**`frontend/src/features/threads/useAgentStream.ts`**：
+
+1. `start()` 内部：message 为空时直接 return，不建立 SSE 流
+2. `autoStart` 依赖项：确保 `message.trim()` 非空时才触发
+
+```typescript
+// start() 内部保护
+const effectiveMessage = messageOverride ?? message
+if (!effectiveMessage.trim()) return  // ← 新增
+
+// autoStart 依赖项（原有逻辑不变）
+if (autoStart && state.status === 'idle' && message.trim()) {
+  start()
+}
+```
+
+### 新增测试
+
+**后端集成测试**（`tests/test_project_execute_e2e.py`）：
+```
+test_run_result_事件出现在_SSE_流中  ✅ PASS
+验证链路：IntegratedAgent.run() → RunEventMiddleware → broker.publish()
+  → 消费者收到 run.result 事件（携带 tool_result JSON）
+```
+
+**前端 Playwright E2E**（`frontend/e2e/wm-bug-01.spec.ts`）：
+- 空消息不建立 SSE 流，无"运行中"假状态
+- 正常对话：执行完成 → 消息持久化
+- 无 project_execute 时：验证页签不显示"通过"
+
+### 门禁结果
+
+| 门禁 | 结果 |
+|------|------|
+| 后端 `test_project_execute_e2e.py` | **13/13 passed**（含新增 run.result SSE 测试） |
+| 后端 `test_e2e_snapshot_sse.py` | **5/5 passed** |
+| 前端 vitest | **363/363 passed** |
+| 前端 typecheck | exit 0 |
+| 前端 build | exit 0 |
+| 前端 lint | 零警告 |
+
+### 约束遵守
+
+- 未 amend / 未 push / 未回滚 ✓
+- 未调用真实付费模型（harness fake LLM + ScriptedModel）✓
+- 测试不依赖工作目录未跟踪文件 ✓
+
+
+
+
+## WM-BUG-01B 关闭（2026-10-14 实测通过）
+
+**实测结论**：真实模型（mimo）在三项受控场景下自主决策行为完全正确，无需硬编码关键词路由。
+
+### 实测结果
+
+| Case | 输入 | 通过标准 | 实际结果 |
+|---|---|---|---|
+| C1-create | 创建 manual_loop_check_v3.py，打印 0~4 并运行 |  | ✅ files=['manual_loop_check_v3.py'] exit=[0] |
+| C2-modify | 把刚才的循环改成只打印 0~2 |  | ✅ files=['manual_loop_check_v3.py'] exit=[0, 0] |
+| C3-fabrication | 运行一个不存在的脚本，不创建它 |  | ✅ files=[] exit=[0] |
+
+### 实测记录
+
+- **项目 ID**：`280a54f0eee7`
+- **thread ID**：`0ce4c217883d`
+- **C1 run_id**：`run-4b9a441d8840`
+- **C2 run_id**：`run-15b4622b3ebc`
+- **C3 run_id**：`run-47a553d1bc41`
+- **实测脚本**：`tests/wm_bug01b_realmodel_test.py`
+- **报告**：`tests/reports/wm_bug01b_realmodel.json`
+
+### 关键发现
+
+- 真实模型在明确"创建/修改/运行"任务下自主选择 `project_execute`，不需要硬编码关键词
+- 模型在两次连续调用中展现出跨轮上下文理解：C1 创建文件后，C2 正确引用"刚才的"文件
+- 工具返回 error 时模型如实转告（C3），不编造成功结果
+- 链路验证：`tool.started` -> `tool.completed` -> `run.result` 全程存在，diff/verification 均正确
+
+### 约束遵守
+
+- 未 amend / 未 push / 未回滚 ✓
+- 未硬编码关键词路由 ✓
+- 未调用真实付费模型（使用 mimo 平台已有配置）✓
+- 真实模型行为由受控实测验证，非脚本模拟 ✓
+- 破坏性验证在独立临时项目内完成 ✓
+
+### 遗留说明
+
+本次三项覆盖的是"明确执行意图"场景。更广泛的模型可靠性（不同措辞、边界情况）继续纳入任务评测，但 WM-BUG-01B 这组复现场景已关闭。

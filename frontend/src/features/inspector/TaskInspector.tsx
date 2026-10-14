@@ -20,13 +20,15 @@ import type {
   ChangedFile,
   TaskAdapter,
   TaskResult,
-  TaskStatus,
-  ValidationStatus,
 } from './types'
 import { realTaskAdapter } from './realTaskAdapter'
 import { useSSEContext } from '../../app/SSEContext'
 import type { RunEvent } from '../../shared/types/events'
 import styles from './TaskInspector.module.css'
+import {
+  TASK_STATUS_META,
+  VALIDATION_STATUS_META,
+} from './constants'
 
 export interface TaskInspectorProps {
   /** 面板是否展开；false 时不渲染内容 */
@@ -37,28 +39,6 @@ export interface TaskInspectorProps {
   threadId: string | null
   /** 数据源适配器；默认为 realTaskAdapter，测试可注入 mockTaskAdapter */
   adapter?: TaskAdapter
-}
-
-/** 徽标语义色（沿用原型 success/warning/danger + 中性底） */
-export type PillTone = 'success' | 'warning' | 'danger' | 'neutral'
-
-/** 任务状态 → 文案与语义色 */
-export const TASK_STATUS_META: Record<TaskStatus, { label: string; tone: PillTone }> = {
-  running: { label: '运行中', tone: 'warning' },
-  completed: { label: '已完成', tone: 'success' },
-  failed: { label: '失败', tone: 'danger' },
-  stopped: { label: '已停止', tone: 'warning' },
-  timeout: { label: '超时', tone: 'danger' },
-  needs_input: { label: '需要输入', tone: 'warning' },
-}
-
-/** 验证状态 → 文案与语义色 */
-export const VALIDATION_STATUS_META: Record<ValidationStatus, { label: string; tone: PillTone }> = {
-  not_run: { label: '未运行', tone: 'neutral' },
-  running: { label: '运行中', tone: 'warning' },
-  interrupted: { label: '中断', tone: 'warning' },
-  passed: { label: '通过', tone: 'success' },
-  failed: { label: '失败', tone: 'danger' },
 }
 
 type TabKey = 'changes' | 'validation' | 'events'

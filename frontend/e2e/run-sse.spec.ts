@@ -26,15 +26,14 @@ test('3. 发送消息：显示运行状态 → 最终消息持久化', async ({ 
   // 终态：执行完成（header statusText）
   await expect(page.getByText('执行完成')).toBeVisible({ timeout: 20_000 })
 
-  // 消息列表出现 user + assistant 两条
-  // 答案会同时出现在消息列表与事件面板的 answerBar 中，故用 first()
-  await expect(page.getByText(CALC_PROMPT)).toBeVisible()
-  await expect(page.getByText(CALC_ANSWER).first()).toBeVisible()
+  // 消息列表出现 user + assistant 两条（限定 main 区域避免顶栏标题干扰；答案可能同时在 span 和 pre 中）
+  await expect(page.getByRole('main').getByText(CALC_PROMPT)).toBeVisible()
+  await expect(page.getByRole('main').getByText(CALC_ANSWER).first()).toBeVisible()
 
   // 刷新后仍然存在（持久化）
   await page.reload()
-  await expect(page.getByText(CALC_PROMPT)).toBeVisible({ timeout: 15_000 })
-  await expect(page.getByText(CALC_ANSWER).first()).toBeVisible()
+  await expect(page.getByRole('main').getByText(CALC_PROMPT)).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByRole('main').getByText(CALC_ANSWER).first()).toBeVisible()
 
   await console.assertClean()
 })

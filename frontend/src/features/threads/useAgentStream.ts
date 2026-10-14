@@ -177,13 +177,16 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
   // 闭包捕获的 message 仍是旧值，必须把本次要发送的消息显式传进来，
   // 否则实际会发出空消息（后端 422）。
   const start = useCallback((messageOverride?: string) => {
+    // 空消息不建立 SSE 流，避免"运行中"假状态
+    const effectiveMessage = messageOverride ?? message
+    if (!effectiveMessage.trim()) return
+
     // 如果已有连接，先断开
     if (cancelRef.current) {
       cancelRef.current()
       cancelRef.current = null
     }
 
-    const effectiveMessage = messageOverride ?? message
     const { runId, cancel } = connectAgentStream(threadId, effectiveMessage, {
       onEvent: (event) => {
         dispatch({ type: 'EVENT', event })
@@ -219,9 +222,10 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
     dispatch({ type: 'STOP' })
   }, [])
 
-  // 自动开始
+  // 自动开始：message 必须非空才建立 SSE 流，避免空消息触发"运行中"假状态
   useEffect(() => {
-    if (autoStart && state.status === 'idle' && message.trim()) {
+    const trimmed = message.trim()
+    if (autoStart && state.status === 'idle' && trimmed) {
       start()
     }
   }, [autoStart, state.status, message, start])

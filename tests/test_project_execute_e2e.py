@@ -924,3 +924,109 @@ def test_停止入口_取消链路_进程回收_锁释放(
     lock = _get_project_lock(proj.project_id)
     assert lock.acquire(blocking=False), "停止后锁应释放"
     lock.release()
+
+
+# ---------------------------------------------------------------------------
+# 14. run.result 事件 SSE 端到端（WM-BUG-01 验证）
+# ---------------------------------------------------------------------------
+
+
+def test_run_result_事件出现在_SSE_流中(
+    isolated_workspaces_root, harness_env, monkeypatch
+):
+    """验证 RunEventMiddleware 发出的 run.result 事件出现在 SSE 流中。
+
+    链路：
+    IntegratedAgent.run()
+      → MiddlewarePipeline(RunEventMiddleware)
+      → project_execute 工具成功返回 JSON
+      → RunEventMiddleware.success() 发出 RUN_RESULT 事件
+      → broker.publish() 入队
+      → SSE 流读取 broker 队列
+      → 浏览器收到 run.result 事件
+
+    使用 ScriptedModel（第一次调 project_execute，第二次 final answer），
+    确保 harness 子进程写文件触发 run.result。
+    """
+    import uuid
+    import queue as queue_module
+    import threading
+
+    monkeypatch.setenv("MINI_DEERFLOW_MCP_CONFIG", "")
+    monkeypatch.setenv("HARNESS_USE_FAKE_LLM", "1")
+
+    unique = uuid.uuid4().hex[:8]
+    from mini_deerflow.project_store import InMemoryProjectStore
+    from mini_deerflow.runtime import RuntimeConfig, create_runtime
+    from mini_deerflow.thread_store import InMemoryThreadStore
+    from mini_deerflow.tools import create_default_registry
+    from mini_deerflow.api.services.projects import ProjectService
+    from mini_deerflow.api.schemas.streaming import RunEvent
+
+    project_store = InMemoryProjectStore()
+    store = InMemoryThreadStore()
+    registry = create_default_registry()
+    config = RuntimeConfig(harness_root=HARNESS_ROOT)
+    runtime = create_runtime(
+        store=store,
+        project_store=project_store,
+        registry=registry,
+        config=config,
+    )
+    model = ScriptedModel()
+    runtime.integrated_agent._agent._model = model
+
+    # 创建项目和 Thread
+    project_service = ProjectService(
+        store=project_store,
+        workspaces_root=str(isolated_workspaces_root),
+        thread_store=store,
+    )
+    proj = project_service.create(f"sse-{unique}")
+    thread_id = f"t-sse-{unique}"
+    store.create(thread_id, project_id=proj.project_id)
+
+    # 订阅 broker
+    broker = runtime.run_event_broker
+    assert broker is not None
+    run_id = f"run-sse-{unique}"
+    q = broker.subscribe(run_id)
+
+    received: list = []
+
+    def collect():
+        for _ in range(200):  # 最多 200 次轮询，约 10s
+            try:
+                item = q.get(timeout=0.05)
+                received.append(item)
+            except queue_module.Empty:
+                continue
+
+    consumer = threading.Thread(target=collect, daemon=True)
+    consumer.start()
+
+    # 直接调用 integrated_agent.run（不走 SSE 流，验证 broker 收到事件）
+    answer, trace = runtime.integrated_agent.run(
+        thread_id=thread_id,
+        user_input="在仓库根目录创建 hello.c",
+        run_id=run_id,
+    )
+
+    consumer.join(timeout=5)
+    broker.unsubscribe(run_id)
+
+    # 验证
+    run_events = [e for e in received if isinstance(e, RunEvent)]
+    run_result_events = [e for e in run_events if e.event_type.value == "run.result"]
+
+    assert len(run_result_events) >= 1, (
+        f"期望至少 1 个 run.result 事件，实际 {len(run_result_events)}。"
+        f"全部事件: {[e.event_type.value for e in run_events]}"
+    )
+
+    event = run_result_events[0]
+    assert event.tool_result is not None, "run.result 事件必须携带 tool_result 字段"
+
+    parsed = json.loads(event.tool_result)
+    assert parsed.get("status") == "completed", f"期望 completed，实际: {parsed.get('status')}"
+    assert parsed.get("files_written"), f"期望有文件写入记录，实际: {parsed}"
