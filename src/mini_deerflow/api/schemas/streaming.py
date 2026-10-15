@@ -33,7 +33,7 @@ class RunEventType(str, Enum):
     RUN_FAILED = "run.failed"
     RUN_TIMED_OUT = "run.timed_out"
     RUN_CANCELLED = "run.cancelled"
-    HEARTBEAT = "heartbeat"
+    RUN_MODEL_TOKEN = "model.token"  # token 流式推送事件
 
 
 class RunEvent(BaseModel):
@@ -57,6 +57,8 @@ class RunEvent(BaseModel):
 
     # run.result 事件携带 project_execute 的结构化结果（JSON 字符串形式）
     tool_result: str | None = None
+    # model.token 事件携带 token 流式推送的增量文本
+    delta: str | None = None
 
 
 def encode_sse(event: RunEvent) -> str:

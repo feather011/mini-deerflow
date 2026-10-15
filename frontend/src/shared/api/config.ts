@@ -27,11 +27,18 @@ function normalizeBaseUrl(raw: string | undefined): string {
 
 // Vite 环境变量通过 import.meta.env 访问
 const viteEnv = (import.meta.env as Record<string, string | undefined>)
+  .VITE_API_TARGET
+
+// 兼容旧名
+const legacyEnv = (import.meta.env as Record<string, string | undefined>)
   .VITE_API_BASE_URL
 
-// 兼容 Vitest：在 vitest.setup.ts 中通过 import.meta.env.VITE_API_BASE_URL 注入
+// Vitest 注入路径
 const vitestEnv = (import.meta.env as Record<string, string | undefined>)
-  .VITE_API_BASE_URL
+  .VITE_API_TARGET
 
-export const API_BASE_URL = normalizeBaseUrl(viteEnv ?? vitestEnv)
+// 直连后端（不走 Vite proxy，避免 SSE 缓冲问题）
+// 生产环境由 nginx/网关统一转发，前端无需感知
+const _raw = viteEnv ?? legacyEnv ?? vitestEnv ?? 'http://127.0.0.1:8000'
+export const API_BASE_URL = normalizeBaseUrl(_raw)
 

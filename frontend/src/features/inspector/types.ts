@@ -75,6 +75,8 @@ export interface TaskResult {
   validation: ValidationEvidence
   files: ChangedFile[]
   events: TaskEvent[]
+  /** 当前展示的 run_id（用于检测新 run 开始时清空旧结果） */
+  run_id_marker: string | null
 }
 
 /** 任务结果数据源接口：当前由 mockTaskAdapter 实现，后续可替换为真实 API */

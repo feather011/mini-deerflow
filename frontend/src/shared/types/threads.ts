@@ -37,6 +37,8 @@ export interface ThreadSummary {
 export interface ThreadDetail {
   thread_id: string
   project_id?: string | null  // 如果属于项目，则为项目 ID
+  // 26：最近一次 project_execute 的结果 JSON（页面刷新后恢复 diff 展示）
+  last_run_result?: string | null
   messages: MessageResponse[]
 }
 

@@ -212,3 +212,70 @@ describe('realTaskAdapter run_label', () => {
     )
   })
 })
+
+// ---- 重新进入 thread：保留 files/validation ----
+
+import { ingestProjectExecuteResult } from './realTaskAdapter'
+
+describe('realTaskAdapter 重新进入 thread', () => {
+  it('run.result 写入 files 后，再次进入 thread（idle + 空 events）不丢失 files', () => {
+    // 1) 第一次进入：跑完 run.result
+    ingestRealTaskData('thread-R1', {
+      streamStatus: 'streaming',
+      events: [makeEvent({ event_type: 'run.started', sequence: 1 })],
+      runId: 'run-aaaa',
+      title: 'R1',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'foo.py',
+            status: 'added',
+            unified_diff: '+def f():\n+    return 1\n',
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-R1', result)
+    expect(realTaskAdapter.getTask('thread-R1')?.files).toHaveLength(1)
+
+    // 2) 用户离开 thread 再回来：组件重挂载，events 重置为空、streamStatus='idle'、runId=null
+    ingestRealTaskData('thread-R1', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: 'R1',
+    })
+    // files 必须保留
+    expect(realTaskAdapter.getTask('thread-R1')?.files).toHaveLength(1)
+    expect(realTaskAdapter.getTask('thread-R1')?.files[0]?.path).toBe('foo.py')
+  })
+
+  it('开始新 run（runId 变化）时清空旧的 files 与 validation', () => {
+    ingestRealTaskData('thread-R2', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'old-run',
+      title: 'R2',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: { files: [{ path: 'old.py', status: 'added', unified_diff: '' }] },
+    })
+    ingestProjectExecuteResult('thread-R2', result)
+    expect(realTaskAdapter.getTask('thread-R2')?.files).toHaveLength(1)
+
+    // 切换到新 run：runId 变化，且 streamStatus 变 running
+    ingestRealTaskData('thread-R2', {
+      streamStatus: 'streaming',
+      events: [makeEvent({ event_type: 'run.started', sequence: 1 })],
+      runId: 'new-run',
+      title: 'R2',
+    })
+    expect(realTaskAdapter.getTask('thread-R2')?.files).toEqual([])
+  })
+})

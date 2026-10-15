@@ -4,27 +4,13 @@ import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   plugins: [react()],
-  // 开发期同源反代：浏览器看到 /api/* → Vite 转发到后端
-  // —— 与生产 nginx.conf 的 proxy_pass 行为一致（不变路径前缀）。
-  // SSE 必须关缓冲（对应 nginx 的 proxy_buffering off）。
-  //
-  // strictPort：固定端口避免端口冲突
+  // strictPort=false：允许 fallback 到其他端口
   server: {
+    host: '0.0.0.0',  // 监听所有地址，兼容 IPv4/IPv6
     port: 5173,
-    strictPort: true,
     proxy: {
       "/api": {
-        target: process.env.VITE_API_TARGET || "http://127.0.0.1:8001",
-        changeOrigin: true,
-        ws: true,
-        configure: (proxy) => {
-          proxy.on("proxyReq", (proxyReq) => {
-            proxyReq.setHeader(
-              "X-Forwarded-Proto",
-              "http",
-            );
-          });
-        },
+        target: process.env.VITE_API_TARGET || "http://127.0.0.1:8003",
       },
     },
   },
@@ -40,4 +26,3 @@ export default defineConfig({
     },
   },
 } satisfies Parameters<typeof defineConfig>[0])
-

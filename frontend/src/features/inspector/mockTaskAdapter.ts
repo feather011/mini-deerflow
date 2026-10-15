@@ -167,6 +167,7 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       note: '示例命令证据，不代表所有验收条件已经确认；业务验收等待用户审查。',
     },
     files: [paginationPy, paginationTestPy],
+    run_id_marker: 'mock-8f2a',
     events: [
       { time: '00:00', title: '任务开始', description: '执行 Agent 已接收明确任务' },
       { time: '00:02', title: '读取代码', description: 'src/pagination.py' },
@@ -188,6 +189,7 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       note: '本轮未运行任何验证命令；没有命令证据不显示测试通过。',
     },
     files: [reportPy],
+    run_id_marker: 'mock-1c4d',
     events: [
       { time: '00:00', title: '任务开始', description: '执行 Agent 已接收明确任务' },
       { time: '00:03', title: '修改文件', description: 'src/mini_deerflow/report.py' },
@@ -206,6 +208,7 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       note: '验证运行中；出结果前不显示通过或失败。',
     },
     files: [searchPy],
+    run_id_marker: 'mock-5b90',
     events: [
       { time: '00:00', title: '任务开始', description: '模拟任务已派发' },
       { time: '00:03', title: '修改文件', description: 'src/mini_deerflow/search.py' },
@@ -224,6 +227,7 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       note: '验证失败：test_bulk_discount 期望旧口径，需要确认业务预期后再改测试或改实现。',
     },
     files: [discountPy],
+    run_id_marker: 'mock-3e77',
     events: [
       { time: '00:00', title: '任务开始', description: '执行 Agent 已接收明确任务' },
       { time: '00:04', title: '修改文件', description: 'src/mini_deerflow/discount.py' },
@@ -243,6 +247,7 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       note: '任务被停止，验证未完成；没有完整命令结果不显示通过。',
     },
     files: [notesMd],
+    run_id_marker: 'mock-a012',
     events: [
       { time: '00:00', title: '任务开始', description: '模拟任务已派发' },
       { time: '00:04', title: '用户停止', description: '进度已停止，保留已产生的变更' },
@@ -260,6 +265,7 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       note: '本轮为只读梳理，没有代码变更，也未运行验证命令。',
     },
     files: [],
+    run_id_marker: 'mock-9d31',
     events: [
       { time: '00:00', title: '任务开始', description: '只读梳理接入方案' },
       { time: '00:05', title: '任务结束', description: '无文件变更，结论已在对话中给出' },

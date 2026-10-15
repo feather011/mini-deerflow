@@ -392,7 +392,7 @@ FinalAnswer
   越权抛 `ToolNotAllowedError`；主 Agent 不受影响（`allowed_tools=None`）
 - **失败不半提交**：未知工具 / 非法参数 / 工具异常 / Budget 超限 / 超步数
   都在 `thread.extend()` 之前抛出，Thread 保持原样
-- **不实现 token streaming**：SSE 只发阶段事件
+- **已实现 token streaming**：模型逐 token 推送 SSE 事件（`model.token`），前端按 token 增量渲染
 
 ### SSE / Trace 事件
 

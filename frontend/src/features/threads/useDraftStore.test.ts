@@ -53,13 +53,29 @@ describe('useDraftStore', () => {
     expect(result.current.draft.current).toBe('')
   })
 
-  it('restorePendingSent 恢复发送快照', () => {
+  it('restorePendingSent 恢复发送快照（无新草稿时直接恢复）', () => {
     const { result } = renderHook(() => useDraftStore('t1'))
     act(() => {
       result.current.savePendingSent('sent message')
       result.current.restorePendingSent()
     })
+    // current = 'sent message' + '' = 'sent message'
     expect(result.current.draft.current).toBe('sent message')
+    expect(result.current.draft.pendingSent).toBeNull()
+  })
+
+  it('restorePendingSent 有新草稿时追加到末尾（不覆盖）', () => {
+    const { result } = renderHook(() => useDraftStore('t1'))
+    act(() => {
+      // 发送消息：current 清空，pendingSent 保存快照
+      result.current.savePendingSent('sent message')
+      // 用户在编辑区输入新草稿（此时 pendingSent 仍在）
+      result.current.saveCurrent('new draft here')
+      // 恢复：旧消息 pendingSent 在前，新草稿 current 追加在后
+      result.current.restorePendingSent()
+    })
+    // current = 'sent message' + 'new draft here'
+    expect(result.current.draft.current).toBe('sent messagenew draft here')
     expect(result.current.draft.pendingSent).toBeNull()
   })
 

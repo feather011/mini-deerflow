@@ -18,6 +18,8 @@ interface MessageListProps {
   messages: MessageResponse[]
   /** 当前乐观消息（发送中但服务端尚未返回的用户消息） */
   optimisticMessage?: OptimisticMessage | null
+  /** 当前 run 累加的 token 文本（用于流式渲染 assistant 消息） */
+  streamingText?: string
 }
 
 /**
@@ -65,33 +67,40 @@ function MessageItem({
   )
 }
 
-export function MessageList({ messages, optimisticMessage }: MessageListProps) {
+export function MessageList({ messages, optimisticMessage, streamingText }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
-  // 去重：过滤掉与服务端消息重复的乐观消息。
-  // 服务端消息在先（历史），乐观消息在后——若服务端已有同 content 的 user 消息，
-  // 说明乐观消息已被服务端接受，此时不重复渲染。
-  const deduplicatedMessages = (() => {
-    if (!optimisticMessage) return messages
-    return messages.filter((m) => !isDuplicateOfOptimistic(m, optimisticMessage))
+  // 渲染列表：服务端消息原样保留。
+  // 乐观消息只在「后端尚未同步到这条 user 消息」时才追加。
+  // 判定方式：后端 messages 中没有 content 完全一致的同 role=user 消息。
+  // 这样做的好处：不改变后端消息的相对顺序，避免 assistant 被挤到 user 前面。
+  const showOptimistic = (() => {
+    if (!optimisticMessage) return false
+    // 查后端是否已有这条 user 消息
+    return !messages.some((m) => isDuplicateOfOptimistic(m, optimisticMessage))
   })()
 
   // 乐观消息的 OptimisticMessage.status → MessageResponseLocal._submitStatus
-  // 注意：Object.assign 覆盖同名字段；这里用解构把 status → _submitStatus
-  const optimisticItem = optimisticMessage
-    ? { ...optimisticMessage, role: 'user' as const, _submitStatus: optimisticMessage.status } as MessageResponseLocal
+  const optimisticItem = showOptimistic
+    ? { ...optimisticMessage, role: 'user' as const, _submitStatus: optimisticMessage!.status } as MessageResponseLocal
     : null
 
-  // 合并后的渲染列表：服务端消息 + 乐观消息（若有）
+  // 25C: 流式 assistant 消息（有 token 才显示）
+  const streamingItem = streamingText
+    ? { content: streamingText, role: 'assistant' as const, message_id: 'streaming', created_at: new Date().toISOString() } as MessageResponse
+    : null
+
+  // 合并后的渲染列表：服务端消息原样保留 + 乐观消息（仅后端未同步时追加）+ 流式 assistant（最后）
   const renderItems: (MessageResponse | MessageResponseLocal)[] = [
-    ...deduplicatedMessages,
+    ...messages,
     ...(optimisticItem ? [optimisticItem] : []),
+    ...(streamingItem ? [streamingItem] : []),
   ]
 
-  // 新消息到达或乐观消息状态变化时滚动到底部
+  // 新消息到达、乐观消息状态变化、或流式文本变化时滚动到底部
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [renderItems.length, optimisticMessage?.status])
+  }, [renderItems.length, optimisticMessage?.status, streamingText])
 
   if (renderItems.length === 0) {
     return (

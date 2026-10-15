@@ -100,7 +100,7 @@
 | **无认证、无授权** | MVP 定位；因此禁止直接暴露公网 |
 | **无多租户** | 所有 Thread 属于同一个使用者 |
 | **无分布式锁** | 同 Thread 并发靠进程内 `ThreadRunCoordinator` 判 409 |
-| **无 token streaming** | SSE 只发阶段事件（`model.*` / `tool.*` / `run.*`），不逐 token 推送 |
+| **已实现 token streaming** | 模型逐 token 推送 SSE 事件（`model.token`），前端按 token 增量渲染 assistant 消息 |
 | **无远程 MCP** | 第一版只支持本地 stdio；HTTP MCP / OAuth 不做 |
 | **无并行工具调用** | 一次只允许一个 `tool_use`，多的直接抛协议错误 |
 | **无水平扩容** | SQLite 与进程内协调器都是单实例语义 |

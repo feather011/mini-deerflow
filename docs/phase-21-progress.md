@@ -622,7 +622,7 @@ uv pip check
 
 #### 21B 边界
 
-- 不实现 token streaming（SSE 只发阶段事件）
+- 已实现 token streaming（模型逐 token 推送 `model.token` 事件）
 - 不支持一次响应多个 `tool_use`（抛 `ModelProtocolError`，不静默丢弃）
 - 未改前端公开 API 契约；Thread 持久化形状与 21B 之前一致
 - 未 commit、未 push、未移动 `phase-19-20-mvp` tag

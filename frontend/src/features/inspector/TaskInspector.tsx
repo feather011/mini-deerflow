@@ -314,6 +314,7 @@ function EventsTab({ task }: { task: TaskResult }) {
 const SSE_EVENT_LABELS: Record<string, string> = {
   'run.started': 'Run 开始',
   'model.started': '模型开始',
+  'model.token': 'Token 流式',
   'model.completed': '模型完成',
   'model.failed': '模型失败',
   'tool.started': '工具开始',
@@ -352,6 +353,10 @@ function SSEEventItem({ event }: { event: RunEvent }) {
         )}
         {event.error && (
           <p className={styles.eventError}>错误: {event.error}</p>
+        )}
+        {/* 25C: model.token 事件显示 token 增量文本 */}
+        {event.event_type === 'model.token' && event.delta && (
+          <p className={styles.eventDesc}>增量: {event.delta}</p>
         )}
       </div>
     </li>

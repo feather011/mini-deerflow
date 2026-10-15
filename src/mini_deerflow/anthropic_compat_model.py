@@ -24,6 +24,11 @@
 - 第二轮请求把上一轮的 `tool_use` 与 `tool_result` **按 call_id 配对**还原，
   否则供应商会拒绝该轮（`tool_result` 找不到对应 `tool_use`）
 
+25C 变更：
+- `stream_decide()` 方法：流式版本，逐 token/delta 推送 SSE 事件
+- 推送 `model.token` 事件（含增量文本 delta），由 RunEventMiddleware 透传到 Broker
+- `decide()` 保持不变（向后兼容）
+
 不做的事：
 - 不在日志、repr、异常消息中输出 API Key
 - 不在模块 import 期创建客户端或发起网络请求（客户端在 __init__ 创建，
@@ -32,7 +37,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import anthropic
 
@@ -247,6 +252,7 @@ class AnthropicCompatModel:
             # 只有本轮提供工具时才带上 tools 字段；不传时行为与 21A 完全一致，
             # 因此旧的纯文本路径不受影响。
             extra["tools"] = anthropic_tools
+            extra["tool_choice"] = {"type": "any"}
 
         try:
             response = self._client.messages.create(
@@ -382,3 +388,104 @@ class AnthropicCompatModel:
         if not combined:
             raise ModelEmptyResponseError("模型返回了空白响应")
         return combined
+
+    # ------------------------------------------------------------------ 流式版本（25C）
+
+    def stream_decide(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec] | None = None,
+    ) -> Iterator[tuple[str, str | FinalAnswer | ToolCall]]:
+        """流式 decide：逐 token 推送 SSE 事件 Ye。
+
+        Args:
+            messages: 当前对话（含上一轮的 tool_use / tool_result 配对）。
+            tools: 当前允许调用的工具描述；None 表示本轮不提供工具。
+
+        Yields:
+            ("token", text) — 增量文本 token（用于前端逐字渲染）
+            ("stop", stop_reason_str) — 流结束标记
+            ("decision", FinalAnswer | ToolCall) — 最终决策结果（最后 yield）
+
+        Raises:
+            同 decide() 的异常。
+
+        注意：不支持流式 tool_use——工具块在流结束时一次性解析。
+        """
+        payload = provider_messages_from(messages)
+        anthropic_tools = anthropic_tools_from(tools)
+
+        extra: dict[str, Any] = {}
+        if anthropic_tools:
+            extra["tools"] = anthropic_tools
+            extra["tool_choice"] = {"type": "any"}
+
+        try:
+            with self._client.messages.stream(
+                model=self._settings.model,
+                max_tokens=DEFAULT_MAX_TOKENS,
+                messages=payload,
+                **extra,
+            ) as stream:
+                for event in stream:
+                    event_type = getattr(event, "type", None)
+
+                    if event_type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta is None:
+                            continue
+                        # delta 是 Pydantic 模型，用 model_dump() 方法取字段值
+                        delta_data = getattr(delta, "model_dump", lambda *a, **k: {})()
+                        delta_type = delta_data.get("type") if isinstance(delta_data, dict) else None
+                        # 只推送 text_delta；跳过 thinking_delta / signature_delta 等
+                        if delta_type == "text_delta":
+                            text = delta_data.get("text", "") if isinstance(delta_data, dict) else ""
+                            if text:
+                                yield ("token", text)
+                    elif event_type == "message_delta":
+                        delta = getattr(event, "delta", None)
+                        stop_reason = ""
+                        if delta is not None:
+                            stop_reason = getattr(delta, "stop_reason", None) or ""
+                        yield ("stop", stop_reason)
+                        break
+                    elif event_type == "message_stop":
+                        yield ("stop", "")
+                        break
+                    elif event_type in (
+                        "message_start",
+                        "content_block_start",
+                        "content_block_stop",
+                        "ping",
+                    ):
+                        continue
+                    else:
+                        continue
+
+        except anthropic.APITimeoutError as exc:
+            raise ModelTimeoutError(
+                f"模型请求超时（model={self._settings.model}）"
+            ) from exc
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            status = getattr(exc, "status_code", "?")
+            raise ModelAuthError(f"模型鉴权失败（HTTP {status}）") from None
+        except anthropic.RateLimitError as exc:
+            status = getattr(exc, "status_code", "?")
+            raise ModelRateLimitError(f"模型请求被限流（HTTP {status}）") from exc
+        except anthropic.APIStatusError as exc:
+            status = getattr(exc, "status_code", "?")
+            if status == 402:
+                raise ModelServerError("模型账户余额不足（HTTP 402）") from exc
+            if isinstance(status, int) and status >= 500:
+                raise ModelServerError(
+                    f"模型服务内部错误（HTTP {status}）"
+                ) from exc
+            raise ModelServerError(f"模型请求被拒绝（HTTP {status}）") from exc
+        except anthropic.APIConnectionError as exc:
+            raise ModelServerError("无法连接模型服务") from exc
+        except anthropic.APIError as exc:
+            raise ModelServerError(f"模型调用失败（{type(exc).__name__}）") from exc
+
+        # 流结束后，调用非流式 decide() 获取决策结果（作为最后一个 yield）
+        decision = self.decide(messages, tools)
+        yield ("decision", decision)

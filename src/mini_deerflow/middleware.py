@@ -44,6 +44,10 @@ class ExecutionContext:
     parent_span_id: str | None = None
     span_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # 25C: token 流式回调。Agent.run 在 MODEL_CALL 时设置此字段，
+    # 值为一个累积 token 文本的列表引用；model.stream_decide() 每 yield 一个 token
+    # 就 append 进去。RunEventMiddleware.success() 读取此字段，逐 token 发布 model.token 事件。
+    token_accumulator: "list[str] | None" = None
 
     def is_cancelled(self) -> bool:
         return self.cancellation_token.is_cancelled() if self.cancellation_token else False

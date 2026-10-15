@@ -43,22 +43,15 @@ interface AgentChatPanelProps {
   thread: ThreadDetail
 }
 
-// ---------------------------------------------------------------------------
-// 提交状态守卫
-// ---------------------------------------------------------------------------
-function useSubmitGuard() {
-  const submittingRef = { current: false }
-  return submittingRef
-}
-
-// ---------------------------------------------------------------------------
-// 组件
-// ---------------------------------------------------------------------------
 export function AgentChatPanel({ thread }: AgentChatPanelProps) {
-  const submittingRef = useSubmitGuard()
+  // 提交守卫：useRef 保证同一引用跨渲染持久
+  const submittingRef = useRef(false)
 
   // 乐观消息
   const [optimisticMsg, setOptimisticMsg] = useState<OptimisticMessage | null>(null)
+
+  // 已处理的 run.result 事件序列号（防重复 ingest）
+  const processedResultSeq = useRef<number>(0)
 
   // 消息提交状态
   const [submitStatus, setSubmitStatus] = useState<UserSubmitStatus>('idle')
@@ -74,6 +67,7 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
     errorMessage,
     requestId,
     terminalEvent,
+    currentText,
     start,
     stop,
   } = useAgentStream({
@@ -114,8 +108,13 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
     if (isTerminal) void refresh()
   }, [isTerminal]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 跟踪已处理的 run.result 事件
-  const processedResultSeq = useRef<number>(-1)
+  // 26：从 API 响应恢复最近一次 run.result（页面刷新后仍显示 diff）
+  useEffect(() => {
+    const persisted = thread.last_run_result
+    if (persisted && typeof persisted === 'string' && persisted.trim().startsWith('{')) {
+      ingestProjectExecuteResult(thread.thread_id, persisted)
+    }
+  }, [thread.thread_id, thread.last_run_result])
 
   useEffect(() => {
     ingestRealTaskData(thread.thread_id, {
@@ -154,9 +153,8 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
         break
       case 'error':
         // unknown：消息是否被服务端接收不明
-        // 输入框由 draft.current 恢复可写；发送按钮 disabled（submittingRef=true）
+        // submittingRef.current 保持 true，禁止重发；输入框由 draft.current 恢复可写
         setSubmitStatus('unknown')
-        submittingRef.current = false
         break
       case 'completed':
         setSubmitStatus('submitted')
@@ -215,13 +213,17 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
   return (
     <SSEContext.Provider value={{ events, status: streamStatus }}>
       <div className={styles.panel}>
-        {/* 消息列表（含乐观消息） */}
+        {/* 消息列表（含乐观消息 + 流式 assistant） */}
         <div className={styles.messageArea}>
-          <MessageList messages={thread.messages} optimisticMessage={optimisticMsg} />
+          <MessageList
+            messages={thread.messages}
+            optimisticMessage={optimisticMsg}
+            streamingText={currentText}
+          />
         </div>
 
-        {/* SSE 事件面板 */}
-        {submitStatus !== 'idle' && (
+        {/* SSE 事件面板（已隐藏） */}
+        {false && submitStatus !== 'idle' && (
           <div className={styles.streamArea}>
             <RunEventPanel
               status={streamStatus === 'idle' ? 'connecting' : streamStatus}
@@ -273,6 +275,7 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
           onValueChange={saveCurrent}
           onSend={handleSend}
           isPending={isPending}
+          isSubmitting={submittingRef.current}
           hasPendingRestore={canRestore}
           onRestore={handleRestore}
         />

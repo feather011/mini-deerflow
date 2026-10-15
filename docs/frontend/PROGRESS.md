@@ -666,7 +666,7 @@ idle → connecting → streaming → completed | failed | timed_out | cancelled
 **真实限制**
 
 - 当前不支持自动重连（按后端设计）
-- 当前不支持 token streaming（后端不在 event_type 中暴露）
+- 当前已支持 token streaming（`model.token` 事件，delta 字段）
 - 当前不支持断线取消 Agent（按后端限制）
 - 客户端断开时 Server 停止 publish，但不取消 Agent
 

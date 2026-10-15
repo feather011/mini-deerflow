@@ -20,6 +20,7 @@ from typing import Any
 from mini_deerflow.api.schemas.streaming import RunEvent, RunEventType
 from mini_deerflow.api.services.event_broker import RunEventBroker
 from mini_deerflow.middleware import ExecutionContext, Middleware, OperationType
+from mini_deerflow.thread_store import ThreadStore
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,10 +30,12 @@ class RunEventMiddleware(Middleware[Any]):
     """把 ExecutionContext 转换为 RunEvent 发布到 broker。
 
     线程局部栈关联嵌套操作（AGENT_RUN → MODEL_CALL/TOOL_CALL）。
+    26：额外将 project_execute 的 run.result 持久化到 ThreadState。
     """
 
-    def __init__(self, broker: RunEventBroker) -> None:
+    def __init__(self, broker: RunEventBroker, thread_store: ThreadStore | None = None) -> None:
         self._broker = broker
+        self._thread_store = thread_store
         self._local = threading.local()
 
     # ---------------------------------------------------------------- stack
@@ -112,6 +115,16 @@ class RunEventMiddleware(Middleware[Any]):
         run_id, thread_id = top
 
         if op == OperationType.MODEL_CALL:
+            # 25C: 发布 token 流式事件（token_accumulator 在 Agent.run 中累积）
+            if ctx.token_accumulator:
+                for text in ctx.token_accumulator:
+                    self._publish(
+                        run_id,
+                        thread_id,
+                        RunEventType.RUN_MODEL_TOKEN,
+                        operation="model",
+                        delta=text,
+                    )
             self._publish(
                 run_id,
                 thread_id,
@@ -135,6 +148,8 @@ class RunEventMiddleware(Middleware[Any]):
                     RunEventType.RUN_RESULT,
                     tool_result=result,
                 )
+                # 26：持久化到 ThreadState（页面刷新后可恢复 diff 展示）
+                self._persist_run_result(thread_id, result)
         return result
 
     def error(self, ctx: ExecutionContext, exc: Exception) -> Exception:
@@ -173,3 +188,19 @@ class RunEventMiddleware(Middleware[Any]):
             if s:
                 s.pop()
             # 序列号在 RunStreamManager 确认终止后回收（避免误清理）
+
+    # ---------------------------------------------------------------- persist
+
+    def _persist_run_result(self, thread_id: str, tool_result: str) -> None:
+        """将 project_execute 结果持久化到 ThreadState。
+
+        失败不影响主流程：只记录日志，不抛异常。
+        """
+        if self._thread_store is None:
+            return
+        try:
+            thread = self._thread_store.get(thread_id)
+            thread.last_run_result = tool_result
+            self._thread_store.save(thread)
+        except Exception:
+            _LOGGER.exception("Failed to persist run_result for thread=%s", thread_id)

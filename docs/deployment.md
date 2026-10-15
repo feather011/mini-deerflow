@@ -182,7 +182,7 @@ nginx 的 `try_files $uri $uri/ /index.html` 负责 SPA 回落；
 
 - 无认证、无多租户、无分布式锁
 - 无远程 MCP（只支持本地 stdio）
-- 无 token streaming（SSE 只发阶段事件，不逐 token 推送）
+- 已实现 token streaming（模型逐 token 推送 `model.token` 事件）
 - 单实例设计：横向扩容需要先解决 SQLite 与进程内协调器的共享问题
 
 详见 [feature-parity.md](feature-parity.md)。

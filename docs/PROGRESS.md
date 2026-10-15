@@ -199,7 +199,7 @@ smoke 实测：
 ## 明确的真实限制
 
 - **无认证、无多租户、无分布式锁** —— 禁止直接暴露公网
-- **无 token streaming** —— SSE 只发阶段事件
+- **已实现 token streaming** —— 模型逐 token 推送 SSE 事件，前端按 token 增量渲染 assistant 消息
 - **无远程 MCP** —— 只支持本地 stdio
 - **无并行工具调用** —— 一次一个 `tool_use`
 - **单实例** —— SQLite 与进程内协调器都是单实例语义

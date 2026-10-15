@@ -11,7 +11,7 @@ import logging
 import uuid
 from pathlib import Path
 
-from mini_deerflow.project_store import ProjectStore
+from mini_deerflow.project_store import ProjectNotFoundError, ProjectStore
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import (
     ThreadAlreadyExistsError as StoreAlreadyExistsError,

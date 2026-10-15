@@ -142,6 +142,8 @@ class RuntimeConfig:
     harness_timeout_seconds: float = 600.0
     # 模型调用真实超时（秒），0 = 不启用（使用 SDK 自带 timeout）
     model_timeout_seconds: float = 0.0
+    # 测试用：禁用 Budget 限制
+    disable_budget: bool = False
 
 
 # =============================================================================
@@ -567,6 +569,8 @@ def create_runtime(
         max_subagent_tasks=20,
         max_subagent_depth=config.subagent_max_depth,
     )
+    if config.disable_budget:
+        budget = None
 
     # 24：上下文工程层。放在 SubagentManager 之前，因为子代理与主 Agent
     # 共用同一个 assembler（按 thread_id 天然隔离，见 RuntimeContext 说明）。
@@ -691,10 +695,11 @@ def create_runtime(
     # 19D：额外注入 RunEventMiddleware（同一实例同时挂在 IntegratedAgent.pipeline，
     #     共享 thread-local 栈关联 AGENT_RUN 与 MODEL_CALL/TOOL_CALL）。
     run_event_broker = RunEventBroker(queue_maxsize=config.stream_queue_maxsize)
-    run_event_middleware = RunEventMiddleware(run_event_broker)
+    run_event_middleware = RunEventMiddleware(run_event_broker, thread_store=store)  # 26: 传入 store 持久化 run.result
 
     pipeline_middlewares: list = []
-    pipeline_middlewares.append(BudgetMiddleware(budget))
+    if budget is not None:
+        pipeline_middlewares.append(BudgetMiddleware(budget))
     if trace_sink:
         pipeline_middlewares.append(TraceMiddleware(trace_sink))
     if config.retry_enabled:

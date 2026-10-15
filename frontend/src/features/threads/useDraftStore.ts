@@ -94,11 +94,12 @@ export function useDraftStore(threadId: string) {
     })
   }, [threadId])
 
-  /** 用户主动恢复：pendingSent → textarea，pendingSent 清空 */
+  /** 用户主动恢复：pendingSent 追加到 current（不覆盖新草稿），pendingSent 清空 */
   const restorePendingSent = useCallback(() => {
     setDraft((prev) => {
       if (!prev.pendingSent) return prev
-      const next = { current: prev.pendingSent, pendingSent: null }
+      // 追加而非替换：旧消息 pendingSent 在前，新草稿 current 在后
+      const next = { current: prev.pendingSent + prev.current, pendingSent: null }
       writeDraft(threadId, next)
       return next
     })

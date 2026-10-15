@@ -78,7 +78,55 @@ export function ingestRealTaskData(
     cache.delete(threadId)
     return
   }
-  cache.set(threadId, buildTaskResult(threadId, data))
+  const existing = cache.get(threadId)
+  const status = mapStreamStatus(data.streamStatus)
+  const run_label = data.runId
+    ? `run-${data.runId.slice(0, 4)} · 归属当前会话`
+    : `thread: ${threadId} · 尚未建立 Run`
+  const events = data.events.map(convertToTimelineEvent)
+
+  if (!existing) {
+    // 首次进入：建立 task，结果字段用默认占位
+    cache.set(threadId, {
+      thread_id: threadId,
+      run_label,
+      title: data.title,
+      status,
+      validation: {
+        status: 'not_run',
+        command: null,
+        output: null,
+        note: '执行器输出尚未通过 run.result 事件推送。',
+      },
+      files: [],
+      events,
+    })
+    return
+  }
+
+  // 已存在：只更新元数据（status/run_label/events/title），
+  // 保留 files/validation —— 它们由 ingestProjectExecuteResult 独立维护，
+  // 不应被 SSE 重连或组件重挂载清空。
+  // 清空条件：检测到开始新的 run（runId 与缓存不一致）
+  // - 同一 run 内的所有事件（model.* / tool.* / run.result）都不清空
+  // - 新 run 开始（runId 变化）才清空
+  const isNewRun =
+    data.runId != null && data.runId !== existing.run_id_marker
+  if (isNewRun) {
+    existing.validation = {
+      status: 'not_run',
+      command: null,
+      output: null,
+      note: '执行器输出尚未通过 run.result 事件推送。',
+    }
+    existing.files = []
+  }
+  existing.status = status
+  existing.run_label = run_label
+  existing.title = data.title
+  existing.run_id_marker = data.runId
+  existing.events = events
+  cache.set(threadId, existing)
 }
 
 /**
@@ -259,6 +307,9 @@ function parseUnifiedDiff(diff: string): DiffLine[] {
 }
 
 function buildTaskResult(threadId: string, data: RealTaskDataInput): TaskResult {
+  // 已废弃：原实现每次都重建 task 并把 files/validation 重置为空，
+  // 导致「重新进入 thread」或「SSE 重连」时把上一次 run.result 的成果清空。
+  // 保留以避免外部测试引用；新逻辑在 ingestRealTaskData 内联处理。
   const status = mapStreamStatus(data.streamStatus)
   return {
     thread_id: threadId,
@@ -275,6 +326,7 @@ function buildTaskResult(threadId: string, data: RealTaskDataInput): TaskResult 
     },
     files: [], // 默认空；run.result 事件触发更新
     events: data.events.map(convertToTimelineEvent),
+    run_id_marker: data.runId,
   }
 }
 
@@ -283,6 +335,7 @@ function buildTaskResult(threadId: string, data: RealTaskDataInput): TaskResult 
 const SSE_EVENT_LABELS: Record<RunEventType, string> = {
   'run.started': 'Run 开始',
   'model.started': '模型开始',
+  'model.token': 'Token 流式',
   'model.completed': '模型完成',
   'model.failed': '模型失败',
   'tool.started': '工具开始',

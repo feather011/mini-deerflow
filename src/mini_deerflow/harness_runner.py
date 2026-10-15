@@ -178,9 +178,12 @@ class HarnessRunner:
             )
 
         env = dict(os.environ)
+        # 清除 MCP 代理配置：harness 必须直连真实 API，不能走 127.0.0.1:15721
+        env.pop("ANTHROPIC_BASE_URL", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
         env["PYTHONPATH"] = str(self._harness_root) + os.pathsep + env.get("PYTHONPATH", "")
         env["HARNESS_NONINTERACTIVE"] = "1"
-        # 让 harness 加载 mini-deerflow 的 .env（包含 MIMO_* 配置）
+        # 让 harness 加载 mini-deerflow 的 .env（包含 MINI_MAX 配置）
         env["HARNESS_ENV_FILE"] = str(Path(__file__).parent.parent.parent / ".env")
         if extra_env:
             env.update(extra_env)

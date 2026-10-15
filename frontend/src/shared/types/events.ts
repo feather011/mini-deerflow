@@ -31,6 +31,7 @@ export type TerminalEventType = typeof TERMINAL_EVENT_TYPES extends Set<infer T>
 export type RunEventType =
   | 'run.started'
   | 'model.started'
+  | 'model.token'       // token 流式推送事件
   | 'model.completed'
   | 'model.failed'
   | 'tool.started'
@@ -71,6 +72,8 @@ export interface RunEvent {
   duration_seconds: number | null
   /** run.result 事件携带 project_execute 结构化结果（JSON 字符串） */
   tool_result?: string | null
+  /** model.token 事件携带 token 流式推送的增量文本 */
+  delta?: string | null
 }
 
 /** 判断事件是否为终态 */

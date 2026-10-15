@@ -136,21 +136,28 @@ describe('MessageList', () => {
     expect(msgEl).toHaveAttribute('data-submit-status', 'pending')
   })
 
-  it('服务端历史已含同 content 的 user 消息时，乐观消息不重复渲染', () => {
+  it('服务端已有同 content 的 user 消息时，乐观消息不追加（服务端消息顺序不变）', () => {
+    // 关键回归测试：不要从 messages 里删掉服务端 user 消息
     const serverMessages: MessageResponse[] = [
-      { role: 'user', content: '发送中的消息' },
+      { role: 'user', content: 'Hello' },
       { role: 'assistant', content: '服务端回复' },
     ]
     const optimistic = {
       clientId: 'local-abc123',
-      content: '发送中的消息',
+      content: 'Hello',
       status: 'submitted' as const,
       createdAt: Date.now(),
     }
     render(<MessageList messages={serverMessages} optimisticMessage={optimistic} />)
-    // 只有一条"发送中的消息"（来自服务端），没有重复
-    expect(screen.getAllByText('发送中的消息')).toHaveLength(1)
+    // 只看到一条"Hello"（来自服务端），乐观消息未追加
+    expect(screen.getAllByText('Hello')).toHaveLength(1)
+    // assistant 回复仍然在 user 后面
     expect(screen.getByText('服务端回复')).toBeInTheDocument()
+    // 验证相对顺序：Hello 在"服务端回复"前面（DOM 中 Hello 索引 < assistant 索引）
+    const allDivs = document.querySelectorAll('[data-role]')
+    const helloIdx = Array.from(allDivs).findIndex(d => d.getAttribute('data-role') === 'user' && d.textContent === 'Hello')
+    const assistantIdx = Array.from(allDivs).findIndex(d => d.getAttribute('data-role') === 'assistant')
+    expect(helloIdx).toBeLessThan(assistantIdx)
   })
 
   it('服务端无匹配时，乐观消息追加在列表末尾', () => {

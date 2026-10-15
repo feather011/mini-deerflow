@@ -17,6 +17,10 @@
  * - 断线取消 Agent（当前后端不支持）
  */
 import { API_BASE_URL } from './config'
+
+// SSE 流不走 Vite proxy：Vite proxy 会缓冲响应导致无法实时推送，
+// 直接连接后端（生产环境由 nginx 转发，不走 Vite）。
+const SSE_BASE_URL = API_BASE_URL
 import type { RunEvent, RunEventType } from '../types/events'
 
 // ---------------------------------------------------------------------------
@@ -114,7 +118,9 @@ function parseSseChunk(
         currentEvent = { id: '', event: '', data: value }
       } else {
         // data 行可能多行，追加（用换行分隔）
-        currentEvent.data = currentEvent.data ? `${currentEvent.data}\n${value}` : value
+        // 去掉 Windows 行尾的 \r，避免破坏 JSON 解析
+        const cleanValue = value.replace(/\r$/, '')
+        currentEvent.data = currentEvent.data ? `${currentEvent.data}\n${cleanValue}` : cleanValue
       }
     }
     // 其他字段忽略
@@ -181,7 +187,7 @@ export function connectAgentStream(
   void (async () => {
     try {
       const response = await fetch(
-        `${API_BASE_URL}/api/threads/${encodeURIComponent(threadId)}/runs/stream`,
+        `${SSE_BASE_URL}/api/threads/${encodeURIComponent(threadId)}/runs/stream`,
         {
           method: 'POST',
           signal: controller.signal,

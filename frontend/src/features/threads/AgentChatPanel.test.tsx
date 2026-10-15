@@ -171,7 +171,7 @@ describe('AgentChatPanel', () => {
       stop: vi.fn(),
     } as unknown as ReturnType<typeof mockUseAgentStream>)
     rerender(<AgentChatPanel thread={emptyThread} />)
-    // unknown 状态：input 恢复（用户可写），但发送按钮 disabled（submittingRef=true）
+    // unknown 状态：input 恢复（用户可写），发送按钮 disabled（submittingRef=true）
     expect(screen.getByRole('textbox')).not.toBeDisabled()
     expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled()
   })

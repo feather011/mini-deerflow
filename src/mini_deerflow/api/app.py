@@ -110,6 +110,7 @@ def _default_runtime_factory(
             mcp_servers=load_mcp_config(),
             harness_root=resolved.harness_root,
             harness_timeout_seconds=resolved.harness_timeout_seconds,
+            disable_budget=True,
             **load_context_config(),
         ),
         workspaces_root=ws_root,

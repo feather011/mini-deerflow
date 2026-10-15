@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, TypeVar
+from typing import Callable, Iterator, TypeVar
 
 from mini_deerflow.context_assembler import AssembledContext, ContextAssembler
 from mini_deerflow.memory_manager import MemoryProcessor
@@ -255,22 +255,39 @@ class Agent:
                 ]
 
             # Model call：通过 middleware_pipeline 包装（原子 consume 预算）
+            # 25C: 使用 stream_decide() 实现 token 流式推送
+            token_accumulator: list[str] = []
             model_ctx = ExecutionContext(
                 run_id="",  # 由 IntegratedAgent 在外层生成
                 thread_id=thread_id,
                 operation=OperationType.MODEL_CALL,
                 operation_name="model_decide",
                 budget=self._budget,
+                token_accumulator=token_accumulator,
             )
             def _do_model_call(
                 _msgs=model_messages,
                 _tools=model_tools,
+                _acc=token_accumulator,
+            ) -> ToolCall | FinalAnswer:
+                # 25C: 如果模型实现了 stream_decide()，用流式路径；
+                # 否则用普通 decide()（FakeModel 等不支持流式的模型）
+                if hasattr(self._model, "stream_decide"):
+                    return _do_model_call_stream(_msgs, _tools, _acc)
+                else:
+                    result = self._model.decide(_msgs, _tools)
+                    _acc.append(result.content if isinstance(result, FinalAnswer) else "")
+                    return result
+
+            def _do_model_call_stream(
+                _msgs: list[Message],
+                _tools: list[ToolSpec] | None,
+                _acc: list[str],
             ) -> ToolCall | FinalAnswer:
                 # 真正发起调用前原子消费额度（成功/失败/Retry 每次都计）
                 if self._budget is not None:
                     self._budget.consume_model_call()
 
-                # 真实超时：用 threading.Timer 在指定秒数后发送取消信号
                 if self._model_timeout_seconds > 0 and cancellation_token is not None:
                     timer = threading.Timer(
                         self._model_timeout_seconds,
@@ -278,20 +295,37 @@ class Agent:
                     )
                     timer.start()
                     try:
-                        result = self._model.decide(_msgs, _tools)
+                        return _consume_stream(_msgs, _tools, _acc)
                     finally:
                         timer.cancel()
                 else:
-                    result = self._model.decide(_msgs, _tools)
+                    return _consume_stream(_msgs, _tools, _acc)
 
-                # 模型调用返回后检查是否因超时/停止而被取消
-                # （Timer 在调用期间触发；cancel() 本身不中断 HTTP，但 stop API 可实时生效）
-                if cancellation_token is not None and cancellation_token.is_cancelled():
-                    raise BudgetExceededError(
-                        "model_call_timeout",
-                        None,
-                    )
+            def _consume_stream(
+                _msgs: list[Message],
+                _tools: list[ToolSpec] | None,
+                _acc: list[str],
+            ) -> ToolCall | FinalAnswer:
+                result: ToolCall | FinalAnswer | None = None
+                for event in self._model.stream_decide(_msgs, _tools):  # type: ignore[union-attr]
+                    etype, evalue = event
+                    if etype == "token":
+                        _acc.append(evalue)  # type: ignore[arg-type]
+                    elif etype == "stop":
+                        pass
+                    elif etype == "decision":
+                        result = evalue  # type: ignore[assignment]
+                if result is None:
+                    # 流结束但没有决策（理论上不应该发生）
+                    return FinalAnswer(content="".join(_acc))
                 return result
+
+            # 模型调用返回后检查是否因超时/停止而被取消
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                raise BudgetExceededError(
+                    "model_call_timeout",
+                    None,
+                )
             decision = self._run_via_pipeline(model_ctx, _do_model_call)
 
             if isinstance(decision, FinalAnswer):

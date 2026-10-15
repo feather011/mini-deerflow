@@ -353,7 +353,7 @@ function handleStop() {
 | 不做 | 原因 |
 |------|------|
 | 自动重连 | 按当前 SSE 设计，一次性流；重连会丢失中间事件 |
-| Token-level streaming | 后端 `event_type` 不暴露 token chunk |
+| Token-level streaming | 后端通过 `model.token` 事件逐 token 推送 delta，前端累加渲染 |
 | 断线取消后端 Agent | 当前后端不支持 |
 | Last-Event-ID | SSE 事件已通过 `sequence` 排序，无需补发 |
 | 乐观事件显示 | 等待事件流确认，避免显示不存在的事件 |

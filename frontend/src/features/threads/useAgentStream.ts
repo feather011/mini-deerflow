@@ -52,12 +52,15 @@ export interface StreamState {
   requestId: string | null
   /** 事件总数上限（超过后不再添加） */
   eventLimit: number
+  /** 当前 run 的累加 token 文本（用于流式渲染 assistant 消息） */
+  currentText: string
 }
 
 /** 流 Action */
 type StreamAction =
   | { type: 'CONNECTING'; runId: string }
   | { type: 'EVENT'; event: RunEvent }
+  | { type: 'TOKEN_CHUNK'; delta: string }
   | { type: 'TERMINAL'; event: RunEvent }
   | { type: 'ERROR'; message: string; requestId?: string }
   | { type: 'STOP' }
@@ -78,6 +81,8 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
         runId: action.runId,
         errorMessage: null,
         requestId: null,
+        // 25C: 新 run 开始时重置累加文本
+        currentText: '',
       }
 
     case 'EVENT': {
@@ -98,6 +103,13 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
       }
     }
 
+    case 'TOKEN_CHUNK':
+      return {
+        ...state,
+        status: 'streaming',
+        currentText: state.currentText + action.delta,
+      }
+
     case 'TERMINAL': {
       const eventType = action.event.event_type as RunEventType
       const terminalStatus: StreamStatus =
@@ -114,6 +126,8 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
         status: terminalStatus,
         events: [...state.events, action.event].sort((a, b) => a.sequence - b.sequence),
         terminalEvent: action.event,
+        // 25C: 终态时重置累加文本，为下一次 run 准备
+        currentText: '',
       }
     }
 
@@ -123,12 +137,14 @@ function streamReducer(state: StreamState, action: StreamAction): StreamState {
         status: 'error',
         errorMessage: action.message,
         requestId: action.requestId ?? null,
+        currentText: '',
       }
 
     case 'STOP':
       return {
         ...state,
         status: 'stopped',
+        currentText: '',
       }
 
     default:
@@ -170,6 +186,7 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
     errorMessage: null,
     requestId: null,
     eventLimit: MAX_EVENTS,
+    currentText: '',
   })
 
   // 开始流
@@ -189,7 +206,12 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
 
     const { runId, cancel } = connectAgentStream(threadId, effectiveMessage, {
       onEvent: (event) => {
-        dispatch({ type: 'EVENT', event })
+        // 25C: model.token 事件分发到 TOKEN_CHUNK（累加到 currentText）
+        if (event.event_type === 'model.token' && event.delta) {
+          dispatch({ type: 'TOKEN_CHUNK', delta: event.delta })
+        } else {
+          dispatch({ type: 'EVENT', event })
+        }
       },
       onTerminal: (event) => {
         dispatch({ type: 'TERMINAL', event })

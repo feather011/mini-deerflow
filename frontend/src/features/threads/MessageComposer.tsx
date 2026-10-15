@@ -24,6 +24,8 @@ interface MessageComposerProps {
   onValueChange?: (value: string) => void
   onSend: (message: string) => void
   isPending: boolean
+  /** 外部守卫状态（submittingRef.current），unknown 时禁止发送 */
+  isSubmitting?: boolean
   /** 显示"恢复原消息"按钮（pendingSent 存在且无新草稿时） */
   hasPendingRestore?: boolean
   /** 用户点击"恢复原消息" */
@@ -35,6 +37,7 @@ export function MessageComposer({
   onValueChange,
   onSend,
   isPending,
+  isSubmitting,
   hasPendingRestore,
   onRestore,
 }: MessageComposerProps) {
@@ -53,7 +56,7 @@ export function MessageComposer({
   const trimmedValue = value.trim()
   const isEmpty = trimmedValue.length === 0
   const isTooLong = value.length > MAX_MESSAGE_LENGTH
-  const canSend = !isEmpty && !isTooLong && !isPending && !isComposing
+  const canSend = !isEmpty && !isTooLong && !isPending && !isComposing && !isSubmitting
 
   // 父组件已接收（isPending 上升）→ 释放 submittingRef
   useEffect(() => {
