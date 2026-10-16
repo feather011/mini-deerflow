@@ -2381,3 +2381,24 @@ def _do_tool_call(...) -> str:
 | R2a-3-run: parent_run_id 仍为 "main" | `parent_run_id` 使用 `self._parent_run_id`（hardcoded） | 从 `ExecutionContext.run_id` 获取真实父 run_id |
 
 **测试结果**：TOOL-02 + Subagent 定向 160 passed
+
+### TOOL-02 E2E 行为测试补齐（2026-10-16）
+
+推送 SHA：`56c4e29`（审查 V1 要求）
+
+**新增测试文件**：`tests/test_tool_e2e_behavior.py`（442 行，10 个测试）
+
+| 测试 | 验证内容 | 结果 |
+|------|---------|------|
+| test_uncategorized_hidden_from_model | uncategorized 工具 DENY | PASS |
+| test_normal_session_project_read_hidden | 普通会话 scope_mismatch DENY | PASS |
+| test_explicit_confirm_blocks_handler | CONFIRM 策略触发 CONFIRM，handler 不执行 | PASS |
+| test_project_read_file_direct_execute_ok | 直接 Tool.execute: ok=true 含文件内容 | PASS |
+| test_project_read_file_nonexistent_fails | 不存在文件返回错误 | PASS |
+| test_subagent_manager_submit_succeeds | Manager.submit 返回 ok=true | PASS |
+| test_subagent_tool_reads_project_file | 项目会话中 project_read_file 可访问文件 | PASS |
+| test_different_run_ids_submit_independently | 不同 run_id 独立提交 | PASS |
+| test_same_run_id_respects_limit | 同 run_id 共享计数，达上限抛异常 | PASS |
+| test_sandbox_write_uncategorized_deny | sandbox_write_file DENY，handler 不执行 | PASS |
+
+**完整定向**：170 passed in 16.38s
