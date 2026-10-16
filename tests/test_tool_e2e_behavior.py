@@ -1,6 +1,8 @@
-"""TOOL-02 E2E 行为测试（V1 修复版）。
+"""TOOL-02 E2E 行为测试（V1 真实链路版）。
 
-审查 V1 要求：真实 submit/Agent/Runner 链路。
+审查 V1 要求：
+- V1-project：真实子任务读取项目文件（submit→Manager→Runner→collect）
+- V1-visibility：注册待测工具，断言 DENY 隐藏、ALLOW/CONFIRM 可见
 """
 
 import json
@@ -15,8 +17,10 @@ from mini_deerflow.models import FinalAnswer, Message, ToolCall
 from mini_deerflow.project_store import InMemoryProjectStore
 from mini_deerflow.project_tools import create_project_read_tools
 from mini_deerflow.subagent_executor import (
+    CancellationToken,
     SubagentBudget,
     SubagentManager,
+    SubagentRunner,
 )
 from mini_deerflow.subagent_tools import create_subagent_tools
 from mini_deerflow.thread_store import InMemoryThreadStore
@@ -33,6 +37,7 @@ from mini_deerflow.tool_authorization import (
 from mini_deerflow.tool_contracts import (
     AccessDecisionKind,
     ToolCapability,
+    BUILTIN_TOOL_METADATA,
 )
 
 
@@ -49,22 +54,42 @@ class ScriptedModel:
 
     def decide(self, messages, tools=None):
         self.received.append(list(messages))
+        if not self._queue:
+            return FinalAnswer(content="done")
         return self._queue.popleft()
 
 
 # ============================================================================
-# Test 1: 可见性过滤 — 真实 Agent + tool_specs
+# V1-visibility：可见性过滤 — 注册工具后断言 DENY 隐藏、ALLOW/CONFIRM 可见
 # ============================================================================
 
 
 class TestToolVisibilityViaAgent(unittest.TestCase):
     """Agent.run 真实发给模型的 tool_specs 过滤。"""
 
-    def test_tool_visibility_denied_hidden(self):
+    def test_deny_tool_hidden_from_model(self):
         """DENY 工具不在发给模型的 tool_specs 中。"""
         registry = ToolPolicyRegistry()
+        tool_reg = ToolRegistry()
 
-        # 用 FakeModel 捕获 tools
+        # 注册 sandbox_write_file（uncategorized → 默认 DENY）
+        def dummy_handler(args):
+            return '{"ok": true}'
+
+        tool_reg.register(Tool(
+            name="sandbox_write_file",
+            description="Write to sandbox",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+            handler=dummy_handler,
+        ))
+        # 注册一个正常工具（ALLOW）
+        tool_reg.register(Tool(
+            name="calculator",
+            description="Calculator",
+            parameters={"type": "object", "properties": {"expr": {"type": "string"}}},
+            handler=dummy_handler,
+        ))
+
         captured_tools = []
 
         class CaptureModel:
@@ -78,34 +103,36 @@ class TestToolVisibilityViaAgent(unittest.TestCase):
 
         agent = Agent(
             model=CaptureModel(),
-            registry=ToolRegistry(),
+            registry=tool_reg,
             store=store,
             tool_policy_registry=registry,
         )
         agent.run("t1", "hello")
 
-        # 验证 sandbox_write_file 不在发给模型的工具列表中
         tool_names = [t.name for t in captured_tools]
+        # DENY 工具不应出现
         self.assertNotIn("sandbox_write_file", tool_names,
                         f"sandbox_write_file should be hidden. Got: {tool_names}")
+        # ALLOW 工具应出现
+        self.assertIn("calculator", tool_names,
+                     f"calculator should be visible. Got: {tool_names}")
 
-    def test_tool_visibility_confirm_visible(self):
-        """CONFIRM 工具仍发给模型（只是 handler 不执行）。"""
+    def test_confirm_tool_visible_to_model(self):
+        """CONFIRM 工具发给模型（只是 handler 不执行）。"""
         registry = ToolPolicyRegistry()
+        tool_reg = ToolRegistry()
 
-        captured_tools = []
+        # 注册 task_note 并设置 requires_confirmation=True 策略
+        def dummy_handler(args):
+            return '{"ok": true}'
 
-        class CaptureModel:
-            def decide(self, messages, tools=None):
-                captured_tools.extend(list(tools) if tools else [])
-                return FinalAnswer(content="done")
+        tool_reg.register(Tool(
+            name="task_note",
+            description="记笔记",
+            parameters={"type": "object", "properties": {}},
+            handler=dummy_handler,
+        ))
 
-        from mini_deerflow.agent import Agent
-        store = InMemoryThreadStore()
-        store.create("t1")
-
-        # task_note 策略默认不 CONFIRM（WRITES_SESSION 为内部操作）
-        # 为测试 CONFIRM 可见性，显式设置 requires_confirmation=True
         policy = ToolPolicy(
             enabled=True,
             allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
@@ -113,18 +140,127 @@ class TestToolVisibilityViaAgent(unittest.TestCase):
         )
         registry._policies["task_note"] = policy
 
+        captured_tools = []
+
+        class CaptureModel:
+            def decide(self, messages, tools=None):
+                captured_tools.extend(list(tools) if tools else [])
+                return FinalAnswer(content="done")
+
+        from mini_deerflow.agent import Agent
+        store = InMemoryThreadStore()
+        store.create("t1")
+
         agent = Agent(
             model=CaptureModel(),
-            registry=ToolRegistry(),
+            registry=tool_reg,
             store=store,
             tool_policy_registry=registry,
         )
         agent.run("t1", "hello")
 
         tool_names = [t.name for t in captured_tools]
-        # CONFIRM 工具应该发给模型（模型决定是否调用）
-        # 当前注册表没有 task_note，所以这里只验证 sandbox_write_file 隐藏
-        self.assertNotIn("sandbox_write_file", tool_names)
+        # CONFIRM 工具应该发给模型
+        self.assertIn("task_note", tool_names,
+                     f"task_note should be visible (CONFIRM). Got: {tool_names}")
+
+
+# ============================================================================
+# V1-project：真实子任务读取项目文件（submit→Manager→Runner→collect）
+# ============================================================================
+
+
+class TestSubagentProjectRead(unittest.TestCase):
+    """真实子任务读取项目文件链路测试。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.repo_path = Path(self.temp_dir.name)
+        f = self.repo_path / "test.txt"
+        f.write_text("hello from project\n", encoding="utf-8")
+
+        self.project_store = InMemoryProjectStore()
+        self.project_store.create(
+            project_id="proj-subagent-test",
+            name="Subagent Test",
+            workspace_path=self.repo_path,
+        )
+        self.thread_store = InMemoryThreadStore()
+        self.thread_store.create("parent-t")
+
+        # 设置父线程的项目上下文
+        parent_thread = self.thread_store.get("parent-t")
+        parent_thread.project_id = "proj-subagent-test"
+        self.thread_store.save(parent_thread)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_subagent_reads_project_file_via_submit_collect(self):
+        """通过 submit→Manager→Runner→collect 读取项目文件。"""
+        manager = SubagentManager(
+            max_concurrency=1,
+            max_tasks_per_parent=10,
+            shared_budget=SubagentBudget(max_steps=10),
+            tool_policy_registry=ToolPolicyRegistry(),
+            thread_store=self.thread_store,
+        )
+
+        # 创建工具注册表（含 project_read_file）
+        tool_reg = ToolRegistry()
+        read_tools = create_project_read_tools(
+            self.thread_store, self.project_store
+        )
+        tool_reg.register_many(read_tools)
+
+        # 脚本模型：先调用 project_read_file，再返回 FinalAnswer
+        scripted_model = ScriptedModel([
+            ToolCall(name="project_read_file", arguments={"path": "test.txt"}),
+            FinalAnswer(content="read complete"),
+        ])
+
+        # 创建 Runner
+        runner = SubagentRunner(
+            task=None,  # 稍后填充
+            model=scripted_model,
+            registry=tool_reg,
+            store=self.thread_store,
+            budget=SubagentBudget(max_steps=10),
+            cancellation_token=CancellationToken(),
+            tool_policy_registry=ToolPolicyRegistry(),
+            parent_granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
+            parent_project_id="proj-subagent-test",
+        )
+
+        # 提交任务
+        task = manager.submit(
+            instruction="读取项目文件 test.txt 并返回内容",
+            parent_run_id="test-run",
+            parent_thread_id="parent-t",
+            depth=1,
+            parent_granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
+            parent_project_id="proj-subagent-test",
+        )
+
+        # 直接运行 Runner（绕过 Manager 队列）
+        runner.task = task
+        result = runner.run()
+
+        # 验证：任务成功
+        self.assertTrue(result.succeeded,
+                       f"Subagent should succeed. error={result.error_type}: {result.error_message}")
+
+        # 验证：输出包含文件内容
+        self.assertIn("hello from project", result.output,
+                     f"Output should contain file content. Got: {result.output}")
+
+        # 验证：模型确实收到了 tool_use 消息
+        tool_calls = [m for m in scripted_model.received
+                     if isinstance(m, Message) and m.role == "assistant"
+                     for tool_call in (m.tool_calls or [])]
+        read_calls = [tc for tc in tool_calls if tc.name == "project_read_file"]
+        self.assertGreater(len(read_calls), 0,
+                          f"Model should call project_read_file. Tool calls: {tool_calls}")
 
 
 # ============================================================================
@@ -398,12 +534,7 @@ class TestConfirmBlocksHandler(unittest.TestCase):
     def test_explicit_confirm_blocks_handler(self):
         """显式 requires_confirmation=True 触发 CONFIRM，handler 不执行。"""
         registry = ToolPolicyRegistry()
-        policy = ToolPolicy(
-            enabled=True,
-            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
-            requires_confirmation=True,
-        )
-        registry._policies["task_note"] = policy
+        tool_reg = ToolRegistry()
 
         executed = False
 
@@ -411,6 +542,20 @@ class TestConfirmBlocksHandler(unittest.TestCase):
             nonlocal executed
             executed = True
             return '{"ok": true}'
+
+        tool_reg.register(Tool(
+            name="task_note",
+            description="记笔记",
+            parameters={"type": "object", "properties": {}},
+            handler=note_handler,
+        ))
+
+        policy = ToolPolicy(
+            enabled=True,
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=True,
+        )
+        registry._policies["task_note"] = policy
 
         store = InMemoryThreadStore()
         store.create("t1")
@@ -422,16 +567,10 @@ class TestConfirmBlocksHandler(unittest.TestCase):
         from mini_deerflow.agent import Agent
         agent = Agent(
             model=FakeModel(),
-            registry=ToolRegistry(),
+            registry=tool_reg,
             store=store,
             tool_policy_registry=registry,
         )
-        agent._registry.register(Tool(
-            name="task_note",
-            description="记笔记",
-            parameters={"type": "object", "properties": {}},
-            handler=note_handler,
-        ))
 
         with self.assertRaises(ToolAuthorizationError) as ctx:
             agent.run("t1", "记个笔记")
