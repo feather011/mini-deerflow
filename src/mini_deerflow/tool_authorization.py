@@ -78,10 +78,14 @@ class ToolPolicyRegistry:
         run_id: str,
         project_id: str | None,
         granted_capabilities: frozenset,
+        principal: ExecutorPrincipal = ExecutorPrincipal.MAIN_AGENT,
     ) -> RunAuthority:
-        """从执行上下文构造 RunAuthority。"""
+        """从执行上下文构造 RunAuthority。
+
+        principal 参数允许调用方指定执行主体（MAIN_AGENT / MINI_SUBAGENT 等）。
+        """
         return RunAuthority(
-            principal=ExecutorPrincipal.MAIN_AGENT,
+            principal=principal,
             thread_id=thread_id,
             run_id=run_id,
             project_id=project_id,

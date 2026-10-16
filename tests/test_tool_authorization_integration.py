@@ -127,15 +127,14 @@ def test_confirm_tool_visible_to_model():
     """confirm 工具在可见列表中，模型可以看到。"""
     registry = ToolPolicyRegistry()
 
-    # project_execute 默认 requires_confirmation
-    _, policy = registry.get("project_execute")
-    assert policy is not None
-    assert policy.requires_confirmation
-
-    # confirm 工具可见（不在 hidden_names 中）
-    metadata, _ = registry.get("project_execute")
+    # project_execute 策略改为直接派发（requires_confirmation=False），
+    # 但 metadata 副作用 WRITES_PROJECT 仍触发 CONFIRM
+    metadata, policy = registry.get("project_execute")
     assert metadata is not None
     assert not metadata.uncategorized  # 未分类才会隐藏
+    # 策略直接派发，但 metadata 副作用导致 confirm
+    assert policy.requires_confirmation is False
+    assert metadata.requires_confirmation() is True
 
 
 def test_confirm_tool_handler_not_executed():

@@ -32,7 +32,7 @@ from mini_deerflow.tool_authorization import (
     check_tool_access,
     ToolAuthorizationError,
 )
-from mini_deerflow.tool_contracts import ToolCapability
+from mini_deerflow.tool_contracts import ToolCapability, ExecutorPrincipal
 
 T = TypeVar("T")
 
@@ -128,6 +128,7 @@ class Agent:
         context_assembler: ContextAssembler | None = None,
         model_timeout_seconds: float = 0.0,
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
+        run_principal: ExecutorPrincipal = ExecutorPrincipal.MAIN_AGENT,
     ):
         self._model = model
         self._registry = registry
@@ -143,6 +144,8 @@ class Agent:
         self._model_timeout_seconds = model_timeout_seconds
         # TOOL-02：可选细粒度授权策略注册表。None 时回退到 ensure_tool_allowed 白名单检查。
         self._tool_policy_registry = tool_policy_registry
+        # TOOL-02：执行主体的身份（MAIN_AGENT / MINI_SUBAGENT 等）
+        self._run_principal = run_principal
 
     @property
     def last_assembled(self) -> "AssembledContext | None":
@@ -229,16 +232,34 @@ class Agent:
         # 25：按会话权限过滤（暴露限制）。
         model_tools = filter_tool_specs(self._registry.tool_specs(), allowed)
 
-        # TOOL-02：策略可见性过滤——禁用/未分类工具不发给模型
+        # TOOL-02：策略可见性过滤——DENY 工具隐藏，ALLOW/CONFIRM 可见
+        # 用当前会话默认能力做可见性判定：模型不应看到自己无权调用的工具
         if self._tool_policy_registry is not None:
+            # 根据会话类型构造默认能力
+            if thread.project_id is None:
+                session_caps = frozenset({
+                    ToolCapability.COMPUTE,
+                    ToolCapability.SESSION_HISTORY_READ,
+                })
+                session_project_id: str | None = None
+            else:
+                session_caps = frozenset({
+                    ToolCapability.PROJECT_READ,
+                    ToolCapability.COMPUTE,
+                    ToolCapability.SESSION_HISTORY_READ,
+                })
+                session_project_id = thread.project_id
             visible_names: set[str] = set()
             for spec in model_tools:
-                metadata, policy = self._tool_policy_registry.get(spec.name)
-                # 未知工具或未分类：不在可见列表
-                if metadata is None or metadata.uncategorized:
-                    continue
-                # 策略禁用：不在可见列表
-                if policy is not None and not policy.enabled:
+                authority = self._tool_policy_registry.get_authority(
+                    thread_id=thread_id,
+                    run_id=run_id or "",
+                    project_id=session_project_id,
+                    granted_capabilities=session_caps,
+                )
+                decision = check_tool_access(self._tool_policy_registry, spec.name, authority)
+                # DENY 隐藏；ALLOW/CONFIRM 均可见（CONFIRM 需用户确认，但不屏蔽工具）
+                if decision.is_denied:
                     continue
                 visible_names.add(spec.name)
             model_tools = [s for s in model_tools if s.name in visible_names]
@@ -415,16 +436,26 @@ class Agent:
                     # TOOL-02 第三层：细粒度授权策略（能力/主体/确认）
                     # 仅当注册了 policy_registry 时启用；None 时回退到前两层
                     if self._tool_policy_registry is not None:
-                        # 普通会话默认具备基础能力（calculator 等）
+                        # 根据会话类型授予默认基础能力
                         if thread.project_id is None:
-                            default_caps = frozenset({ToolCapability.COMPUTE})
+                            # 普通会话：允许 calculator(history_search 等
+                            default_caps = frozenset({
+                                ToolCapability.COMPUTE,
+                                ToolCapability.SESSION_HISTORY_READ,
+                            })
                         else:
-                            default_caps = frozenset()
+                            # 项目会话：允许 project_read_file/calculator/history_search
+                            default_caps = frozenset({
+                                ToolCapability.PROJECT_READ,
+                                ToolCapability.COMPUTE,
+                                ToolCapability.SESSION_HISTORY_READ,
+                            })
                         authority = self._tool_policy_registry.get_authority(
                             thread_id=thread_id,
                             run_id=getattr(_ctx, "run_id", "") or "",
                             project_id=thread.project_id,
                             granted_capabilities=default_caps,
+                            principal=self._run_principal,
                         )
                         decision = check_tool_access(self._tool_policy_registry, _name, authority)
                         if decision.is_denied or decision.is_confirm:

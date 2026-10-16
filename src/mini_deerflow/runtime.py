@@ -639,6 +639,9 @@ def create_runtime(
     # 项目锁字典（工具层与 API 层共用）
     _project_locks: dict[str, Lock] = {}
 
+    # TOOL-02：创建策略注册表（SubagentManager 和 Agent 都需要注入）
+    tool_policy_registry = ToolPolicyRegistry(thread_store=store)
+
     # SubagentManager
     manager: SubagentManager | None = None
     if config.subagent_enabled:
@@ -652,6 +655,8 @@ def create_runtime(
             # `subagent-{task_id}`，因此 ContextState / 摘要 / 水位 / Task Notes
             # 与父线程以及其它子代理天然隔离，无需另建 store。
             context_assembler=context_assembler,
+            # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
+            tool_policy_registry=tool_policy_registry,
         )
         # 注册子任务工具
         tools = create_subagent_tools(
@@ -723,9 +728,7 @@ def create_runtime(
         # start() 内部已自行清理事件循环桥与子进程，不留半开状态。
         mcp_manager.start(registry)
 
-    # TOOL-02：创建策略注册表并注入 Agent
-    tool_policy_registry = ToolPolicyRegistry(thread_store=store)
-
+    # TOOL-02：策略注册表已在上面创建并注入 SubagentManager 和 Agent
     agent = Agent(
         # 显式传入的 model 优先（测试注入 FakeModel 等）；
         # 否则走统一 Model Factory，由 config.model_settings 决定 provider。

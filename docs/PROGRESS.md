@@ -2210,7 +2210,7 @@ UI 表现：
 
 - 会话标识：`claude-to-01-02-20261016`
 - 目标：将 evaluate_tool_access() 接入 Agent._do_tool_call，提供细粒度授权
-- 状态：✅ 完成（生产接入代码已实现并自测通过，待代码审查）
+- 状态：✅ 完成（生产接入代码已实现并自测通过，审查后修复 6 项问题，代码已推送）
 
 ### 新增文件
 
@@ -2269,11 +2269,13 @@ def _do_tool_call(...) -> str:
 
 | 验收项 | 实际行为 |
 |--------|----------|
-| 模型只看到授权工具 | `filter_tool_specs(registry.tool_specs(), allowed)` 过滤后传给模型 |
+| 模型只看到授权工具 | `check_tool_access` 用当前会话能力过滤，DENY 隐藏，ALLOW/CONFIRM 可见 |
 | 执行前复核 | `check_tool_access` 在 `registry.execute()` 之前调用 |
 | confirm 阻止执行 | 返回 `CONFIRM`，调用方抛异常，handler 不执行 |
-| Mini Subagent 权限隔离 | 独立 `RunAuthority`，`subagent_submit` 策略仅允许 `MAIN_AGENT` |
+| Mini Subagent 权限隔离 | `_BudgetAwareAgent` 持有与父共享的 `tool_policy_registry`，principal=MINI_SUBAGENT |
 | 正常工具调用保留 | `calculator` 等只读工具返回 `ALLOW`，无回归 |
+| 策略能力合并 | `evaluate_tool_access` 第 5 步用 `policy.merge_requirements()` 合并元数据+策略能力 |
+| project_execute 直接派发 | 策略 `requires_confirmation=False`，metadata `RUNS_COMMAND` 不触发确认 |
 
 ### 24 个失败用例归因（非 TOOL-02 引入）
 
@@ -2291,19 +2293,30 @@ def _do_tool_call(...) -> str:
 ### 三处生产接入证据（代码位置）
 
 **证据 1：Runtime 注入**
-- 文件：`src/mini_deerflow/runtime.py:727-740`
-- 代码：`tool_policy_registry = ToolPolicyRegistry(...)` → `Agent(..., tool_policy_registry=tool_policy_registry)`
+- 文件：`src/mini_deerflow/runtime.py:641-655`
+- 代码：`tool_policy_registry = ToolPolicyRegistry(...)` → SubagentManager/Agent 注入
 - 测试：`test_runtime_created_agent_normal_session_cannot_write`（13 passed）
 
-**证据 2：模型可见性过滤**
-- 文件：`src/mini_deerflow/agent.py:233-243`
-- 代码：`if self._tool_policy_registry is not None: visible_names = {...}; model_tools = [s for s in model_tools if s.name in visible_names]`
+**证据 2：模型可见性过滤（DENY 隐藏，ALLOW/CONFIRM 可见）**
+- 文件：`src/mini_deerflow/agent.py:233-260`
+- 代码：每个工具用当前会话能力调用 `check_tool_access`，DENY 跳过，ALLOW/CONFIRM 加入可见列表
 - 测试：`test_disabled_tool_not_in_model_tools`（13 passed）
 
 **证据 3：Mini Subagent 权限隔离**
-- 文件：`src/mini_deerflow/subagent_executor.py:130-143`（`_BudgetAwareAgent` 不持有 `tool_policy_registry`）
-- 文件：`src/mini_deerflow/agent.py:417-425`（第三层条件 `if self._tool_policy_registry is not None`）
-- 测试：`test_budget_aware_agent_no_tool_policy_registry` + `test_mini_subagent_cannot_delegate_to_subagent`（13 passed）
+- 文件：`src/mini_deerflow/runtime.py:655`（SubagentManager 注入 `tool_policy_registry`）
+- 文件：`src/mini_deerflow/subagent_executor.py:275-290`（`_BudgetAwareAgent` 第三层授权检查，principal=MINI_SUBAGENT）
+- 测试：`test_mini_subagent_cannot_delegate_to_subagent`（13 passed）
+
+### TOOL-02 本次审查修复项
+
+| 问题 | 修复 |
+|------|------|
+| 项目会话/普通会话能力不足 | `default_caps` 根据 `project_id` 授予 `COMPUTE/SESSION_HISTORY_READ` 或 `PROJECT_READ` |
+| 策略能力未合并 | `evaluate_tool_access` step 5 用 `policy.merge_requirements()` |
+| 确认要求未合并 | step 6 用 `policy.requires_confirmation or metadata.requires_confirmation()` |
+| Subagent 未接入授权 | `_BudgetAwareAgent` 持有 `tool_policy_registry`，execute 前第三层检查，principal=MINI_SUBAGENT |
+| 模型可见性用能力判定 | 每个工具用 `check_tool_access` 判定，DENY 隐藏 |
+| project_execute 默认确认 | 策略改为 `requires_confirmation=False`，metadata RUNS_COMMAND 不触发确认 |
 
 ### 约束遵守
 

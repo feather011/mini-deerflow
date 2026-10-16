@@ -143,9 +143,13 @@ class ToolMetadata:
         """是否有外部副作用（默认需要本次确认）。"""
         if self.uncategorized:
             return True
-        return bool(self.side_effects - {ToolSideEffect.NONE,
-                                          ToolSideEffect.READS_SESSION,
-                                          ToolSideEffect.READS_PROJECT})
+        # READS_SESSION / READS_PROJECT / RUNS_COMMAND（受控委派路径）不算危险副作用
+        return bool(self.side_effects - {
+            ToolSideEffect.NONE,
+            ToolSideEffect.READS_SESSION,
+            ToolSideEffect.READS_PROJECT,
+            ToolSideEffect.RUNS_COMMAND,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -410,16 +414,17 @@ def evaluate_tool_access(
                 "普通会话不允许项目操作",
             )
 
-    # 5. 所需能力不全部满足
-    missing = metadata.capabilities - authority.granted_capabilities
+    # 5. 所需能力不全部满足（合并元数据 + 策略要求）
+    all_required = policy.merge_requirements(metadata.capabilities)
+    missing = all_required - authority.granted_capabilities
     if missing:
         return ToolAccessDecision.deny(
             "capability_missing",
             f"缺少能力: {', '.join(c.name for c in missing)}",
         )
 
-    # 6. 已授权但需要确认
-    if metadata.requires_confirmation():
+    # 6. 已授权但需要确认（策略覆盖 > 元数据默认值）
+    if policy.requires_confirmation or metadata.requires_confirmation():
         return ToolAccessDecision.confirm(
             f"工具 {metadata.name} 有外部副作用，需要本次确认",
         )
@@ -601,13 +606,14 @@ def default_policy_for_project_read() -> ToolPolicy:
 
 
 def default_policy_for_project_execute() -> ToolPolicy:
-    """project_execute 作为受控业务例外：有确认机制，不做通用强制免确认。"""
+    """project_execute：主 Agent 可见，明确编码请求直接派发（不默认要求确认）。"""
     return ToolPolicy(
         enabled=True,
         allowed_principals=frozenset({
             ExecutorPrincipal.MAIN_AGENT,
         }),
-        requires_confirmation=True,  # 有外部副作用，默认要求确认
+        # 明确编码请求直接派发；requires_confirmation 由用户操作层单独控制
+        requires_confirmation=False,
     )
 
 

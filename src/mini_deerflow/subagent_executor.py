@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Callable
 
 from mini_deerflow.agent import Agent
 from mini_deerflow.models import FakeModel, FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.tool_contracts import ExecutorPrincipal
 
 if TYPE_CHECKING:
     # 仅用于类型注解：运行时不导入，避免把上下文工程层拖进 Subagent 的导入链
@@ -40,6 +41,7 @@ from mini_deerflow.tools import (
     ensure_tool_allowed,
     filter_tool_specs,
 )
+from mini_deerflow.tool_authorization import ToolPolicyRegistry
 
 
 # --- Budget ---
@@ -96,6 +98,8 @@ class SubagentRunner:
     # 24：可选。传入则子代理走统一上下文工程，并在结束时回收投影状态。
     # 隔离靠 thread_id（`subagent-{task_id}`），不是靠另开一份 store。
     context_assembler: ContextAssembler | None = None
+    # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
+    tool_policy_registry: "ToolPolicyRegistry | None" = None
 
     def run(self) -> SubagentResult:
         """执行子任务并返回结果。"""
@@ -142,6 +146,8 @@ class SubagentRunner:
                 ),
                 context_assembler=self.context_assembler,
                 run_id=self.run_id,
+                # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
+                tool_policy_registry=self.tool_policy_registry,
             )
 
             # 检查取消（在开始前）
@@ -272,6 +278,8 @@ class _BudgetAwareAgent:
         allowed_tools: tuple[str, ...] | None = None,
         context_assembler: "ContextAssembler | None" = None,
         run_id: str = "",
+        # TOOL-02：子代理策略注册表（与父共享），principal = MINI_SUBAGENT
+        tool_policy_registry: "ToolPolicyRegistry | None" = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -291,6 +299,8 @@ class _BudgetAwareAgent:
         # 仅用于 Trace 关联；子代理的 run_id 由 SubagentRunner 生成。
         self._run_id = run_id
         self._last_assembled: "object | None" = None
+        # TOOL-02：子代理与父共享策略注册表
+        self._tool_policy_registry = tool_policy_registry
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
@@ -376,6 +386,23 @@ class _BudgetAwareAgent:
                 # 所以执行前必须再校验一次，越权直接抛 ToolNotAllowedError。
                 ensure_tool_allowed(decision.name, self._allowed)
 
+                # TOOL-02 第三层：细粒度授权（MINI_SUBAGENT principal + 继承能力）
+                if self._tool_policy_registry is not None:
+                    from mini_deerflow.tool_authorization import check_tool_access
+                    authority = self._tool_policy_registry.get_authority(
+                        thread_id=thread_id,
+                        run_id=self._run_id,
+                        project_id=None,
+                        granted_capabilities=frozenset(),  # 子代理由父授权决定
+                        principal=ExecutorPrincipal.MINI_SUBAGENT,
+                    )
+                    auth_decision = check_tool_access(
+                        self._tool_policy_registry, decision.name, authority
+                    )
+                    if auth_decision.is_denied or auth_decision.is_confirm:
+                        from mini_deerflow.tool_authorization import ToolAuthorizationError
+                        raise ToolAuthorizationError(auth_decision)
+
                 result = self._registry.execute(decision.name, decision.arguments)
                 # 与主 Agent 一致：工具往返只留在 working_messages（本轮喂模型），
                 # **不写入 pending**——Thread 只提交 user 与最终 assistant，
@@ -410,6 +437,7 @@ class SubagentManager:
         default_budget: SubagentBudget | None = None,
         shared_budget: SubagentBudget | None = None,
         context_assembler: ContextAssembler | None = None,
+        tool_policy_registry: "ToolPolicyRegistry | None" = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency 必须 >= 1")
@@ -429,6 +457,8 @@ class SubagentManager:
         # thread_id 不同（`subagent-{task_id}`），因此摘要、Task Notes、
         # 压缩水位与向量索引各自独立，父线程的 ContextState 不会被触碰。
         self._context_assembler = context_assembler
+        # TOOL-02：子代理持有与父相同的策略注册表，principal = MINI_SUBAGENT
+        self._tool_policy_registry = tool_policy_registry
 
         self._lock = threading.Lock()
         self._tasks: dict[str, SubagentTask] = {}
