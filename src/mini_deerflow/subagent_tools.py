@@ -107,9 +107,14 @@ class _SubmitHandler:
             if not isinstance(arguments, dict):
                 raise SubagentToolError("arguments", "必须是 dict")
 
-            # TOOL-02（R2a-3）：从 context 提取父 Agent 的 thread_id（而非 hardcoded "default"）
+            # TOOL-02（R2a-3-run）：从 context 提取父 Agent 的 run_id 和 thread_id（而非 hardcoded）
+            effective_parent_run_id = self._parent_run_id
             effective_parent_thread_id = self._parent_thread_id
             if context is not None:
+                if hasattr(context, "run_id"):
+                    ctx_run_id = getattr(context, "run_id")
+                    if ctx_run_id:
+                        effective_parent_run_id = ctx_run_id
                 if hasattr(context, "thread_id"):
                     ctx_thread_id = getattr(context, "thread_id")
                     if ctx_thread_id:
@@ -161,7 +166,7 @@ class _SubmitHandler:
 
             task = self._manager.submit(
                 instruction=instruction,
-                parent_run_id=self._parent_run_id,
+                parent_run_id=effective_parent_run_id,
                 parent_thread_id=effective_parent_thread_id,
                 depth=self._depth,
                 timeout_seconds=timeout if timeout else None,
