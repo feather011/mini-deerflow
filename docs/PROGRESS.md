@@ -2324,3 +2324,16 @@ def _do_tool_call(...) -> str:
 - 未修改前端及聊天确认卡 ✅
 - 未修改 SSE / run.* 事件 ✅
 - 未修改 Phase 26 schema 和结果持久化 ✅
+
+### TOOL-02 第2轮审查修复（2026-10-16）
+
+审查 SHA：`651782b`，修复推送 SHA：`292ff1e`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R1: session_caps 仍缺 PROJECT_EXEC_DELEGATE/SESSION_STATE_WRITE | agent.py 两个分支的可见性能力集不一致 | 补全两个分支的 session_caps |
+| R2: 父授权被覆盖为空 | `_BudgetAwareAgent.__init__` L313 覆盖 L311 | 移除覆盖行；submit 默认值 `field()` → `frozenset()`；subagent_submit 加 `needs_context=True` |
+| R3: RUNS_COMMAND 全局豁免 | `requires_confirmation()` 排除 RUNS_COMMAND | 移除 RUNS_COMMAND；project_execute 在 `evaluate_tool_access` 中保持受控派发例外 |
+| R4: task_note 默认 CONFIRM | WRITES_SESSION 视为外部副作用 | WRITES_SESSION 移入安全集合，task_note 默认 ALLOW；6 个测试改用显式确认策略验证 CONFIRM 机制 |
+
+**测试结果**：TOOL-02 定向 86 passed，全量回归 3319 passed / 9 failed（无新增）
