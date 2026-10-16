@@ -2371,3 +2371,13 @@ def _do_tool_call(...) -> str:
 | R2a-3: parent_thread_id 为 "default" | `create_subagent_tools` 硬编码 "default" | 从 `ExecutionContext.thread_id` 获取真实父线程 |
 
 **测试结果**：TOOL-02 + Subagent 定向 160 passed
+
+### TOOL-02 第6轮审查修复（2026-10-16）
+
+审查 SHA：`26e2374`，修复推送 SHA：`68ef44a`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R2a-3-run: parent_run_id 仍为 "main" | `parent_run_id` 使用 `self._parent_run_id`（hardcoded） | 从 `ExecutionContext.run_id` 获取真实父 run_id |
+
+**测试结果**：TOOL-02 + Subagent 定向 160 passed
