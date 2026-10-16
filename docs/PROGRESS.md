@@ -2359,3 +2359,15 @@ def _do_tool_call(...) -> str:
 | R2a-2: 项目文件读取失败 | `SubagentRunner._run_task` 创建隔离 `InMemoryThreadStore()`，无项目数据 | Manager 和 `_run_task` 使用共享 `thread_store` |
 
 **测试结果**：TOOL-02 + Subagent 定向 160 passed
+
+### TOOL-02 第5轮审查修复（2026-10-16）
+
+审查 SHA：`942c4e5`，修复推送 SHA：`cd507f5`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R2a-1: depth 参数覆盖 | `thread_store` 作为位置参数4传入覆盖 `depth` | 改用关键字参数 `thread_store=thread_store` |
+| R2a-2: 子线程 project_id 未设置 | `store.create(thread_id)` 后未设 `project_id` | 创建后设置 `sub_thread.project_id = self.parent_project_id` |
+| R2a-3: parent_thread_id 为 "default" | `create_subagent_tools` 硬编码 "default" | 从 `ExecutionContext.thread_id` 获取真实父线程 |
+
+**测试结果**：TOOL-02 + Subagent 定向 160 passed
