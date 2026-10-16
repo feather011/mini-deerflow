@@ -98,6 +98,8 @@ class SubagentTask:
     started_at: float | None = None
     finished_at: float | None = None
     context_policy: SubagentContextPolicy | None = None
+    # TOOL-02：父 Agent 已授予子任务的能力集合
+    parent_granted_capabilities: frozenset[Any] = field(default_factory=frozenset)
     # 元数据（不可变字典）
     metadata: dict[str, Any] = field(default_factory=dict)
 

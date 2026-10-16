@@ -99,11 +99,17 @@ class _SubmitHandler:
         # 工具调用来源的子任务深度（父 Agent 视作 depth=0，本工具提交的子任务从 1 开始）
         self._depth = depth
 
-    def __call__(self, arguments: dict[str, object]) -> str:
+    def __call__(self, arguments: dict[str, object], context: object | None = None) -> str:
         tool_name = "subagent_submit"
         try:
             if not isinstance(arguments, dict):
                 raise SubagentToolError("arguments", "必须是 dict")
+
+            # TOOL-02：从执行上下文提取父 Agent 已授予的能力，传递给子任务
+            parent_caps: frozenset = frozenset()
+            if context is not None:
+                if hasattr(context, "granted_capabilities"):
+                    parent_caps = getattr(context, "granted_capabilities") or frozenset()
 
             instruction = _check_str(arguments, tool_name, "instruction")
             timeout = _check_int(arguments, tool_name, "timeout_seconds", 1)
@@ -134,6 +140,12 @@ class _SubmitHandler:
                     max_tool_calls=max_tool_calls if max_tool_calls else None,
                 )
 
+            # TOOL-02：从执行上下文提取父 Agent 已授予的能力，传递给子任务
+            parent_caps: frozenset = frozenset()
+            if context is not None:
+                if hasattr(context, "granted_capabilities"):
+                    parent_caps = getattr(context, "granted_capabilities") or frozenset()
+
             task = self._manager.submit(
                 instruction=instruction,
                 parent_run_id=self._parent_run_id,
@@ -142,6 +154,7 @@ class _SubmitHandler:
                 timeout_seconds=timeout if timeout else None,
                 budget=budget,
                 context_policy=policy,
+                parent_granted_capabilities=parent_caps,
             )
 
             return _ok(

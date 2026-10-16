@@ -100,6 +100,8 @@ class SubagentRunner:
     context_assembler: ContextAssembler | None = None
     # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
     tool_policy_registry: "ToolPolicyRegistry | None" = None
+    # TOOL-02：子任务从父 Agent 继承的已授予能力
+    parent_granted_capabilities: frozenset = field(default_factory=frozenset)
 
     def run(self) -> SubagentResult:
         """执行子任务并返回结果。"""
@@ -148,6 +150,8 @@ class SubagentRunner:
                 run_id=self.run_id,
                 # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
                 tool_policy_registry=self.tool_policy_registry,
+                # TOOL-02：子任务从父 Agent 继承的已授予能力
+                parent_granted_capabilities=self.parent_granted_capabilities,
             )
 
             # 检查取消（在开始前）
@@ -280,6 +284,8 @@ class _BudgetAwareAgent:
         run_id: str = "",
         # TOOL-02：子代理策略注册表（与父共享），principal = MINI_SUBAGENT
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
+        # TOOL-02：子任务从父 Agent 继承的已授予能力
+        parent_granted_capabilities: frozenset = field(default_factory=frozenset),
     ) -> None:
         self._model = model
         self._registry = registry
@@ -301,6 +307,10 @@ class _BudgetAwareAgent:
         self._last_assembled: "object | None" = None
         # TOOL-02：子代理与父共享策略注册表
         self._tool_policy_registry = tool_policy_registry
+        # TOOL-02：子任务从父 Agent 继承的已授予能力（由 subagent_submit handler 设置）
+        self._parent_granted_capabilities: frozenset = parent_granted_capabilities
+        # TOOL-02：子任务从父 Agent 继承的已授予能力（由 subagent_submit handler 设置）
+        self._parent_granted_capabilities: frozenset = frozenset()
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
@@ -393,7 +403,7 @@ class _BudgetAwareAgent:
                         thread_id=thread_id,
                         run_id=self._run_id,
                         project_id=None,
-                        granted_capabilities=frozenset(),  # 子代理由父授权决定
+                        granted_capabilities=self._parent_granted_capabilities,  # 子代理由父授权决定
                         principal=ExecutorPrincipal.MINI_SUBAGENT,
                     )
                     auth_decision = check_tool_access(
@@ -403,7 +413,16 @@ class _BudgetAwareAgent:
                         from mini_deerflow.tool_authorization import ToolAuthorizationError
                         raise ToolAuthorizationError(auth_decision)
 
-                result = self._registry.execute(decision.name, decision.arguments)
+                # TOOL-02：构造执行上下文，包含父授权能力（供 subagent_submit handler 提取并传递）
+                from mini_deerflow.middleware import ExecutionContext
+                tool_ctx = ExecutionContext(
+                    thread_id=thread_id,
+                    run_id=self._run_id,
+                    granted_capabilities=self._parent_granted_capabilities,
+                    cancellation_token=self._token,
+                    budget=self._budget,
+                )
+                result = self._registry.execute(decision.name, decision.arguments, context=tool_ctx)
                 # 与主 Agent 一致：工具往返只留在 working_messages（本轮喂模型），
                 # **不写入 pending**——Thread 只提交 user 与最终 assistant，
                 # 避免落库一条没有配对 tool_use 的孤儿 tool_result。
@@ -487,6 +506,8 @@ class SubagentManager:
         model: Model | None = None,
         registry: ToolRegistry | None = None,
         context_policy: SubagentContextPolicy | None = None,
+        # TOOL-02：父 Agent 已授予子任务的能力集合
+        parent_granted_capabilities: frozenset = field(default_factory=frozenset),
     ) -> SubagentTask:
         """提交一个子任务。
 
@@ -531,6 +552,8 @@ class SubagentManager:
             depth=depth,
             timeout_seconds=timeout_seconds or self._default_timeout,
             context_policy=context_policy,
+            # TOOL-02：父 Agent 已授予子任务的能力集合
+            parent_granted_capabilities=parent_granted_capabilities,
         )
 
         token = CancellationToken()
@@ -592,6 +615,10 @@ class SubagentManager:
                 cancellation_token=token,
                 parent_run_id=task.parent_run_id,
                 context_assembler=self._context_assembler,
+                # TOOL-02：子代理与父共享策略注册表
+                tool_policy_registry=self._tool_policy_registry,
+                # TOOL-02：子任务从父 Agent 继承的已授予能力
+                parent_granted_capabilities=task.parent_granted_capabilities,
             )
 
             result = runner.run()

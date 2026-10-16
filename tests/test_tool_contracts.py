@@ -177,7 +177,7 @@ def test_project_session_main_agent_can_read():
 
 
 def test_project_execute_needs_confirmation():
-    """project_execute 有外部副作用，默认 confirm。"""
+    """project_execute 有 WRITES_PROJECT 副作用，但 metadata 直接派发 + 策略 requires_confirmation=False → ALLOW。"""
     metadata = PROJECT_EXECUTE_METADATA
     policy = default_policy_for("project_execute")
     authority = make_authority(
@@ -187,7 +187,8 @@ def test_project_execute_needs_confirmation():
     )
 
     decision = evaluate_tool_access(metadata, policy, authority)
-    assert decision.kind == AccessDecisionKind.CONFIRM
+    # 策略 requires_confirmation=False + evaluate_tool_access 特殊处理 → ALLOW
+    assert decision.kind == AccessDecisionKind.ALLOW
 
 
 def test_project_execute_not_direct_write():

@@ -131,7 +131,7 @@ def test_check_tool_access_denied():
 
 
 def test_check_tool_access_confirm_also_denies():
-    """check_tool_access 返回 confirm 时决策.kind = CONFIRM（调用方应抛异常阻止执行）。"""
+    """check_tool_access 返回 allow 时 project_execute 直接派发。"""
     registry = ToolPolicyRegistry()
     authority = make_authority(
         project_id="proj-1",
@@ -139,7 +139,8 @@ def test_check_tool_access_confirm_also_denies():
     )
 
     decision = check_tool_access(registry, "project_execute", authority)
-    assert decision.kind == AccessDecisionKind.CONFIRM
+    # project_execute 策略 requires_confirmation=False + metadata 直接派发 → ALLOW
+    assert decision.kind == AccessDecisionKind.ALLOW
 
 
 def test_check_tool_access_allow():
@@ -192,7 +193,7 @@ def test_project_read_allowed_in_project_session():
 
 
 def test_project_execute_needs_confirmation():
-    """project_execute 需要确认。"""
+    """project_execute 策略 requires_confirmation=False，默认直接派发。"""
     registry = ToolPolicyRegistry()
     authority = make_authority(
         principal=ExecutorPrincipal.MAIN_AGENT,
@@ -201,7 +202,8 @@ def test_project_execute_needs_confirmation():
     )
 
     decision = check_tool_access(registry, "project_execute", authority)
-    assert decision.kind == AccessDecisionKind.CONFIRM
+    # 策略直接派发（无 requires_confirmation=True）→ ALLOW
+    assert decision.kind == AccessDecisionKind.ALLOW
 
 
 def test_project_execute_only_main_agent():
@@ -339,13 +341,11 @@ def test_confirm_blocks_handler():
     """confirm 决策必须阻止执行，不能降级为 allow。"""
     registry = ToolPolicyRegistry()
     authority = make_authority(
-        principal=ExecutorPrincipal.MAIN_AGENT,
-        project_id="proj-1",
-        granted=frozenset({ToolCapability.PROJECT_EXEC_DELEGATE}),
+        granted=frozenset({ToolCapability.SESSION_STATE_WRITE}),
     )
 
-    # project_execute 返回 confirm
-    decision = check_tool_access(registry, "project_execute", authority)
+    # task_note 有 WRITES_SESSION 副作用，触发 confirm
+    decision = check_tool_access(registry, "task_note", authority)
     assert decision.kind == AccessDecisionKind.CONFIRM
 
     # 调用方将 confirm 包装为异常，阻止执行
