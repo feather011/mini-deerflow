@@ -102,6 +102,8 @@ class SubagentRunner:
     tool_policy_registry: "ToolPolicyRegistry | None" = None
     # TOOL-02：子任务从父 Agent 继承的已授予能力
     parent_granted_capabilities: frozenset = field(default_factory=frozenset)
+    # TOOL-02：子任务继承父 Agent 的 project_id
+    parent_project_id: str | None = None
 
     def run(self) -> SubagentResult:
         """执行子任务并返回结果。"""
@@ -152,6 +154,8 @@ class SubagentRunner:
                 tool_policy_registry=self.tool_policy_registry,
                 # TOOL-02：子任务从父 Agent 继承的已授予能力
                 parent_granted_capabilities=self.parent_granted_capabilities,
+                # TOOL-02：子任务继承父 Agent 的 project_id
+                parent_project_id=self.parent_project_id,
             )
 
             # 检查取消（在开始前）
@@ -285,7 +289,9 @@ class _BudgetAwareAgent:
         # TOOL-02：子代理策略注册表（与父共享），principal = MINI_SUBAGENT
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
         # TOOL-02：子任务从父 Agent 继承的已授予能力
-        parent_granted_capabilities: frozenset = field(default_factory=frozenset),
+        parent_granted_capabilities: frozenset = frozenset(),
+        # TOOL-02：子任务继承父 Agent 的 project_id（项目会话上下文）
+        parent_project_id: str | None = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -309,6 +315,8 @@ class _BudgetAwareAgent:
         self._tool_policy_registry = tool_policy_registry
         # TOOL-02：子任务从父 Agent 继承的已授予能力（由 subagent_submit handler 设置）
         self._parent_granted_capabilities: frozenset = parent_granted_capabilities
+        # TOOL-02：子任务继承父 Agent 的 project_id
+        self._parent_project_id: str | None = parent_project_id
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
@@ -334,6 +342,24 @@ class _BudgetAwareAgent:
         # 本地工具、mcp__* 工具、子代理工具一视同仁——这里按名字过滤，
         # 不区分来源，因此三类工具同时受限。
         model_tools = filter_tool_specs(self._registry.tool_specs(), self._allowed)
+
+        # TOOL-02 第二层（R2b）：策略可见性过滤——DENY 工具隐藏，ALLOW/CONFIRM 可见
+        if self._tool_policy_registry is not None:
+            from mini_deerflow.tool_authorization import check_tool_access
+            authority = self._tool_policy_registry.get_authority(
+                thread_id=thread_id,
+                run_id=self._run_id,
+                project_id=self._parent_project_id,
+                granted_capabilities=self._parent_granted_capabilities,
+                principal=ExecutorPrincipal.MINI_SUBAGENT,
+            )
+            visible_names: set[str] = set()
+            for spec in model_tools:
+                decision = check_tool_access(self._tool_policy_registry, spec.name, authority)
+                if decision.is_denied:
+                    continue
+                visible_names.add(spec.name)
+            model_tools = [s for s in model_tools if s.name in visible_names]
 
         for step in range(1, self._max_steps + 1):
             # 取消检查
@@ -400,7 +426,7 @@ class _BudgetAwareAgent:
                     authority = self._tool_policy_registry.get_authority(
                         thread_id=thread_id,
                         run_id=self._run_id,
-                        project_id=None,
+                        project_id=self._parent_project_id,
                         granted_capabilities=self._parent_granted_capabilities,  # 子代理由父授权决定
                         principal=ExecutorPrincipal.MINI_SUBAGENT,
                     )
@@ -506,6 +532,8 @@ class SubagentManager:
         context_policy: SubagentContextPolicy | None = None,
         # TOOL-02：父 Agent 已授予子任务的能力集合
         parent_granted_capabilities: frozenset = frozenset(),
+        # TOOL-02：父 Agent 的 project_id（继承项目会话上下文）
+        parent_project_id: str | None = None,
     ) -> SubagentTask:
         """提交一个子任务。
 
@@ -552,6 +580,8 @@ class SubagentManager:
             context_policy=context_policy,
             # TOOL-02：父 Agent 已授予子任务的能力集合
             parent_granted_capabilities=parent_granted_capabilities,
+            # TOOL-02：父 Agent 的 project_id
+            parent_project_id=parent_project_id,
         )
 
         token = CancellationToken()
@@ -617,6 +647,8 @@ class SubagentManager:
                 tool_policy_registry=self._tool_policy_registry,
                 # TOOL-02：子任务从父 Agent 继承的已授予能力
                 parent_granted_capabilities=task.parent_granted_capabilities,
+                # TOOL-02：子任务继承父 Agent 的 project_id
+                parent_project_id=task.parent_project_id,
             )
 
             result = runner.run()

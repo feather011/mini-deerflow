@@ -146,6 +146,14 @@ class _SubmitHandler:
                 if hasattr(context, "granted_capabilities"):
                     parent_caps = getattr(context, "granted_capabilities") or frozenset()
 
+            # TOOL-02（R2a）：从父线程获取 project_id，继承项目会话上下文
+            parent_project_id: str | None = None
+            try:
+                parent_thread = self._manager._store.get(self._parent_thread_id)
+                parent_project_id = getattr(parent_thread, "project_id", None) or None
+            except Exception:
+                pass  # 非项目会话时 project_id 为 None
+
             task = self._manager.submit(
                 instruction=instruction,
                 parent_run_id=self._parent_run_id,
@@ -155,6 +163,7 @@ class _SubmitHandler:
                 budget=budget,
                 context_policy=policy,
                 parent_granted_capabilities=parent_caps,
+                parent_project_id=parent_project_id,
             )
 
             return _ok(

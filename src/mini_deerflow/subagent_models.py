@@ -100,6 +100,8 @@ class SubagentTask:
     context_policy: SubagentContextPolicy | None = None
     # TOOL-02：父 Agent 已授予子任务的能力集合
     parent_granted_capabilities: frozenset[Any] = field(default_factory=frozenset)
+    # TOOL-02：父 Agent 的 project_id（继承项目会话上下文）
+    parent_project_id: str | None = None
     # 元数据（不可变字典）
     metadata: dict[str, Any] = field(default_factory=dict)
 
