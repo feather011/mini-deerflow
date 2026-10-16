@@ -657,12 +657,15 @@ def create_runtime(
             context_assembler=context_assembler,
             # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
             tool_policy_registry=tool_policy_registry,
+            # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问和 project_id 反查）
+            thread_store=store,
         )
         # 注册子任务工具
         tools = create_subagent_tools(
             manager=manager,
             parent_run_id=run_id,
             parent_thread_id="default",
+            thread_store=store,
         )
         registry.register_many(tools)
 

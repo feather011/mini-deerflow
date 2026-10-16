@@ -48,6 +48,8 @@ class ExecutionContext:
     # 值为一个累积 token 文本的列表引用；model.stream_decide() 每 yield 一个 token
     # 就 append 进去。RunEventMiddleware.success() 读取此字段，逐 token 发布 model.token 事件。
     token_accumulator: "list[str] | None" = None
+    # TOOL-02：工具授权检查通过后的已授予能力集合，供 handler（如 subagent_submit）读取并传递给子任务
+    granted_capabilities: frozenset = field(default_factory=frozenset)
 
     def is_cancelled(self) -> bool:
         return self.cancellation_token.is_cancelled() if self.cancellation_token else False

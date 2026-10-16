@@ -143,12 +143,12 @@ class ToolMetadata:
         """是否有外部副作用（默认需要本次确认）。"""
         if self.uncategorized:
             return True
-        # READS_SESSION / READS_PROJECT / RUNS_COMMAND（受控委派路径）不算危险副作用
+        # 会话内部读写不算危险副作用；RUNS_COMMAND 由 evaluate_tool_access 中 project_execute 例外覆盖
         return bool(self.side_effects - {
             ToolSideEffect.NONE,
             ToolSideEffect.READS_SESSION,
+            ToolSideEffect.WRITES_SESSION,
             ToolSideEffect.READS_PROJECT,
-            ToolSideEffect.RUNS_COMMAND,
         })
 
 
@@ -424,7 +424,12 @@ def evaluate_tool_access(
         )
 
     # 6. 已授权但需要确认（策略覆盖 > 元数据默认值）
-    if policy.requires_confirmation or metadata.requires_confirmation():
+    # project_execute 有受控 harness 执行路径，默认直接派发
+    needs_confirm = (policy.requires_confirmation
+                     or metadata.requires_confirmation())
+    if metadata.name == "project_execute" and not policy.requires_confirmation:
+        needs_confirm = False
+    if needs_confirm:
         return ToolAccessDecision.confirm(
             f"工具 {metadata.name} 有外部副作用，需要本次确认",
         )
@@ -526,7 +531,7 @@ PROJECT_GREP_METADATA = ToolMetadata(
     side_effects=frozenset({ToolSideEffect.READS_PROJECT}),
 )
 
-# project_execute（受控委派，有确认机制）
+# project_execute（受控委派，RUNS_COMMAND 覆盖执行语义）
 PROJECT_EXECUTE_METADATA = ToolMetadata(
     name="project_execute",
     source=ToolSourceKind.LOCAL,
