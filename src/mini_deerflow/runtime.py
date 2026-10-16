@@ -71,6 +71,7 @@ from mini_deerflow.project_store import (
     SQLiteProjectStore,
 )
 from mini_deerflow.tools import ToolRegistry
+from mini_deerflow.tool_authorization import ToolPolicyRegistry
 
 # 项目锁：所有 RuntimeContext 实例共用同一进程级字典
 _PROJECT_LOCKS: dict[str, Lock] = {}
@@ -722,6 +723,9 @@ def create_runtime(
         # start() 内部已自行清理事件循环桥与子进程，不留半开状态。
         mcp_manager.start(registry)
 
+    # TOOL-02：创建策略注册表并注入 Agent
+    tool_policy_registry = ToolPolicyRegistry(thread_store=store)
+
     agent = Agent(
         # 显式传入的 model 优先（测试注入 FakeModel 等）；
         # 否则走统一 Model Factory，由 config.model_settings 决定 provider。
@@ -733,6 +737,7 @@ def create_runtime(
         budget=budget,
         context_assembler=context_assembler,
         model_timeout_seconds=config.model_timeout_seconds,
+        tool_policy_registry=tool_policy_registry,
     )
 
     integrated_agent = IntegratedAgent(

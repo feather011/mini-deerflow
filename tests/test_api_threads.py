@@ -72,7 +72,7 @@ def test_post_threads_returns_201_with_empty_thread() -> None:
         response = client.post("/api/threads", json={})
     assert response.status_code == 201
     body = response.json()
-    assert set(body) == {"thread_id", "messages", "project_id"}
+    assert set(body) == {"thread_id", "messages", "project_id", "last_run_result"}
     assert body["messages"] == []
 
 

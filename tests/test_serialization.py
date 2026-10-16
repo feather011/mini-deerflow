@@ -65,7 +65,7 @@ class TestThreadStateSerialization(unittest.TestCase):
 
     def test_to_dict_shape(self):
         d = self._make_thread().to_dict()
-        self.assertEqual(d["schema_version"], 1)
+        self.assertEqual(d["schema_version"], 2)
         self.assertEqual(d["thread_id"], "default")
         self.assertIsInstance(d["messages"], list)
         self.assertEqual(len(d["messages"]), 3)
@@ -157,8 +157,8 @@ class TestThreadStateSerialization(unittest.TestCase):
 class TestSchemaVersionConstant(unittest.TestCase):
     """SCHEMA_VERSION 常量。"""
 
-    def test_schema_version_is_one(self):
-        self.assertEqual(SCHEMA_VERSION, 1)
+    def test_schema_version_is_two(self):
+        self.assertEqual(SCHEMA_VERSION, 2)
 
 
 if __name__ == "__main__":

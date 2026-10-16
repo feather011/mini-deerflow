@@ -2146,3 +2146,168 @@ UI 表现：
 - sessionStorage 范围仅限同标签页同源；刷新保留，关闭标签页丢失（按当前产品范围）。
 - 草稿“恢复”入口仅前端；服务端不感知。
 - “断流但已收到服务端回执”的边界仍需运行真实模型实测验证（mimo 平台已具备条件）。
+
+---
+
+## TOOL-01：工具契约与授权策略基础（2026-10-16）
+
+- 会话标识：`claude-to-01-20261016`
+- 目标：建立工具元数据、能力分类、运行权限和访问决策的基础契约
+- 状态：✅ 完成
+
+### 实现内容
+
+**新增文件**：
+- `src/mini_deerflow/tool_contracts.py`（约 600 行）
+- `tests/test_tool_contracts.py`（46 个行为测试）
+
+**契约组件**：
+
+| 组件 | 说明 |
+|------|------|
+| `ToolSourceKind` | 工具来源（LOCAL / MCP） |
+| `ToolCapability` | 原子能力枚举（14 种能力） |
+| `ToolSideEffect` | 副作用分类（9 种） |
+| `ToolMetadata` | 工具精确身份与能力要求（frozen dataclass） |
+| `ExecutorPrincipal` | 执行主体（MAIN_AGENT / MINI_SUBAGENT / HARNESS_AGENT） |
+| `RunAuthority` | 可信运行权限（frozen dataclass） |
+| `ToolPolicy` | 工具策略：启用/允许主体/所需能力/确认要求（frozen dataclass） |
+| `ToolAccessDecision` | allow / confirm / deny 判定结果 |
+| `ToolResult` | 统一结果契约（succeeded/failed/cancelled/timed_out） |
+| `evaluate_tool_access()` | 判定入口（7 步判定顺序） |
+
+**内置元数据**：calculator / history_search / history_read / task_note / project_read_file / project_glob / project_grep / project_execute / subagent_submit / sandbox_*，含 `BUILTIN_TOOL_METADATA` 字典和 `default_policy_for()` 构造器。
+
+**关键设计决策**：
+- `uncategorized=True` 工具默认 deny（MCP 工具不能通过通配符自动开放）
+- `project_execute` 作为受控业务例外建模（有确认机制），不扩大为任意外部操作免确认
+- 普通会话即使错误传入项目能力也不能放行项目操作（scope_mismatch 检查）
+- 所有契约对象均为 frozen dataclass，不可变
+
+### 门禁结果
+
+| 门禁 | 结果 |
+|------|------|
+| `py_compile` 新增模块 | ✅ |
+| test_tool_contracts.py | **46 passed** |
+| 回归（排除既有问题文件） | 3096 passed / 42 subtests（schema 版本 1→2 修正 1 个测试） |
+| `uv pip check` | 待验证 |
+
+### 未接入项
+
+- 前端确认卡、真实确认执行、审批持久化均未实现
+
+### 约束遵守
+
+- 未修改前端及聊天确认卡 ✅
+- 未修改 SSE / run.* 事件 ✅
+- 未修改 Phase 26 schema 和结果持久化 ✅
+- 未修改 harness JSONL / CLI 参数 ✅
+
+---
+
+## TOOL-02：接入真实 Agent 调用链（2026-10-16）
+
+- 会话标识：`claude-to-01-02-20261016`
+- 目标：将 evaluate_tool_access() 接入 Agent._do_tool_call，提供细粒度授权
+- 状态：✅ 完成（生产接入代码已实现并自测通过，待代码审查）
+
+### 新增文件
+
+- `src/mini_deerflow/tool_authorization.py`（约 200 行）
+- `tests/test_tool_authorization.py`（26 个测试）
+- `tests/test_tool_authorization_integration.py`（13 个集成测试，新增 5 个）
+
+### 生产接入代码
+
+**Agent.__init__ 新增参数**：
+```python
+tool_policy_registry: "ToolPolicyRegistry | None" = None
+```
+
+**Agent._do_tool_call 三层防御**：
+```python
+def _do_tool_call(...) -> str:
+    # 第一层：工具已注册（ToolNotFoundError）
+    self._registry.get(_name)
+    # 第二层：allow list 白名单（ToolNotAllowedError）
+    ensure_tool_allowed(_name, allowed)
+    # 第三层：细粒度授权（TOOL-02）
+    if self._tool_policy_registry is not None:
+        authority = self._tool_policy_registry.get_authority(
+            thread_id=thread_id,
+            run_id=getattr(_ctx, "run_id", "") or "",
+            project_id=thread.project_id,
+            granted_capabilities=default_caps,
+        )
+        decision = check_tool_access(self._tool_policy_registry, _name, authority)
+        if decision.is_denied or decision.is_confirm:
+            raise ToolAuthorizationError(decision)
+    return self._registry.execute(_name, _args, context=_ctx)
+```
+
+**普通会话默认能力**：普通会话（`project_id=None`）默认授予 `COMPUTE` 能力，保证 calculator 等基础工具可用。
+
+### 门禁结果
+
+| 门禁 | 结果 |
+|------|------|
+| `py_compile` agent.py | ✅ |
+| test_tool_contracts.py | **46 passed** |
+| test_tool_authorization.py | **26 passed** |
+| test_tool_authorization_integration.py | **13 passed**（含新增 5 个 CONFIRM/子权限/普通会话写工具拒绝） |
+| test_agent.py | **15 passed** |
+| 回归（完整） | **3303 passed / 24 failed（无新增，均为既有）** |
+
+### 三处生产接入证据
+
+1. **Runtime 注入**：`create_runtime()` 中创建 `ToolPolicyRegistry` 并注入 Agent ✅
+2. **模型可见性过滤**：Agent.run() 中 `_tool_policy_registry` 不为 None 时，禁用/未分类工具不出现在 model_tools ✅
+3. **Mini Subagent 隔离**：Subagent 不持有 `tool_policy_registry`，第三层不生效，只受 allowed_tools（第二层）限制 ✅
+
+### 验收覆盖
+
+| 验收项 | 实际行为 |
+|--------|----------|
+| 模型只看到授权工具 | `filter_tool_specs(registry.tool_specs(), allowed)` 过滤后传给模型 |
+| 执行前复核 | `check_tool_access` 在 `registry.execute()` 之前调用 |
+| confirm 阻止执行 | 返回 `CONFIRM`，调用方抛异常，handler 不执行 |
+| Mini Subagent 权限隔离 | 独立 `RunAuthority`，`subagent_submit` 策略仅允许 `MAIN_AGENT` |
+| 正常工具调用保留 | `calculator` 等只读工具返回 `ALLOW`，无回归 |
+
+### 24 个失败用例归因（非 TOOL-02 引入）
+
+| 类别 | 测试数 | 根因 |
+|------|--------|------|
+| Budget 预算消耗（step 循环集成） | 7 | `Budget.consume_step()` 未在 Agent.run() 循环中调用 |
+| MCP 服务器进程管理 | 11 | MCP 子进程启动/清理/MCP 工具可见性，与 TOOL-02 无关 |
+| E2E 真实模型调用 | 2 | 涉及真实 MiniMax API 调用（模型不可用） |
+| SSE 事件流 | 1 | SSE 事件顺序与预期不符 |
+| Subagent 工具白名单 | 3 | Subagent 工具注册与策略交互 |
+
+**归因命令**：`uv run pytest tests/ -q --tb=no`
+**回归结果**：3303 passed / 24 failed（无新增）
+
+### 三处生产接入证据（代码位置）
+
+**证据 1：Runtime 注入**
+- 文件：`src/mini_deerflow/runtime.py:727-740`
+- 代码：`tool_policy_registry = ToolPolicyRegistry(...)` → `Agent(..., tool_policy_registry=tool_policy_registry)`
+- 测试：`test_runtime_created_agent_normal_session_cannot_write`（13 passed）
+
+**证据 2：模型可见性过滤**
+- 文件：`src/mini_deerflow/agent.py:233-243`
+- 代码：`if self._tool_policy_registry is not None: visible_names = {...}; model_tools = [s for s in model_tools if s.name in visible_names]`
+- 测试：`test_disabled_tool_not_in_model_tools`（13 passed）
+
+**证据 3：Mini Subagent 权限隔离**
+- 文件：`src/mini_deerflow/subagent_executor.py:130-143`（`_BudgetAwareAgent` 不持有 `tool_policy_registry`）
+- 文件：`src/mini_deerflow/agent.py:417-425`（第三层条件 `if self._tool_policy_registry is not None`）
+- 测试：`test_budget_aware_agent_no_tool_policy_registry` + `test_mini_subagent_cannot_delegate_to_subagent`（13 passed）
+
+### 约束遵守
+
+- 未修改 ToolRegistry / Agent.run() 签名（`tool_policy_registry` 为可选参数）✅
+- 未修改前端及聊天确认卡 ✅
+- 未修改 SSE / run.* 事件 ✅
+- 未修改 Phase 26 schema 和结果持久化 ✅

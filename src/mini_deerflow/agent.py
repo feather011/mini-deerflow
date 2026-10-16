@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, Iterator, TypeVar
+from typing import TYPE_CHECKING, Callable, Iterator, TypeVar
 
 from mini_deerflow.context_assembler import AssembledContext, ContextAssembler
 from mini_deerflow.memory_manager import MemoryProcessor
@@ -26,6 +26,13 @@ from mini_deerflow.tools import (
     filter_tool_specs,
     ensure_tool_allowed,
 )
+
+from mini_deerflow.tool_authorization import (
+    ToolPolicyRegistry,
+    check_tool_access,
+    ToolAuthorizationError,
+)
+from mini_deerflow.tool_contracts import ToolCapability
 
 T = TypeVar("T")
 
@@ -120,6 +127,7 @@ class Agent:
         budget: Budget | None = None,
         context_assembler: ContextAssembler | None = None,
         model_timeout_seconds: float = 0.0,
+        tool_policy_registry: "ToolPolicyRegistry | None" = None,
     ):
         self._model = model
         self._registry = registry
@@ -130,11 +138,11 @@ class Agent:
         self._skill_context_provider = skill_context_provider
         self._middleware_pipeline = middleware_pipeline
         self._budget = budget
-        # 24：可选。None = 走原有拼装逻辑，短会话行为与 Phase 23 完全一致。
         self._context_assembler = context_assembler
         self._last_assembled: "AssembledContext | None" = None
-        # 真实调用超时：> 0 时在每次模型调用上生效，超时后抛 BudgetExceededError
         self._model_timeout_seconds = model_timeout_seconds
+        # TOOL-02：可选细粒度授权策略注册表。None 时回退到 ensure_tool_allowed 白名单检查。
+        self._tool_policy_registry = tool_policy_registry
 
     @property
     def last_assembled(self) -> "AssembledContext | None":
@@ -220,6 +228,20 @@ class Agent:
         # Tool 带 handler（可执行对象），交给模型适配层等于把可执行能力泄漏到传输层。
         # 25：按会话权限过滤（暴露限制）。
         model_tools = filter_tool_specs(self._registry.tool_specs(), allowed)
+
+        # TOOL-02：策略可见性过滤——禁用/未分类工具不发给模型
+        if self._tool_policy_registry is not None:
+            visible_names: set[str] = set()
+            for spec in model_tools:
+                metadata, policy = self._tool_policy_registry.get(spec.name)
+                # 未知工具或未分类：不在可见列表
+                if metadata is None or metadata.uncategorized:
+                    continue
+                # 策略禁用：不在可见列表
+                if policy is not None and not policy.enabled:
+                    continue
+                visible_names.add(spec.name)
+            model_tools = [s for s in model_tools if s.name in visible_names]
 
         trace: list[dict] = []
 
@@ -385,11 +407,28 @@ class Agent:
                     _args=decision.arguments,
                     _ctx=tool_ctx,
                 ) -> str:
-                    # 25：两层纵深防御
+                    # 25：三层纵深防御
                     # 第一层：确保工具已注册（未知名 → ToolNotFoundError）
                     self._registry.get(_name)  # KeyError → ToolNotFoundError
                     # 第二层：确保工具在允许清单内（已注册但越权 → ToolNotAllowedError）
                     ensure_tool_allowed(_name, allowed)
+                    # TOOL-02 第三层：细粒度授权策略（能力/主体/确认）
+                    # 仅当注册了 policy_registry 时启用；None 时回退到前两层
+                    if self._tool_policy_registry is not None:
+                        # 普通会话默认具备基础能力（calculator 等）
+                        if thread.project_id is None:
+                            default_caps = frozenset({ToolCapability.COMPUTE})
+                        else:
+                            default_caps = frozenset()
+                        authority = self._tool_policy_registry.get_authority(
+                            thread_id=thread_id,
+                            run_id=getattr(_ctx, "run_id", "") or "",
+                            project_id=thread.project_id,
+                            granted_capabilities=default_caps,
+                        )
+                        decision = check_tool_access(self._tool_policy_registry, _name, authority)
+                        if decision.is_denied or decision.is_confirm:
+                            raise ToolAuthorizationError(decision)
                     # 真正发起调用前原子消费额度（成功/失败都计）
                     if self._budget is not None:
                         self._budget.consume_tool_call()
