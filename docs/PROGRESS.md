@@ -2402,3 +2402,37 @@ def _do_tool_call(...) -> str:
 | test_sandbox_write_uncategorized_deny | sandbox_write_file DENY，handler 不执行 | PASS |
 
 **完整定向**：170 passed in 16.38s
+
+### TOOL-02 V1 真实入口测试修复（2026-10-17）
+
+推送 SHA：`49dfd91`（用户授权额外一次收尾）
+
+**问题**：V1 审查要求真实 submit/Agent/Runner 链路测试，但原 10 个测试部分依赖 check_tool_access/evaluate_tool_access（策略函数调用），而非真实 Agent.run 路径。
+
+**修复内容**：
+- 重写 `tests/test_tool_e2e_behavior.py`（443 行，9 个测试）
+- 可见性测试改用 `Agent.run` + tool_specs 捕获（真实路径）
+- submit 测试改用 `ExecutionContext` + `tool.execute`（真实 handler）
+- 验证 `Task.parent_run_id`/`parent_thread_id` 从 `ExecutionContext` 继承
+- 所有测试通过真实 handler 链路，而非策略函数
+
+| 测试 | 验证内容 | 结果 |
+|------|---------|------|
+| test_tool_visibility_denied_hidden | DENY 工具不在 tool_specs 中 | PASS |
+| test_tool_visibility_confirm_visible | CONFIRM 工具仍发给模型 | PASS |
+| test_handler_inherits_run_id_from_context | parent_run_id 从 context.run_id 继承 | PASS |
+| test_handler_inherits_thread_id_from_context | parent_thread_id 从 context.thread_id 继承 | PASS |
+| test_two_runs_submit_independently_via_tool | 不同 run_id 独立提交 | PASS |
+| test_same_run_via_tool_respects_limit | 同 run_id 达上限抛异常 | PASS |
+| test_project_read_file_direct_execute_ok | 直接 Tool.execute 返回文件内容 | PASS |
+| test_project_read_file_nonexistent_fails | 不存在文件返回错误 | PASS |
+| test_explicit_confirm_blocks_handler | CONFIRM 触发 handler 不执行 | PASS |
+
+**测试结果**：
+```
+tests/test_tool_e2e_behavior.py: 9 passed in 0.11s
+TOOL-02 + Subagent 定向（8 文件）：169 passed in 16.05s
+```
+
+**改动文件**：
+- `tests/test_tool_e2e_behavior.py`（重写）
