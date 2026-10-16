@@ -17,27 +17,21 @@ from mini_deerflow.models import FinalAnswer, Message, ToolCall
 from mini_deerflow.project_store import InMemoryProjectStore
 from mini_deerflow.project_tools import create_project_read_tools
 from mini_deerflow.subagent_executor import (
-    CancellationToken,
     SubagentBudget,
     SubagentManager,
-    SubagentRunner,
 )
 from mini_deerflow.subagent_tools import create_subagent_tools
 from mini_deerflow.thread_store import InMemoryThreadStore
 from mini_deerflow.tools import Tool, ToolRegistry
 from mini_deerflow.tool_authorization import (
     ExecutorPrincipal,
-    RunAuthority,
     ToolAuthorizationError,
     ToolPolicy,
     ToolPolicyRegistry,
-    check_tool_access,
-    evaluate_tool_access,
 )
 from mini_deerflow.tool_contracts import (
     AccessDecisionKind,
     ToolCapability,
-    BUILTIN_TOOL_METADATA,
 )
 
 
@@ -47,16 +41,27 @@ from mini_deerflow.tool_contracts import (
 
 
 class ScriptedModel:
-    """按预设序列返回决策。"""
+    """按预设序列返回决策；自动将工具结果注入 FinalAnswer。"""
     def __init__(self, decisions):
         self._queue = deque(decisions)
         self.received = []
+        self._last_tool_result = ""
 
     def decide(self, messages, tools=None):
         self.received.append(list(messages))
+        # 提取最后一条 tool result
+        for m in reversed(messages):
+            if isinstance(m, Message) and m.role == "tool" and m.content:
+                self._last_tool_result = m.content
+                break
         if not self._queue:
-            return FinalAnswer(content="done")
-        return self._queue.popleft()
+            return FinalAnswer(content=self._last_tool_result or "done")
+        result = self._queue.popleft()
+        # 如果下一个是 FinalAnswer 且包含占位符，注入 tool result
+        if isinstance(result, FinalAnswer) and "TOOL_RESULT:" in result.content:
+            result = FinalAnswer(content=result.content.replace(
+                "TOOL_RESULT:", self._last_tool_result))
+        return result
 
 
 # ============================================================================
@@ -166,7 +171,7 @@ class TestToolVisibilityViaAgent(unittest.TestCase):
 
 
 # ============================================================================
-# V1-project：真实子任务读取项目文件（submit→Manager→Runner→collect）
+# V1-project：真实子任务读取项目文件（submit→Manager→collect）
 # ============================================================================
 
 
@@ -193,11 +198,24 @@ class TestSubagentProjectRead(unittest.TestCase):
         parent_thread.project_id = "proj-subagent-test"
         self.thread_store.save(parent_thread)
 
+        # 创建工具注册表（含 project_read_file）
+        self.tool_reg = ToolRegistry()
+        read_tools = create_project_read_tools(
+            self.thread_store, self.project_store
+        )
+        self.tool_reg.register_many(read_tools)
+
     def tearDown(self):
         self.temp_dir.cleanup()
 
     def test_subagent_reads_project_file_via_submit_collect(self):
-        """通过 submit→Manager→Runner→collect 读取项目文件。"""
+        """通过 submit→Manager自动运行→collect 读取项目文件。"""
+        # 脚本模型：调用 project_read_file，返回包含工具结果的 FinalAnswer
+        scripted_model = ScriptedModel([
+            ToolCall(name="project_read_file", arguments={"path": "test.txt"}),
+            FinalAnswer(content="TOOL_RESULT:"),  # 注入实际 tool result
+        ])
+
         manager = SubagentManager(
             max_concurrency=1,
             max_tasks_per_parent=10,
@@ -206,45 +224,20 @@ class TestSubagentProjectRead(unittest.TestCase):
             thread_store=self.thread_store,
         )
 
-        # 创建工具注册表（含 project_read_file）
-        tool_reg = ToolRegistry()
-        read_tools = create_project_read_tools(
-            self.thread_store, self.project_store
-        )
-        tool_reg.register_many(read_tools)
-
-        # 脚本模型：先调用 project_read_file，再返回 FinalAnswer
-        scripted_model = ScriptedModel([
-            ToolCall(name="project_read_file", arguments={"path": "test.txt"}),
-            FinalAnswer(content="read complete"),
-        ])
-
-        # 创建 Runner
-        runner = SubagentRunner(
-            task=None,  # 稍后填充
-            model=scripted_model,
-            registry=tool_reg,
-            store=self.thread_store,
-            budget=SubagentBudget(max_steps=10),
-            cancellation_token=CancellationToken(),
-            tool_policy_registry=ToolPolicyRegistry(),
-            parent_granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
-            parent_project_id="proj-subagent-test",
-        )
-
-        # 提交任务
+        # 提交任务（Manager 自动在后台线程运行 Runner）
         task = manager.submit(
             instruction="读取项目文件 test.txt 并返回内容",
             parent_run_id="test-run",
             parent_thread_id="parent-t",
             depth=1,
+            model=scripted_model,
+            registry=self.tool_reg,
             parent_granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
             parent_project_id="proj-subagent-test",
         )
 
-        # 直接运行 Runner（绕过 Manager 队列）
-        runner.task = task
-        result = runner.run()
+        # 通过 Manager collect 回收结果（等待任务完成）
+        result = manager.collect(task.task_id, timeout=30)
 
         # 验证：任务成功
         self.assertTrue(result.succeeded,
@@ -254,13 +247,14 @@ class TestSubagentProjectRead(unittest.TestCase):
         self.assertIn("hello from project", result.output,
                      f"Output should contain file content. Got: {result.output}")
 
-        # 验证：模型确实收到了 tool_use 消息
-        tool_calls = [m for m in scripted_model.received
-                     if isinstance(m, Message) and m.role == "assistant"
-                     for tool_call in (m.tool_calls or [])]
-        read_calls = [tc for tc in tool_calls if tc.name == "project_read_file"]
-        self.assertGreater(len(read_calls), 0,
-                          f"Model should call project_read_file. Tool calls: {tool_calls}")
+        # 验证：模型确实调用了 project_read_file
+        tool_calls_made = []
+        for msgs in scripted_model.received:
+            for m in msgs:
+                if isinstance(m, Message) and m.tool_name:
+                    tool_calls_made.append(m.tool_name)
+        self.assertIn("project_read_file", tool_calls_made,
+                     f"Model should call project_read_file. Got: {tool_calls_made}")
 
 
 # ============================================================================
