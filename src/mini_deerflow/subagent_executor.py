@@ -481,6 +481,8 @@ class SubagentManager:
         shared_budget: SubagentBudget | None = None,
         context_assembler: ContextAssembler | None = None,
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
+        # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问和 project_id 反查）
+        thread_store: ThreadStore | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency 必须 >= 1")
@@ -502,6 +504,8 @@ class SubagentManager:
         self._context_assembler = context_assembler
         # TOOL-02：子代理持有与父相同的策略注册表，principal = MINI_SUBAGENT
         self._tool_policy_registry = tool_policy_registry
+        # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问）
+        self._store = thread_store
 
         self._lock = threading.Lock()
         self._tasks: dict[str, SubagentTask] = {}
@@ -638,7 +642,7 @@ class SubagentManager:
                 task=task_obj,
                 model=model or FakeModel(),
                 registry=registry or ToolRegistry(),
-                store=InMemoryThreadStore(),
+                store=self._store or InMemoryThreadStore(),
                 budget=effective_budget,
                 cancellation_token=token,
                 parent_run_id=task.parent_run_id,

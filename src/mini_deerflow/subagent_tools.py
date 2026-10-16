@@ -84,7 +84,7 @@ def _check_int(args: dict, name: str, field: str, min_val: int | None = None) ->
 
 class _SubmitHandler:
     """subagent_submit handler。"""
-    __slots__ = ("_manager", "_parent_run_id", "_parent_thread_id", "_depth")
+    __slots__ = ("_manager", "_parent_run_id", "_parent_thread_id", "_depth", "_thread_store")
 
     def __init__(
         self,
@@ -92,12 +92,14 @@ class _SubmitHandler:
         parent_run_id: str,
         parent_thread_id: str,
         depth: int = 1,
+        thread_store: "InMemoryThreadStore | None" = None,
     ) -> None:
         self._manager = manager
         self._parent_run_id = parent_run_id
         self._parent_thread_id = parent_thread_id
-        # 工具调用来源的子任务深度（父 Agent 视作 depth=0，本工具提交的子任务从 1 开始）
         self._depth = depth
+        # TOOL-02：子代理与父共享 ThreadStore（用于反查 project_id）
+        self._thread_store = thread_store
 
     def __call__(self, arguments: dict[str, object], context: object | None = None) -> str:
         tool_name = "subagent_submit"
@@ -140,19 +142,14 @@ class _SubmitHandler:
                     max_tool_calls=max_tool_calls if max_tool_calls else None,
                 )
 
-            # TOOL-02：从执行上下文提取父 Agent 已授予的能力，传递给子任务
-            parent_caps: frozenset = frozenset()
-            if context is not None:
-                if hasattr(context, "granted_capabilities"):
-                    parent_caps = getattr(context, "granted_capabilities") or frozenset()
-
-            # TOOL-02（R2a）：从父线程获取 project_id，继承项目会话上下文
+            # TOOL-02（R2a-1）：从共享 ThreadStore 获取父线程的 project_id，继承项目会话上下文
             parent_project_id: str | None = None
-            try:
-                parent_thread = self._manager._store.get(self._parent_thread_id)
-                parent_project_id = getattr(parent_thread, "project_id", None) or None
-            except Exception:
-                pass  # 非项目会话时 project_id 为 None
+            if self._thread_store is not None:
+                try:
+                    parent_thread = self._thread_store.get(self._parent_thread_id)
+                    parent_project_id = getattr(parent_thread, "project_id", None) or None
+                except Exception:
+                    pass  # 非项目会话时 project_id 为 None
 
             task = self._manager.submit(
                 instruction=instruction,
@@ -318,6 +315,7 @@ def create_subagent_tools(
     manager: SubagentManager,
     parent_run_id: str,
     parent_thread_id: str,
+    thread_store: "InMemoryThreadStore | None" = None,
 ) -> list[Tool]:
     """创建 4 个 Subagent 工具。"""
     return [
@@ -363,7 +361,7 @@ def create_subagent_tools(
                 "required": ["instruction"],
                 "additionalProperties": False,
             },
-            handler=_SubmitHandler(manager, parent_run_id, parent_thread_id),
+            handler=_SubmitHandler(manager, parent_run_id, parent_thread_id, thread_store),
             needs_context=True,
         ),
         Tool(
