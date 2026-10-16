@@ -107,6 +107,14 @@ class _SubmitHandler:
             if not isinstance(arguments, dict):
                 raise SubagentToolError("arguments", "必须是 dict")
 
+            # TOOL-02（R2a-3）：从 context 提取父 Agent 的 thread_id（而非 hardcoded "default"）
+            effective_parent_thread_id = self._parent_thread_id
+            if context is not None:
+                if hasattr(context, "thread_id"):
+                    ctx_thread_id = getattr(context, "thread_id")
+                    if ctx_thread_id:
+                        effective_parent_thread_id = ctx_thread_id
+
             # TOOL-02：从执行上下文提取父 Agent 已授予的能力，传递给子任务
             parent_caps: frozenset = frozenset()
             if context is not None:
@@ -146,7 +154,7 @@ class _SubmitHandler:
             parent_project_id: str | None = None
             if self._thread_store is not None:
                 try:
-                    parent_thread = self._thread_store.get(self._parent_thread_id)
+                    parent_thread = self._thread_store.get(effective_parent_thread_id)
                     parent_project_id = getattr(parent_thread, "project_id", None) or None
                 except Exception:
                     pass  # 非项目会话时 project_id 为 None
@@ -154,7 +162,7 @@ class _SubmitHandler:
             task = self._manager.submit(
                 instruction=instruction,
                 parent_run_id=self._parent_run_id,
-                parent_thread_id=self._parent_thread_id,
+                parent_thread_id=effective_parent_thread_id,
                 depth=self._depth,
                 timeout_seconds=timeout if timeout else None,
                 budget=budget,
@@ -361,7 +369,7 @@ def create_subagent_tools(
                 "required": ["instruction"],
                 "additionalProperties": False,
             },
-            handler=_SubmitHandler(manager, parent_run_id, parent_thread_id, thread_store),
+            handler=_SubmitHandler(manager, parent_run_id, parent_thread_id, thread_store=thread_store),
             needs_context=True,
         ),
         Tool(

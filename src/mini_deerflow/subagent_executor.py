@@ -115,10 +115,15 @@ class SubagentRunner:
             if self.task.status == TaskStatus.QUEUED:
                 self.task.transition_to(TaskStatus.RUNNING)
 
-            # 创建独立 Thread
+            # 创建独立 Thread（继承父项目的 project_id）
             if self.store.exists(thread_id):
                 self.store.delete(thread_id)
             self.store.create(thread_id)
+            # TOOL-02（R2a-2）：子线程继承父项目的 project_id，使项目工具可访问
+            if self.parent_project_id is not None:
+                sub_thread = self.store.get(thread_id)
+                sub_thread.project_id = self.parent_project_id
+                self.store.save(sub_thread)
 
             started_at = time.monotonic()
             if self.task.started_at is not None:
