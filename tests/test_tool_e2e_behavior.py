@@ -41,27 +41,21 @@ from mini_deerflow.tool_contracts import (
 
 
 class ScriptedModel:
-    """按预设序列返回决策；自动将工具结果注入 FinalAnswer。"""
+    """按预设序列返回决策。"""
     def __init__(self, decisions):
         self._queue = deque(decisions)
         self.received = []
-        self._last_tool_result = ""
+        self.tool_results: list[str] = []
 
     def decide(self, messages, tools=None):
         self.received.append(list(messages))
-        # 提取最后一条 tool result
-        for m in reversed(messages):
+        # 捕获 tool 结果用于断言
+        for m in messages:
             if isinstance(m, Message) and m.role == "tool" and m.content:
-                self._last_tool_result = m.content
-                break
+                self.tool_results.append(m.content)
         if not self._queue:
-            return FinalAnswer(content=self._last_tool_result or "done")
-        result = self._queue.popleft()
-        # 如果下一个是 FinalAnswer 且包含占位符，注入 tool result
-        if isinstance(result, FinalAnswer) and "TOOL_RESULT:" in result.content:
-            result = FinalAnswer(content=result.content.replace(
-                "TOOL_RESULT:", self._last_tool_result))
-        return result
+            return FinalAnswer(content="done")
+        return self._queue.popleft()
 
 
 # ============================================================================
@@ -209,11 +203,14 @@ class TestSubagentProjectRead(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_subagent_reads_project_file_via_submit_collect(self):
-        """通过 submit→Manager自动运行→collect 读取项目文件。"""
-        # 脚本模型：调用 project_read_file，返回包含工具结果的 FinalAnswer
+        """通过 submit→Manager自动运行→collect 读取项目文件。
+
+        不在 ScriptedModel 硬编码预期内容；直接断言模型收到的真实 tool JSON。
+        """
+        # 脚本模型：调用 project_read_file，再返回 FinalAnswer（不预设内容）
         scripted_model = ScriptedModel([
             ToolCall(name="project_read_file", arguments={"path": "test.txt"}),
-            FinalAnswer(content="TOOL_RESULT:"),  # 注入实际 tool result
+            FinalAnswer(content="read complete"),
         ])
 
         manager = SubagentManager(
@@ -224,37 +221,42 @@ class TestSubagentProjectRead(unittest.TestCase):
             thread_store=self.thread_store,
         )
 
-        # 提交任务（Manager 自动在后台线程运行 Runner）
-        task = manager.submit(
-            instruction="读取项目文件 test.txt 并返回内容",
-            parent_run_id="test-run",
-            parent_thread_id="parent-t",
-            depth=1,
-            model=scripted_model,
-            registry=self.tool_reg,
-            parent_granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
-            parent_project_id="proj-subagent-test",
-        )
+        try:
+            # 提交任务（Manager 自动在后台线程运行 Runner）
+            task = manager.submit(
+                instruction="读取项目文件 test.txt 并返回内容",
+                parent_run_id="test-run",
+                parent_thread_id="parent-t",
+                depth=1,
+                model=scripted_model,
+                registry=self.tool_reg,
+                parent_granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
+                parent_project_id="proj-subagent-test",
+            )
 
-        # 通过 Manager collect 回收结果（等待任务完成）
-        result = manager.collect(task.task_id, timeout=30)
+            # 通过 Manager collect 回收结果
+            result = manager.collect(task.task_id, timeout=30)
 
-        # 验证：任务成功
-        self.assertTrue(result.succeeded,
-                       f"Subagent should succeed. error={result.error_type}: {result.error_message}")
+            # 验证：任务成功
+            self.assertTrue(result.succeeded,
+                           f"Subagent should succeed. error={result.error_type}: {result.error_message}")
 
-        # 验证：输出包含文件内容
-        self.assertIn("hello from project", result.output,
-                     f"Output should contain file content. Got: {result.output}")
+            # 验证：模型收到的真实 tool JSON 包含 ok=true 和文件内容
+            self.assertGreater(len(scripted_model.tool_results), 0,
+                              f"Model should have received tool result. received={scripted_model.tool_results}")
+            tool_json = json.loads(scripted_model.tool_results[0])
+            self.assertTrue(tool_json.get("ok"),
+                           f"Tool result ok should be true. Got: {tool_json}")
+            self.assertIn("hello from project", tool_json.get("content", ""),
+                         f"Tool result content should include file text. Got: {tool_json}")
 
-        # 验证：模型确实调用了 project_read_file
-        tool_calls_made = []
-        for msgs in scripted_model.received:
-            for m in msgs:
-                if isinstance(m, Message) and m.tool_name:
-                    tool_calls_made.append(m.tool_name)
-        self.assertIn("project_read_file", tool_calls_made,
-                     f"Model should call project_read_file. Got: {tool_calls_made}")
+            # 验证：模型确实调用了 project_read_file
+            tool_calls_made = [m.tool_name for m in scripted_model.received[1]
+                              if isinstance(m, Message) and m.tool_name]
+            self.assertIn("project_read_file", tool_calls_made,
+                         f"Model should call project_read_file. Got: {tool_calls_made}")
+        finally:
+            manager.shutdown()
 
 
 # ============================================================================
