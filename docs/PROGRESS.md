@@ -2348,3 +2348,14 @@ def _do_tool_call(...) -> str:
 | R2b: MINI_SUBAGENT 可见性不过滤 | `model_tools` 只用 `allowed_tools`，不接 `tool_policy_registry` | `_BudgetAwareAgent.run()` 加 `tool_policy_registry` 可见性过滤（与主 Agent 同构） |
 
 **测试结果**：TOOL-02 + Subagent 定向 160 passed，全量回归（归因待核实）
+
+### TOOL-02 第4轮审查修复（2026-10-16）
+
+审查 SHA：`180d6f9`，修复推送 SHA：`ff1f219`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R2a-1: project_id 获取 AttributeError | `_SubmitHandler` 用 `manager._store` 但 Manager 无此属性 | `create_subagent_tools` 加 `thread_store` 参数；Handler 通过 `thread_store.get(parent_thread_id)` 反查 |
+| R2a-2: 项目文件读取失败 | `SubagentRunner._run_task` 创建隔离 `InMemoryThreadStore()`，无项目数据 | Manager 和 `_run_task` 使用共享 `thread_store` |
+
+**测试结果**：TOOL-02 + Subagent 定向 160 passed
