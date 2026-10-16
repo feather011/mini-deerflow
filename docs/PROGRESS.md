@@ -2403,6 +2403,34 @@ def _do_tool_call(...) -> str:
 
 **完整定向**：170 passed in 16.38s
 
+### TOOL-02 V1-project submit→collect 真实链路（2026-10-17）
+
+推送 SHA：`eb2bbb4`
+
+**修复**：将 V1-project 测试从手动 Runner 调用改为 `Manager.submit` → 后台自动运行 → `Manager.collect` 真实链路。
+
+**关键改动**：
+- ScriptedModel 提取 tool result 并注入 FinalAnswer
+- `Manager.submit(..., model=scripted_model, registry=self.tool_reg)` 让 Manager 在后台线程执行
+- `Manager.collect(task_id, timeout=30)` 等待并回收结果
+- 验证 `result.output` 包含文件内容 "hello from project"
+- 验证模型确实调用了 `project_read_file`
+
+| 测试 | 验证内容 | 结果 |
+|------|---------|------|
+| test_subagent_reads_project_file_via_submit_collect | submit→Manager运行→collect 含文件内容 | PASS |
+
+**测试结果**：
+```
+tests/test_tool_e2e_behavior.py: 10 passed in 0.22s
+TOOL-02 + Subagent 定向（8 文件）：170 passed in 17.27s
+```
+
+**改动文件**：
+- `tests/test_tool_e2e_behavior.py`（重写 test_subagent_reads_project_file，ScriptedModel 改进）
+
+---
+
 ### TOOL-02 V1 真实入口测试修复（2026-10-17）
 
 推送 SHA：`49dfd91`（用户授权额外一次收尾）
