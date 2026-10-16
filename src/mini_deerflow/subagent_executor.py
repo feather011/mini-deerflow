@@ -309,8 +309,6 @@ class _BudgetAwareAgent:
         self._tool_policy_registry = tool_policy_registry
         # TOOL-02：子任务从父 Agent 继承的已授予能力（由 subagent_submit handler 设置）
         self._parent_granted_capabilities: frozenset = parent_granted_capabilities
-        # TOOL-02：子任务从父 Agent 继承的已授予能力（由 subagent_submit handler 设置）
-        self._parent_granted_capabilities: frozenset = frozenset()
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
@@ -507,7 +505,7 @@ class SubagentManager:
         registry: ToolRegistry | None = None,
         context_policy: SubagentContextPolicy | None = None,
         # TOOL-02：父 Agent 已授予子任务的能力集合
-        parent_granted_capabilities: frozenset = field(default_factory=frozenset),
+        parent_granted_capabilities: frozenset = frozenset(),
     ) -> SubagentTask:
         """提交一个子任务。
 

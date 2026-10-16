@@ -143,12 +143,12 @@ class ToolMetadata:
         """是否有外部副作用（默认需要本次确认）。"""
         if self.uncategorized:
             return True
-        # READS_SESSION / READS_PROJECT / RUNS_COMMAND（受控）不算危险副作用
+        # 会话内部读写不算危险副作用；RUNS_COMMAND 由 evaluate_tool_access 中 project_execute 例外覆盖
         return bool(self.side_effects - {
             ToolSideEffect.NONE,
             ToolSideEffect.READS_SESSION,
+            ToolSideEffect.WRITES_SESSION,
             ToolSideEffect.READS_PROJECT,
-            ToolSideEffect.RUNS_COMMAND,
         })
 
 

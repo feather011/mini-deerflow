@@ -232,16 +232,15 @@ def test_sandbox_write_uncategorized_denied():
     assert decision.kind == AccessDecisionKind.DENY
 
 
-def test_task_note_confirms():
-    """task_note 有 SESSION_STATE_WRITE 能力，但有 WRITES_SESSION 副作用，默认 confirm。"""
+def test_task_note_allows():
+    """task_note 有 SESSION_STATE_WRITE 能力，无外部副作用（WRITES_SESSION 为会话内部操作），默认 ALLOW。"""
     registry = ToolPolicyRegistry()
     authority = make_authority(
         granted=frozenset({ToolCapability.SESSION_STATE_WRITE}),
     )
 
     decision = check_tool_access(registry, "task_note", authority)
-    # WRITES_SESSION 触发 requires_confirmation()
-    assert decision.kind == AccessDecisionKind.CONFIRM
+    assert decision.kind == AccessDecisionKind.ALLOW
 
 
 # ============================================================================
@@ -338,14 +337,17 @@ def test_authorization_error_carries_decision():
 # ============================================================================
 
 def test_confirm_blocks_handler():
-    """confirm 决策必须阻止执行，不能降级为 allow。"""
-    registry = ToolPolicyRegistry()
+    """显式 requires_confirmation=True 的策略触发 CONFIRM，阻止执行。"""
     authority = make_authority(
         granted=frozenset({ToolCapability.SESSION_STATE_WRITE}),
     )
-
-    # task_note 有 WRITES_SESSION 副作用，触发 confirm
-    decision = check_tool_access(registry, "task_note", authority)
+    # 显式开启确认策略
+    policy = ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    )
+    decision = evaluate_tool_access(TASK_NOTE_METADATA, policy, authority)
     assert decision.kind == AccessDecisionKind.CONFIRM
 
     # 调用方将 confirm 包装为异常，阻止执行

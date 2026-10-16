@@ -355,6 +355,7 @@ def create_subagent_tools(
                 "additionalProperties": False,
             },
             handler=_SubmitHandler(manager, parent_run_id, parent_thread_id),
+            needs_context=True,
         ),
         Tool(
             name="subagent_status",

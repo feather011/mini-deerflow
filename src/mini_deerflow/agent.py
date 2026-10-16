@@ -240,13 +240,16 @@ class Agent:
                 session_caps = frozenset({
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
+                    ToolCapability.SESSION_STATE_WRITE,
                 })
                 session_project_id: str | None = None
             else:
                 session_caps = frozenset({
                     ToolCapability.PROJECT_READ,
+                    ToolCapability.PROJECT_EXEC_DELEGATE,
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
+                    ToolCapability.SESSION_STATE_WRITE,
                 })
                 session_project_id = thread.project_id
             visible_names: set[str] = set()
