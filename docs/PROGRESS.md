@@ -2337,3 +2337,14 @@ def _do_tool_call(...) -> str:
 | R4: task_note 默认 CONFIRM | WRITES_SESSION 视为外部副作用 | WRITES_SESSION 移入安全集合，task_note 默认 ALLOW；6 个测试改用显式确认策略验证 CONFIRM 机制 |
 
 **测试结果**：TOOL-02 定向 86 passed，全量回归 3319 passed / 9 failed（无新增）
+
+### TOOL-02 第3轮审查修复（2026-10-16）
+
+审查 SHA：`5e55ca0`，修复推送 SHA：`0276e7b`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R2a: 项目会话子代理 project_read_file 失败 | `_BudgetAwareAgent` 硬编码 `project_id=None`，无项目上下文 | SubagentTask/Runner/Agent 链路贯穿 `parent_project_id`；`_SubmitHandler` 从父线程提取并传递 |
+| R2b: MINI_SUBAGENT 可见性不过滤 | `model_tools` 只用 `allowed_tools`，不接 `tool_policy_registry` | `_BudgetAwareAgent.run()` 加 `tool_policy_registry` 可见性过滤（与主 Agent 同构） |
+
+**测试结果**：TOOL-02 + Subagent 定向 160 passed，全量回归（归因待核实）
