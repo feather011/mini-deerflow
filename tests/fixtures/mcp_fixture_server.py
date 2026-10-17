@@ -13,6 +13,19 @@ if mode == "bad_init":
     sys.stderr.write("fixture: bad_init mode, exiting with error\n")
     sys.exit(1)
 
+if mode == "hang_init":
+    # TOOL-03 R4 round 3：启动后挂起，不响应 initialize。
+    # 让 manager 的 startup_timeout 触发并验证子进程被回收。
+    import time
+    sys.stderr.write("fixture: hang_init mode, sleeping 30s\n")
+    sys.stderr.flush()
+    # 仅睡短时间，让测试不要真等 30s；manager 的 startup_timeout 触发后会 cancel
+    try:
+        time.sleep(30)
+    except KeyboardInterrupt:
+        pass
+    sys.exit(2)
+
 
 def _make_server():
     """按 mcp 版本构造 server。"""

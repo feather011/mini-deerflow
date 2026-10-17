@@ -226,6 +226,11 @@ class MCPClientManager:
         # qualified_name → (原始服务器名, 原始工具名)
         self._tools: dict[str, tuple[str, str]] = {}
         self._started = False
+        # TOOL-03 R4 round 3：记录本 manager 之前注册到 ToolRegistry 的工具名。
+        # stop→start 时先把自有工具从 registry 移除（仅自有，不动外来），
+        # 然后再注册新发现，避免报"自有名称冲突"。
+        self._owned_registry: ToolRegistry | None = None
+        self._owned_tool_names: set[str] = set()
         # TOOL-03 R5：服务器状态。key=server name, value=ServerState
         # 状态来源是「配置」而非「已运行」，因此启动失败/被禁用/被停止的服务器
         # 仍出现在清单中。
@@ -279,6 +284,16 @@ class MCPClientManager:
         """
         if self._started or not self._configs:
             return 0
+
+        # TOOL-03 R4 round 3：stop→start 时清掉本 manager 之前注册到该 registry 的
+        # 工具（仅自有，不动外来），避免重复启动时自己跟自己冲突。
+        # 同时记录本轮使用的 registry，便于 stop 时回滚。
+        if self._owned_tool_names and self._owned_registry is registry:
+            for name in self._owned_tool_names:
+                self._owned_registry.unregister(name)
+            self._owned_tool_names.clear()
+            self._tools.clear()
+        self._owned_registry = registry
 
         # 桥只建一次：所有服务器共享同一个事件循环线程
         self._portal = AsyncPortal(name="mini-deerflow-mcp")
@@ -352,7 +367,18 @@ class MCPClientManager:
         session = _Session(future, errors)
 
         if not ready.wait(timeout=config.startup_timeout):
-            self._signal_stop(session)
+            # TOOL-03 R4 round 3：超时回收——取消 future 并等待，让子进程退出。
+            # session.stopping 此刻可能尚未从 ctx 赋值（事件循环未跑过那段代码），
+            # 所以先 cancel future 触发 TaskGroup 拆解，再等 future 完成。
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            try:
+                future.result(timeout=5.0)
+            except BaseException:
+                # 包括 CancelledError / ExceptionGroup；这里不区分，因为子进程已死即可
+                pass
             self._discard(config.name)
             raise MCPStartupError(
                 f"服务器 {config.name} 在 {config.startup_timeout}s 内未就绪"
@@ -370,6 +396,15 @@ class MCPClientManager:
                 "MCP 服务器初始化未完成: server=%s init_ok=%s client=%s errors=%s",
                 config.name, init_ok, session.client is not None, errors,
             )
+            # TOOL-03 R4 round 3：同样取消 future 并等待。
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            try:
+                future.result(timeout=5.0)
+            except BaseException:
+                pass
             self._discard(config.name)
             raise MCPStartupError(f"服务器 {config.name} 连接后未完成初始化")
 
@@ -402,10 +437,12 @@ class MCPClientManager:
 
         existing = {tool.name for tool in registry.list_tools()}
         registered = 0
+        registered_in_this_run: list[str] = []
         for mcp_tool in mcp_tools:
             spec, tool = adapter.to_tool(mcp_tool)
             detect_conflicts(existing, spec.name)
             if spec.name in self._tools:
+                # 理论上 start 顶部已清空 _tools；防御性兜底
                 raise MCPStartupError(f"工具名冲突: {spec.name}")
             self._tools[spec.name] = (config.name, getattr(mcp_tool, "name", ""))
             try:
@@ -414,7 +451,10 @@ class MCPClientManager:
                 del self._tools[spec.name]
                 raise
             existing.add(spec.name)
+            registered_in_this_run.append(spec.name)
             registered += 1
+        # 记入 manager 自有集合；下次 start 时清掉
+        self._owned_tool_names.update(registered_in_this_run)
 
         _LOGGER.info(
             "MCP 服务器已连接: server=%s tools=%d", config.name, registered
