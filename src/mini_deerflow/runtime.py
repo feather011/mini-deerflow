@@ -860,12 +860,19 @@ def create_runtime(
     policy_registry: ToolPolicyRegistry = tool_policy_registry
 
     def _is_run_alive(run_id: str, thread_id: str) -> bool:
-        # R5：同时检查 thread 是否有该 run_id 在跑（不是只看 thread 忙）。
-        # Coordinator 只存 (thread_id, run_id) 关系；is_running(thread) 表示该 thread
-        # 当前正在跑某个 run。我们这里要求"该 thread 正在跑且 run_id 匹配"。
-        coord = thread_run_coordinator
-        # thread 忙 + 那个 run 仍然 active
-        return coord.is_running(thread_id)
+        # R5 round 3：检查 thread 当前 run_id 与 caller 提供的一致，
+        # 且该 run_id 未被取消 / 结束。
+        coord = runtime.thread_run_coordinator
+        # thread 正在跑 + 跑的是 caller 提供的 run_id
+        with coord._lock:
+            current = coord._running.get(thread_id)
+        if current is None or current != run_id:
+            return False
+        # 检查 run 是否已 cancel
+        cancelled_runs = getattr(runtime, "_cancelled_runs", None)
+        if isinstance(cancelled_runs, set) and run_id in cancelled_runs:
+            return False
+        return True
 
     confirmation_manager = ConfirmationManager(
         store=confirmation_store,
@@ -982,6 +989,19 @@ def create_runtime(
         )
 
     runtime.execute_confirmed_request = _execute_confirmed_request
+
+    # R1：把 confirmation_manager 注入到 agent（CONFIRM 时自动创建 pending）
+    if agent is not None:
+        try:
+            agent._confirmation_manager = confirmation_manager
+        except Exception:
+            pass
+    if integrated_agent is not None:
+        try:
+            integrated_agent._confirmation_manager = confirmation_manager
+        except Exception:
+            pass
+
     return runtime
 
 

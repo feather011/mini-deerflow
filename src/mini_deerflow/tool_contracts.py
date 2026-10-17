@@ -241,6 +241,9 @@ class ToolAccessDecision:
     reason: str
     """简短说明（面向用户或日志）。"""
 
+    metadata: dict = field(default_factory=dict)
+    """扩展元数据（如 CONFIRM 时挂载的 pending request_id）。"""
+
     @classmethod
     def allow(cls, reason: str = "allowed") -> "ToolAccessDecision":
         return cls(AccessDecisionKind.ALLOW, "allowed", reason)

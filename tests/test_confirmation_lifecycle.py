@@ -922,9 +922,9 @@ class TestR6DeepCopyAndHashCheck(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_nested_argument_not_mutated_after_create(self):
-        """R6：批准后修改原嵌套 dict，存储中的 arguments 不变。"""
+        """R6：批准后修改原嵌套 dict，存储中的 arguments 不变（保持 dict/list 类型）。"""
         import copy as _copy
-        nested = {"data": {"value": 1}}
+        nested = {"data": {"value": 1}, "items": [1, 2]}
         req = self.manager.create(
             run_id="r1", thread_id="t1", project_id=None,
             principal=ExecutorPrincipal.MAIN_AGENT,
@@ -933,18 +933,14 @@ class TestR6DeepCopyAndHashCheck(unittest.TestCase):
         )
         # 批准后修改原 nested
         nested["data"]["value"] = 999
-        # 存储中 data.value 应仍为 1
+        nested["items"].append(99)
+        # 存储中仍是原值
         stored = self.store.get(req.request_id)
-        self.assertEqual(len(stored.arguments), 1)
-        outer_key, outer_val = stored.arguments[0]
-        self.assertEqual(outer_key, "data")
-        # outer_val 是 (("value", 1),) 深拷贝 + freeze 后
-        # 确认内层 value 是 1（不是 999）
-        if isinstance(outer_val, tuple) and len(outer_val) > 0:
-            inner = outer_val[0]
-            if isinstance(inner, tuple) and len(inner) == 2:
-                self.assertEqual(inner[1], 1,
-                                f"存储中 value 应为 1，实际 inner={inner}")
+        self.assertEqual(stored.arguments, {"data": {"value": 1}, "items": [1, 2]},
+                        f"存储应保留原 JSON 结构，实际 {stored.arguments}")
+        # 验证 type：dict/list 不是 tuple
+        self.assertIsInstance(stored.arguments["data"], dict)
+        self.assertIsInstance(stored.arguments["items"], list)
 
     def test_execute_rejects_modified_arguments(self):
         """R6：执行时 caller 传不同 arguments → 拒绝（hash 复核）。"""
@@ -1017,6 +1013,90 @@ class TestR5RunLifecycleBoundRunId(unittest.TestCase):
                 invoker=lambda t, a: "ok",
             )
         self.assertIn("已停止", str(ctx.exception))
+
+
+class TestR3StoreSerializationRound3(unittest.TestCase):
+    """R3 round 3：并发 create + claim + 重建后 handler 计数只 1。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        self.policy = _make_policy_registry()
+        self.manager = ConfirmationManager(self.store, self.policy)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_concurrent_create_and_execute_then_rebuild_handler_count(self):
+        """R3 round 3：并发 create + claim/execute + 重建后 handler 计数只 1。"""
+        import threading
+        handler_calls: list[str] = []
+        results: list[Any] = []
+        errors: list[Exception] = []
+
+        # 创建并批准
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+
+        # 模拟：claim_and_execute + 并发 create 互不干扰
+        def worker_execute():
+            try:
+                def invoker(name, args):
+                    handler_calls.append(name)
+                    return "ok"
+                res = self.manager.claim_and_execute(
+                    req.request_id,
+                    parent_authority=_make_authority(),
+                    invoker=invoker,
+                )
+                results.append(res)
+            except Exception as e:
+                errors.append(e)
+
+        def worker_create():
+            try:
+                self.manager.create(
+                    run_id="r2", thread_id="t2", project_id=None,
+                    principal=ExecutorPrincipal.MAIN_AGENT,
+                    tool_name="mcp__echo__echo", arguments={},
+                )
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker_execute)] + \
+                  [threading.Thread(target=worker_create) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # 关键：原 req 已 EXECUTED，handler 只调用 1 次
+        self.assertEqual(len(handler_calls), 1,
+                        f"应只调用 handler 1 次，实际 {len(handler_calls)}")
+        # 终态 EXECUTED
+        final = self.store.get(req.request_id)
+        self.assertEqual(final.state, ConfirmationState.EXECUTED)
+
+        # 重建（删除 store 实例，重新从磁盘加载）
+        del self.store
+        store_reload = ConfirmationStore(path=self.path)
+        reloaded = store_reload.get(req.request_id)
+        self.assertEqual(reloaded.state, ConfirmationState.EXECUTED)
+        # 重建后不能再次执行
+        mgr2 = ConfirmationManager(store_reload, self.policy)
+        with self.assertRaises(ConfirmationError):
+            mgr2.claim_and_execute(
+                req.request_id,
+                parent_authority=_make_authority(),
+                invoker=lambda t, a: "should_not_be_called",
+            )
+        # 重建后 handler 仍未被调（仍是 1 次）
+        self.assertEqual(len(handler_calls), 1)
 
 
 if __name__ == "__main__":

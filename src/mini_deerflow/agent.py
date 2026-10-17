@@ -464,7 +464,32 @@ class Agent:
                             principal=self._run_principal,
                         )
                         auth_decision = check_tool_access(self._tool_policy_registry, _name, authority)
-                        if auth_decision.is_denied or auth_decision.is_confirm:
+                        if auth_decision.is_denied:
+                            raise ToolAuthorizationError(auth_decision)
+                        if auth_decision.is_confirm:
+                            # R1：若 runtime 提供 confirmation_manager，自动创建 pending 请求，
+                            # 把 request_id 注入决策的 metadata，外层 API 批准后调 execute_confirmed_request。
+                            cm = getattr(self, "_confirmation_manager", None)
+                            if cm is not None:
+                                from mini_deerflow.tool_contracts import (
+                                    ExecutorPrincipal as _EP,
+                                )
+                                principal = _EP[
+                                    authority.principal.name
+                                ] if hasattr(authority.principal, "name") else authority.principal
+                                pending = cm.create(
+                                    run_id=authority.run_id or "main",
+                                    thread_id=thread_id,
+                                    project_id=thread.project_id,
+                                    principal=principal,
+                                    tool_name=_name,
+                                    arguments=_args,
+                                )
+                                # 把 request_id 写入决策 metadata
+                                try:
+                                    auth_decision.metadata["request_id"] = pending.request_id
+                                except Exception:
+                                    pass
                             raise ToolAuthorizationError(auth_decision)
                         # 授权通过：记录已授予能力，供 handler（如 subagent_submit）读取并传递
                         _ctx.granted_capabilities = default_caps

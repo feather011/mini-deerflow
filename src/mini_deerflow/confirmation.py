@@ -67,7 +67,7 @@ class ConfirmationRequest:
     principal: str  # ExecutorPrincipal.name
     tool_name: str
     arguments_hash: str  # 锁定参数
-    arguments: tuple[tuple[str, Any], ...]  # 原始参数（持久化用）
+    arguments: Any  # 规范化后的参数快照（dict/list 保持原 JSON 结构，frozen=True）
     requested_at: float
     expires_at: float
     state: ConfirmationState = ConfirmationState.PENDING
@@ -96,17 +96,11 @@ class ConfirmationRequest:
         if not isinstance(arguments, Mapping):
             raise ConfirmationError("arguments 必须是 dict")
         current = now if now is not None else time.time()
-        # R6 round 2：深拷贝 arguments，避免后续修改原对象影响存储的快照
+        # R6 round 3：深拷贝 + JSON 规范化（保持 dict/list 类型，可逆）
+        # 用 json 序列化-反序列化确保可逆且稳定。
         import copy as _copy
         arguments_snapshot = _copy.deepcopy(dict(arguments))
-        # 同时把内层 dict 递归转 tuple（确保 to_dict/from_dict 往返稳定）
-        def _deep_freeze(obj):
-            if isinstance(obj, dict):
-                return tuple(sorted((k, _deep_freeze(v)) for k, v in obj.items()))
-            if isinstance(obj, (list, tuple)):
-                return tuple(_deep_freeze(x) for x in obj)
-            return obj
-        arguments_frozen = _deep_freeze(arguments_snapshot)
+        arguments_normalized = json.loads(json.dumps(arguments_snapshot, default=str))
         return cls(
             request_id=f"cf-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -115,7 +109,7 @@ class ConfirmationRequest:
             principal=principal.name,
             tool_name=tool_name,
             arguments_hash=_hash_arguments(arguments),
-            arguments=arguments_frozen,
+            arguments=arguments_normalized,
             requested_at=current,
             expires_at=current + ttl_seconds,
         )
@@ -133,7 +127,7 @@ class ConfirmationRequest:
             "principal": self.principal,
             "tool_name": self.tool_name,
             "arguments_hash": self.arguments_hash,
-            "arguments": [list(item) for item in self.arguments],
+            "arguments": self.arguments,  # 已规范化的 JSON 结构
             "requested_at": self.requested_at,
             "expires_at": self.expires_at,
             "state": self.state.value,
@@ -153,7 +147,7 @@ class ConfirmationRequest:
             principal=raw["principal"],
             tool_name=raw["tool_name"],
             arguments_hash=raw["arguments_hash"],
-            arguments=tuple(tuple(item) for item in raw["arguments"]),
+            arguments=raw["arguments"],  # JSON 兼容结构（dict/list）
             requested_at=raw["requested_at"],
             expires_at=raw["expires_at"],
             state=ConfirmationState(raw["state"]),
@@ -168,6 +162,8 @@ def _coerce_args_for_compare(
     arguments: Mapping[str, Any] | tuple[tuple[str, Any], ...],
 ) -> dict[str, Any]:
     """把不同形态的参数归一化为 dict 用于哈希比较。"""
+    if isinstance(arguments, Mapping):
+        return dict(arguments)
     if isinstance(arguments, tuple):
         return dict(arguments)
     return dict(arguments)
@@ -182,6 +178,9 @@ class ConfirmationStore:
         self._path = Path(path)
         self._requests: dict[str, ConfirmationRequest] = {}
         self._loaded = False
+        # R3 round 3：进程内读写锁。加载/候选生成/写盘/内存发布串行化。
+        import threading as _threading
+        self._store_lock = _threading.Lock()
 
     @property
     def path(self) -> Path:
@@ -213,38 +212,69 @@ class ConfirmationStore:
         return self._requests.get(request_id)
 
     def add(self, request: ConfirmationRequest) -> None:
-        self._ensure_loaded()
-        self._save_then_replace(request.request_id, request)
+        self._add_or_update(request.request_id, request)
 
     def update(self, request: ConfirmationRequest) -> None:
-        self._ensure_loaded()
-        self._save_then_replace(request.request_id, request)
+        self._add_or_update(request.request_id, request)
+
+    def _add_or_update(self, rid: str, new_req: ConfirmationRequest) -> None:
+        """R3 round 3：在 store 进程锁内做加载、候选生成、写盘、内存发布。
+
+        避免与并发的 claim_and_execute 写盘交叉：两个线程都先读最新
+        _requests，生成候选字典，写临时文件，os.replace 成功后才更新内存。
+        锁确保任一时刻只有一个 add/update 在做候选生成+写盘。
+        """
+        with self._store_lock:
+            self._ensure_loaded_locked()
+            # 1. 候选字典（最新内存）
+            candidate = dict(self._requests)
+            candidate[rid] = new_req
+            # 2. 写临时文件
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                prefix="confirm-state-", suffix=".tmp", dir=self._path.parent
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {"requests": {k: v.to_dict() for k, v in candidate.items()}},
+                        f, ensure_ascii=False, indent=2,
+                    )
+                    f.flush()
+                    os.fsync(f.fileno())
+                # 3. 原子替换到正式路径
+                os.replace(tmp, self._path)
+            except Exception:
+                if os.path.exists(tmp):
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                raise
+            # 4. 落盘成功才更新内存
+            self._requests[rid] = new_req
+
+    def _ensure_loaded_locked(self) -> None:
+        """调用方必须持 store_lock。"""
+        if self._loaded:
+            return
+        if self._path.is_file():
+            try:
+                raw = json.loads(self._path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ConfirmationError(f"确认存储 JSON 解析失败: {exc.msg}") from None
+            if not isinstance(raw, Mapping):
+                raise ConfirmationError("确认存储顶层必须是对象")
+            requests = raw.get("requests", {})
+            if not isinstance(requests, Mapping):
+                raise ConfirmationError("requests 必须是对象")
+            for rid, r_raw in requests.items():
+                self._requests[str(rid)] = ConfirmationRequest.from_dict(r_raw)
+        self._loaded = True
 
     def _save_then_replace(self, rid: str, new_req: ConfirmationRequest) -> None:
-        """R1 同款：候选字典写盘成功才更新内存。"""
-        candidate = dict(self._requests)
-        candidate[rid] = new_req
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            prefix="confirm-state-", suffix=".tmp", dir=self._path.parent
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"requests": {k: v.to_dict() for k, v in candidate.items()}},
-                    f, ensure_ascii=False, indent=2,
-                )
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self._path)
-        except Exception:
-            if os.path.exists(tmp):
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-            raise
-        self._requests[rid] = new_req
+        """保留兼容：内部直接调 _add_or_update（已加锁）。"""
+        self._add_or_update(rid, new_req)
 
 
 __all__ = [
