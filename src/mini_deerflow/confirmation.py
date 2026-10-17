@@ -96,6 +96,17 @@ class ConfirmationRequest:
         if not isinstance(arguments, Mapping):
             raise ConfirmationError("arguments 必须是 dict")
         current = now if now is not None else time.time()
+        # R6 round 2：深拷贝 arguments，避免后续修改原对象影响存储的快照
+        import copy as _copy
+        arguments_snapshot = _copy.deepcopy(dict(arguments))
+        # 同时把内层 dict 递归转 tuple（确保 to_dict/from_dict 往返稳定）
+        def _deep_freeze(obj):
+            if isinstance(obj, dict):
+                return tuple(sorted((k, _deep_freeze(v)) for k, v in obj.items()))
+            if isinstance(obj, (list, tuple)):
+                return tuple(_deep_freeze(x) for x in obj)
+            return obj
+        arguments_frozen = _deep_freeze(arguments_snapshot)
         return cls(
             request_id=f"cf-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -104,7 +115,7 @@ class ConfirmationRequest:
             principal=principal.name,
             tool_name=tool_name,
             arguments_hash=_hash_arguments(arguments),
-            arguments=tuple(sorted(arguments.items())),
+            arguments=arguments_frozen,
             requested_at=current,
             expires_at=current + ttl_seconds,
         )

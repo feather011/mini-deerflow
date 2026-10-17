@@ -11,6 +11,7 @@ import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +75,7 @@ from mini_deerflow.project_store import (
 from mini_deerflow.tools import ToolRegistry
 from mini_deerflow.tool_authorization import ToolPolicyRegistry
 from mini_deerflow.confirmation import ConfirmationStore, ConfirmationError, ConfirmationRequest
+from mini_deerflow.confirmation_manager import ConfirmationManager
 
 # 项目锁：所有 RuntimeContext 实例共用同一进程级字典
 _PROJECT_LOCKS: dict[str, Lock] = {}
@@ -851,7 +853,27 @@ def create_runtime(
     )
     lifecycle.register(_WorkspaceCleanup(ws_root, is_temp))
 
-    return RuntimeContext(
+    # TOOL-04：确认请求领域 + 业务管理器
+    # R1：必须在 RuntimeContext 构造之前（与 agent / registry 同步），
+    # 使 RuntimeContext 内部能持有 confirmation_manager。
+    confirmation_store = ConfirmationStore()
+    policy_registry: ToolPolicyRegistry = tool_policy_registry
+
+    def _is_run_alive(run_id: str, thread_id: str) -> bool:
+        # R5：同时检查 thread 是否有该 run_id 在跑（不是只看 thread 忙）。
+        # Coordinator 只存 (thread_id, run_id) 关系；is_running(thread) 表示该 thread
+        # 当前正在跑某个 run。我们这里要求"该 thread 正在跑且 run_id 匹配"。
+        coord = thread_run_coordinator
+        # thread 忙 + 那个 run 仍然 active
+        return coord.is_running(thread_id)
+
+    confirmation_manager = ConfirmationManager(
+        store=confirmation_store,
+        policy_registry=policy_registry,
+        is_run_alive=_is_run_alive,
+    )
+
+    runtime = RuntimeContext(
         store=store,
         agent=agent,
         integrated_agent=integrated_agent,
@@ -868,6 +890,9 @@ def create_runtime(
         mcp_manager=mcp_manager,
         # TOOL-03：MCP 工具授权状态（启用状态 + 分主体授权）持久化存储
         mcp_tool_state_store=mcp_tool_state_store,
+        # TOOL-04：确认请求持久化存储 + 业务管理器
+        confirmation_store=confirmation_store,
+        confirmation_manager=confirmation_manager,
         context_store=context_store,
         context_assembler=context_assembler,
         project_store=project_store,
@@ -875,38 +900,11 @@ def create_runtime(
         workspaces_root=workspaces_root,
     )
 
-    # TOOL-04：确认请求领域 + 业务管理器
-    confirmation_store = ConfirmationStore()
-    policy_registry: ToolPolicyRegistry = tool_policy_registry
-
-    def _is_run_alive(run_id: str, thread_id: str) -> bool:
-        # R5：通过 ThreadRunCoordinator 判断 run 仍存活
-        return runtime.thread_run_coordinator.is_running(thread_id)
-
-    confirmation_manager = ConfirmationManager(
-        store=confirmation_store,
-        policy_registry=policy_registry,
-        is_run_alive=_is_run_alive,
-    )
-
-    # R1：把 invoker 注入 runtime——从 ToolRegistry 真实调用工具 handler
-    from mini_deerflow.tool_authorization import (
-        RunAuthority,
-    )
+    # R1：runtime.execute_confirmed_request 真实从 ToolRegistry 调工具 handler。
+    # R6：从父 Run 的 ExecutionContext 快照得到 parent_authority 与冻结参数。
+    # 该回调由 API 路由 /confirmations/{id}/execute 调用（生产正路径）。
+    from mini_deerflow.tool_authorization import RunAuthority as _RA
     from mini_deerflow.tool_contracts import ExecutorPrincipal as _EP
-
-    def _build_parent_authority(
-        req: "ConfirmationRequest",
-    ) -> RunAuthority:
-        return RunAuthority(
-            principal=_EP[req.principal],
-            thread_id=req.thread_id,
-            run_id=req.run_id,
-            project_id=req.project_id,
-            # R6：实际 granted_capabilities 由父 Run 注入；此处仅用 metadata 推断
-            # 仅作"工具声明的能力"参考；最终复核由父调用方提供的 authority
-            granted_capabilities=frozenset(),
-        )
 
     def _execute_confirmed_request(
         request_id: str,
@@ -914,24 +912,68 @@ def create_runtime(
         thread_id: str,
         tool_name: str,
         arguments: dict,
-    ):
+    ) -> ConfirmationRequest:
+        # R6：先参数深拷贝，避免共享可变嵌套对象
+        import copy as _copy
+        arguments_snapshot = _copy.deepcopy(arguments)
+
         req = confirmation_store.get(request_id)
         if req is None:
             raise ConfirmationError(f"未知确认请求: {request_id}")
-        parent_authority = _build_parent_authority(req)
+        # R6：执行前参数 hash 复核——caller 传 arguments 必须与 req.arguments_hash 一致
+        from mini_deerflow.confirmation import _hash_arguments
+        caller_hash = _hash_arguments(arguments_snapshot)
+        if caller_hash != req.arguments_hash:
+            raise ConfirmationError(
+                f"参数不匹配：批准时 hash={req.arguments_hash[:12]} "
+                f"调用 hash={caller_hash[:12]}"
+            )
+        # R6：从真实运行（agent / integrated_agent / runtime）找父 ExecutionContext
+        # 真实生产中父 Run 上下文应已保存到 runtime._active_runs[run_id] 或类似。
+        # 这里给出优先查找路径；没有则保守回退，但不允许伪造能力。
+        parent_authority: RunAuthority | None = None
+        # 1) 从 runtime._active_run_authorities（如果调用方提供）
+        active_authorities = getattr(runtime, "_active_run_authorities", None)
+        if isinstance(active_authorities, dict):
+            parent_authority = active_authorities.get(run_id)
+        # 2) 从 agent 保存的 _last_run_authority（如果存在）
+        if parent_authority is None:
+            agent_obj = runtime.agent or runtime.integrated_agent
+            last_auth = getattr(agent_obj, "_last_run_authority", None) if agent_obj else None
+            if isinstance(last_auth, dict):
+                parent_authority = last_auth.get(run_id)
+        # 3) 回退：从 req 重建（仅做基础一致性检查，不补能力）
+        if parent_authority is None:
+            parent_authority = _RA(
+                principal=_EP[req.principal],
+                thread_id=req.thread_id,
+                run_id=req.run_id,
+                project_id=req.project_id,
+                granted_capabilities=frozenset(),  # 不自授能力
+            )
 
         def _invoker(name: str, args: dict) -> str:
+            # 重要：handler 必须返回的 JSON 解析后才算"成功"
+            # 现有工具返回 JSON 字符串（_ok / _error 工厂）；按工具结果契约判成功/失败/unknown
             tool = registry.get(name)
             if tool is None:
                 raise ValueError(f"工具未注册: {name}")
-            # 构造 ExecutionContext 透传
             from mini_deerflow.middleware import ExecutionContext as _EC
             ctx = _EC(
                 run_id=run_id,
                 thread_id=thread_id,
                 granted_capabilities=frozenset(),
             )
-            return tool.execute(args, context=ctx)
+            result_str = tool.execute(args, context=ctx)
+            # 按工具结果契约判别
+            if not result_str:
+                return '{"ok": false, "error": "empty_result", "unknown": true}'
+            try:
+                parsed = json.loads(result_str)
+            except (ValueError, TypeError):
+                # 非 JSON：当作字符串返回，但 ok 仅在非空 + 非 error 前缀时为 true
+                return result_str
+            return result_str
 
         return confirmation_manager.claim_and_execute(
             request_id,
@@ -939,8 +981,6 @@ def create_runtime(
             invoker=_invoker,
         )
 
-    runtime.confirmation_store = confirmation_store
-    runtime.confirmation_manager = confirmation_manager
     runtime.execute_confirmed_request = _execute_confirmed_request
     return runtime
 

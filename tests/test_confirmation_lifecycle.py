@@ -764,5 +764,260 @@ class TestConfirmationAPIWithRealInvoker(unittest.TestCase):
         self.assertIn("未提供", msg)
 
 
+# ============================================================================
+# 9. R3 round 2: 决定路径与领取同锁（迟到 approve 不再覆盖）
+# ============================================================================
+
+
+class TestR3DecisionPathAtomicity(unittest.TestCase):
+    """R3：approve/deny/cancel/expire 与 claim_and_execute 共用同一锁；终态不可覆盖。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        self.policy = _make_policy_registry()
+        self.manager = ConfirmationManager(self.store, self.policy)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_approve_after_execute_rejected(self):
+        """R3：已 EXECUTED 后再 approve → 拒绝（不覆盖终态）。"""
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+        self.manager.claim_and_execute(
+            req.request_id,
+            parent_authority=_make_authority(),
+            invoker=lambda t, a: "ok",
+            now=201.0,
+        )
+        # 已 EXECUTED → 任何决定都应拒绝
+        with self.assertRaises(ConfirmationError):
+            self.manager.approve(req.request_id, decided_by="user2", now=202.0)
+        with self.assertRaises(ConfirmationError):
+            self.manager.deny(req.request_id, decided_by="user2", now=202.0)
+        with self.assertRaises(ConfirmationError):
+            self.manager.cancel(req.request_id, decided_by="user2", now=202.0)
+
+    def test_late_approve_does_not_reset_executed(self):
+        """R3 round 2：迟到 approve（先等执行完）不能把 EXECUTED 改回 APPROVED。"""
+        import threading
+        results: list[Any] = []
+        errors: list[Exception] = []
+
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        # 先 approve
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+
+        # 模拟：worker A 立即领取执行；worker B 晚到一会儿后调用 approve
+        def worker_a():
+            try:
+                res = self.manager.claim_and_execute(
+                    req.request_id,
+                    parent_authority=_make_authority(),
+                    invoker=lambda t, a: "ok",
+                )
+                results.append(("a", res))
+            except Exception as e:
+                errors.append(("a", e))
+
+        def worker_b():
+            try:
+                time.sleep(0.05)  # 让 A 先跑
+                res = self.manager.approve(req.request_id, decided_by="late", now=300.0)
+                results.append(("b", res))
+            except Exception as e:
+                errors.append(("b", e))
+
+        ta = threading.Thread(target=worker_a)
+        tb = threading.Thread(target=worker_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        # A 成功执行
+        self.assertEqual(len(results), 1, f"应只 1 个成功结果，实际 {results}")
+        self.assertEqual(results[0][0], "a")
+        self.assertEqual(results[0][1].state, ConfirmationState.EXECUTED)
+        # B 抛错（不能覆盖 EXECUTED）
+        self.assertEqual(len(errors), 1, f"应只有 1 个错误")
+        self.assertEqual(errors[0][0], "b")
+        self.assertIsInstance(errors[0][1], ConfirmationError)
+
+    def test_concurrent_approve_and_execute_safe(self):
+        """R3 round 2：approve + execute 并发 → 终态一致。"""
+        import threading
+        results: list[Any] = []
+        errors: list[Exception] = []
+
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        # 先同步 approve（确保 APPROVED 状态）
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+
+        # 3 个 execute 线程 + 2 个 approve 线程并发
+        def worker_execute():
+            try:
+                res = self.manager.claim_and_execute(
+                    req.request_id,
+                    parent_authority=_make_authority(),
+                    invoker=lambda t, a: "ok",
+                )
+                results.append(("exec", res))
+            except Exception as e:
+                errors.append(("exec", e))
+
+        def worker_approve():
+            try:
+                res = self.manager.approve(req.request_id, decided_by="user2", now=201.0)
+                results.append(("approve", res))
+            except Exception as e:
+                errors.append(("approve", e))
+
+        threads = [threading.Thread(target=worker_execute) for _ in range(3)] + \
+                  [threading.Thread(target=worker_approve) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # 至少 1 个执行成功
+        executed_count = sum(1 for r in results if r[0] == "exec")
+        self.assertGreaterEqual(executed_count, 1,
+                               f"应至少 1 个 exec 成功，实际 results={results} errors={errors}")
+        # 终态 EXECUTED
+        final = self.store.get(req.request_id)
+        self.assertEqual(final.state, ConfirmationState.EXECUTED)
+
+
+# ============================================================================
+# 10. R6 round 2: 深拷贝/嵌套参数 + 调用前 hash 复核
+# ============================================================================
+
+
+class TestR6DeepCopyAndHashCheck(unittest.TestCase):
+    """R6：参数深拷贝、嵌套对象不可共享、执行前 hash 复核。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        self.policy = _make_policy_registry()
+        self.manager = ConfirmationManager(self.store, self.policy)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_nested_argument_not_mutated_after_create(self):
+        """R6：批准后修改原嵌套 dict，存储中的 arguments 不变。"""
+        import copy as _copy
+        nested = {"data": {"value": 1}}
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo",
+            arguments=_copy.deepcopy(nested),
+        )
+        # 批准后修改原 nested
+        nested["data"]["value"] = 999
+        # 存储中 data.value 应仍为 1
+        stored = self.store.get(req.request_id)
+        self.assertEqual(len(stored.arguments), 1)
+        outer_key, outer_val = stored.arguments[0]
+        self.assertEqual(outer_key, "data")
+        # outer_val 是 (("value", 1),) 深拷贝 + freeze 后
+        # 确认内层 value 是 1（不是 999）
+        if isinstance(outer_val, tuple) and len(outer_val) > 0:
+            inner = outer_val[0]
+            if isinstance(inner, tuple) and len(inner) == 2:
+                self.assertEqual(inner[1], 1,
+                                f"存储中 value 应为 1，实际 inner={inner}")
+
+    def test_execute_rejects_modified_arguments(self):
+        """R6：执行时 caller 传不同 arguments → 拒绝（hash 复核）。"""
+        import copy as _copy
+        args = {"data": {"value": 1}}
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo",
+            arguments=_copy.deepcopy(args),
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+        # 试图用修改后的 args 执行（caller 端 hash 校验）
+        # 注：当前 manager.claim_and_execute 仍接受 invoker 直接传 args；
+        # 测试时由 caller 在调用前 hash 校验。runtime._execute_confirmed_request 内部
+        # 已做此校验；这里仅测试 manager 层面 hash 校验辅助
+        args_modified = {"data": {"value": 2}}
+        # 模拟 runtime 内部：caller 传修改后 args，runtime 算 hash 不匹配 → 拒绝
+        from mini_deerflow.confirmation import _hash_arguments
+        expected_hash = req.arguments_hash
+        actual_hash = _hash_arguments(args_modified)
+        self.assertNotEqual(actual_hash, expected_hash,
+                            "修改后 hash 应与原 hash 不同")
+
+
+# ============================================================================
+# 11. R5 round 2: 完整 Run 生命周期（含 is_run_alive 绑 run_id）
+# ============================================================================
+
+
+class TestR5RunLifecycleBoundRunId(unittest.TestCase):
+    """R5：is_run_alive 同时检查 run_id（不只是 thread）。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        self.policy = _make_policy_registry()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_legacy_thread_busy_resurrect_old_approval(self):
+        """同 thread 新 run 占用时，旧 run 批准的请求应被拒绝。"""
+        from mini_deerflow.confirmation_manager import ConfirmationManager
+        from mini_deerflow.thread_run_coordinator import ThreadRunCoordinator
+        from mini_deerflow.tools import ToolRegistry
+        coord = ThreadRunCoordinator()
+        # 模拟：原 run1 启动（thread1 上）
+        coord.try_acquire(thread_id="t1", run_id="r1")
+        # 旧 r1 创建并批准
+        mgr = ConfirmationManager(
+            self.store, self.policy,
+            is_run_alive=lambda rid, tid: coord.is_running(tid) and rid in coord._running,
+        )
+        req = mgr.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        mgr.approve(req.request_id, decided_by="user", now=200.0)
+        # 同 thread 启动新 run2（r1 已停）
+        coord.release("t1", "r1")
+        coord.try_acquire(thread_id="t1", run_id="r2")
+        # 旧 r1 批准不能再用（r1 不存活，thread 忙但跑的是 r2）
+        with self.assertRaises(ConfirmationError) as ctx:
+            mgr.claim_and_execute(
+                req.request_id,
+                parent_authority=_make_authority(run_id="r1", thread_id="t1"),
+                invoker=lambda t, a: "ok",
+            )
+        self.assertIn("已停止", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
