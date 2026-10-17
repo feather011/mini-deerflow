@@ -432,10 +432,14 @@ class RuntimeContext:
         # - _runtime_cancellation_tokens: run_id -> CancellationToken（由运行入口注入）
         # - _cancelled_runs: 被 stop()/失败 标记的 run_id 集合（由 stop/failure 维护）
         # - _confirmation_waiters: request_id -> _ConfirmationWaiter（Agent CONFIRM 时挂起）
+        # R1 round 5：终态持久化 _terminal_outcomes。signal 即使 waiter 未注册也保存
+        # 结果；waiter 注册时先消费已有终态再阻塞。避免信号丢失（pending 发布后
+        # wait 注册前 execute 完成的信号；deny/cancel/expire 触发的状态变更）。
         self._active_run_authorities: dict[str, RunAuthority] = {}
         self._runtime_cancellation_tokens: dict[str, CancellationToken] = {}
         self._cancelled_runs: set[str] = set()
         self._confirmation_waiters: dict[str, _ConfirmationWaiter] = {}
+        self._terminal_outcomes: dict[str, dict[str, Any]] = {}
         # 注册时 lock；不锁整个表，只锁单 waiter 注册动作
         self._waiter_lock = Lock()
 
@@ -490,14 +494,24 @@ class RuntimeContext:
         ttl_seconds: float,
         cancellation_token: CancellationToken | None,
     ) -> dict[str, Any]:
-        """R1 round 4：Agent CONFIRM 时挂起等待 API 决议。
+        """R1 round 5：Agent CONFIRM 时挂起等待 API 决议。
 
         返回 slot 字典（outcome / result / error）。
         - 等待期间 cancellation_token 置位或 run 取消 → outcome="cancelled"
         - TTL 到期且无决议 → outcome="expired"
         - API execute 成功 → outcome="executed", result=工具结果
-        - API deny → outcome="denied"
+        - API deny / cancel / 早到 execute 失败 → outcome="denied" / "failed"
+
+        R1 round 5 修复：
+        - 注册前先消费已存在的终态（避免 wait 晚于 signal 时的信号丢失）
+        - 等待循环每次 poll 都重读 _terminal_outcomes（覆盖 signal 跨周期发布）
+        - 已有终态直接返回，不进入阻塞
         """
+        # 1. 快速路径：注册前检查已有终态
+        existing = self._terminal_outcomes.get(request_id)
+        if existing is not None:
+            return dict(existing)
+
         waiter = _ConfirmationWaiter(
             request_id=request_id,
             run_id=run_id,
@@ -505,6 +519,10 @@ class RuntimeContext:
             tool_name=tool_name,
         )
         with self._waiter_lock:
+            # 持锁重读：避免与 signal 的写竞争
+            existing = self._terminal_outcomes.get(request_id)
+            if existing is not None:
+                return dict(existing)
             self._confirmation_waiters[request_id] = waiter
         try:
             deadline = ttl_seconds if ttl_seconds > 0 else 300.0
@@ -520,6 +538,11 @@ class RuntimeContext:
                 if run_id in self._cancelled_runs:
                     waiter.slot.setdefault("outcome", "cancelled")
                     waiter.slot.setdefault("error", "run cancelled")
+                    break
+                # R1 round 5：重读终态，跨周期 signal 也能拾取
+                term = self._terminal_outcomes.get(request_id)
+                if term is not None:
+                    waiter.slot.update(term)
                     break
                 if waiter.event.wait(timeout=poll):
                     break
@@ -541,17 +564,24 @@ class RuntimeContext:
         result: str | None = None,
         error: str | None = None,
     ) -> None:
-        """R1 round 4：API 决议 / 执行完成后唤醒等待的 Agent。"""
-        with self._waiter_lock:
-            waiter = self._confirmation_waiters.get(request_id)
-        if waiter is None:
-            return
-        waiter.slot["outcome"] = outcome
+        """R1 round 5：API 决议 / 执行完成后唤醒等待的 Agent。
+
+        - 始终保存终态到 _terminal_outcomes（即使 waiter 尚未注册也不丢信号）
+        - 唤醒已注册的 waiter
+        """
+        slot: dict[str, Any] = {"outcome": outcome}
         if result is not None:
-            waiter.slot["result"] = result
+            slot["result"] = result
         if error is not None:
-            waiter.slot["error"] = error
-        waiter.event.set()
+            slot["error"] = error
+        with self._waiter_lock:
+            # 1. 始终落盘终态（持久信号）
+            self._terminal_outcomes[request_id] = slot
+            # 2. 唤醒已注册的 waiter
+            waiter = self._confirmation_waiters.get(request_id)
+        if waiter is not None:
+            waiter.slot.update(slot)
+            waiter.event.set()
 
     def shutdown(self) -> None:
         """关闭所有资源；幂等，重复调用安全。
@@ -1078,6 +1108,12 @@ def create_runtime(
         req = confirmation_store.get(request_id)
         if req is None:
             raise ConfirmationError(f"未知确认请求: {request_id}")
+        # R6 round 5：tool_name 必须与请求绑定一致——错工具 409 + 不消费批准
+        # 防止 caller 用同 run/thread/args 但换工具名消费原批准。
+        if req.tool_name != tool_name:
+            raise ConfirmationError(
+                f"tool_name 不匹配：请求绑定 {req.tool_name!r}，调用提供 {tool_name!r}"
+            )
         # R6 round 4：run/thread 严格匹配，伪造绑定直接拒绝
         if req.run_id != run_id:
             raise ConfirmationError(
@@ -1108,21 +1144,42 @@ def create_runtime(
             )
 
         captured_result: list[str] = []
+        captured_error: list[str] = []
 
         def _invoker(name: str, args: dict) -> str:
-            # handler 必须返回的 JSON 解析后才算"成功"
-            # 现有工具返回 JSON 字符串（_ok / _error 工厂）；按工具结果契约判成功/失败/unknown
+            # R1 round 5：handler 异常时返回明确错误（不空串），同时记录异常信息
+            # 由外部 signal_confirmation 把 outcome 标为 "failed" 喂回模型。
             tool = registry.get(name)
             if tool is None:
                 raise ValueError(f"工具未注册: {name}")
             from mini_deerflow.middleware import ExecutionContext as _EC
             # 使用父 RunAuthority 实际授予的能力（不可伪造）
+            # R5 round 5：透传可信 run 的真实 CancellationToken，让长任务可被原 stop 入口取消
+            parent_token = runtime._runtime_cancellation_tokens.get(run_id)
             ctx = _EC(
                 run_id=run_id,
                 thread_id=thread_id,
                 granted_capabilities=parent_authority.granted_capabilities,
+                cancellation_token=parent_token,
             )
-            result_str = tool.execute(args, context=ctx)
+            try:
+                result_str = tool.execute(args, context=ctx)
+            except Exception as exc:
+                # 真实错误回传：模型应收到明确失败信息
+                err_str = f"{type(exc).__name__}: {exc}"
+                captured_error.append(err_str)
+                captured_result.append("")
+                # 仍向上抛，让 confirmation_manager.claim_and_execute 持久化 error
+                # 但本函数返回的 JSON 字符串被 confirmation_manager 写回
+                # execution_result 时不会用；真正喂给模型的是 signal_confirmation 的 slot
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"tool_invoke_failed: {err_str}",
+                        "unknown": True,
+                    },
+                    ensure_ascii=False,
+                )
             captured_result.append(result_str)
             # 按工具结果契约判别
             if not result_str:
@@ -1140,23 +1197,50 @@ def create_runtime(
             invoker=_invoker,
         )
 
-        # R1 round 4：执行完成后唤醒 Agent 的等待
-        # - 状态 EXECUTED → outcome="executed" + 工具结果
+        # R1 round 5：执行完成后唤醒 Agent 的等待
+        # - 状态 EXECUTED + 无错误 → outcome="executed" + 工具结果
+        # - 状态 EXECUTED + handler 抛错 → outcome="failed" + 真实错误信息
         # - 其他失败/拒绝 → outcome="failed" + 错误描述
         try:
-            if result_req.state.value == "executed":
-                runtime.signal_confirmation(
-                    request_id,
-                    outcome="executed",
-                    result=captured_result[0] if captured_result else "",
-                )
+            err_field = getattr(result_req, "execution_result", None) or ""
+            handler_threw = bool(captured_error)
+            if result_req.state.value == "executed" and not handler_threw and not err_field.startswith("error"):
+                # 真实工具结果回灌
+                result_payload = captured_result[0] if captured_result else ""
+                if not result_payload:
+                    # 防御：handler 成功但 result 为空 → 标 failed 避免空内容冒充
+                    runtime.signal_confirmation(
+                        request_id,
+                        outcome="failed",
+                        error="empty handler result",
+                    )
+                else:
+                    runtime.signal_confirmation(
+                        request_id,
+                        outcome="executed",
+                        result=result_payload,
+                    )
             else:
-                # claim_and_execute 拒绝时（如权限降级）也唤醒，但告知失败
-                err = result_req.denial_reason or "claim rejected"
+                # 失败路径：合并 handler 异常 / 持久化 execution_result / 拒绝原因
+                err_msg = (
+                    (captured_error[0] if captured_error else None)
+                    or (err_field if err_field else None)
+                    or (result_req.denial_reason or "claim rejected")
+                )
+                # 模型收到 failed 的合成错误 JSON，便于继续推进而不是挂死
+                failed_result = json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"confirmation_failed: {err_msg}",
+                        "unknown": True,
+                    },
+                    ensure_ascii=False,
+                )
                 runtime.signal_confirmation(
                     request_id,
                     outcome="failed",
-                    error=err,
+                    result=failed_result,
+                    error=str(err_msg),
                 )
         except Exception:
             # 信号失败不应影响主流程

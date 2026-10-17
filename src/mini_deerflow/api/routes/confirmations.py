@@ -194,6 +194,16 @@ def deny_confirmation(
         req = manager.deny(request_id, decided_by=body.decided_by)
     except Exception as e:
         raise HTTPException(status_code=409, detail=str(e))
+    # R1 round 5：deny 也要唤醒 Agent 的等待
+    if hasattr(runtime, "signal_confirmation"):
+        try:
+            runtime.signal_confirmation(
+                request_id,
+                outcome="denied",
+                error=f"denied by {body.decided_by}",
+            )
+        except Exception:
+            pass
     return _to_info(req)
 
 
@@ -211,6 +221,16 @@ def cancel_confirmation(
         req = manager.cancel(request_id, decided_by=body.decided_by)
     except Exception as e:
         raise HTTPException(status_code=409, detail=str(e))
+    # R1 round 5：cancel 也要唤醒 Agent 的等待
+    if hasattr(runtime, "signal_confirmation"):
+        try:
+            runtime.signal_confirmation(
+                request_id,
+                outcome="cancelled",
+                error=f"cancelled by {body.decided_by}",
+            )
+        except Exception:
+            pass
     return _to_info(req)
 
 

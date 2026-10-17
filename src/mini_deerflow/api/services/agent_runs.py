@@ -219,15 +219,31 @@ class AgentRunService:
         # 在 run 启动时把 RunAuthority + CancellationToken 注入到 runtime，
         # 供 execute 端作为可信父权限的查找来源；失败/cancel 路径 unregister。
         # 没有 self._runtime 时（测试或独立调用）静默跳过——执行端会因找不到 authority 拒绝。
-        # 默认授予基础能力，与 Agent 默认 session 能力一致。
+        # R6 round 5：按 thread 是否属项目会话选择能力集——与 agent.py 同一规则，
+        # 不能从待执行工具反推或自授能力。普通会话：基础三项；
+        # 项目会话：基础三项 + PROJECT_READ + PROJECT_EXEC_DELEGATE。
         if getattr(self, "_runtime", None) is not None:
             try:
                 from mini_deerflow.tool_contracts import ToolCapability
-                default_caps = frozenset({
-                    ToolCapability.COMPUTE,
-                    ToolCapability.SESSION_HISTORY_READ,
-                    ToolCapability.SESSION_STATE_WRITE,
-                })
+                try:
+                    _thread = self._store.get(thread_id)  # type: ignore[union-attr]
+                    is_project = bool(getattr(_thread, "project_id", None))
+                except Exception:
+                    is_project = False
+                if is_project:
+                    default_caps = frozenset({
+                        ToolCapability.COMPUTE,
+                        ToolCapability.SESSION_HISTORY_READ,
+                        ToolCapability.SESSION_STATE_WRITE,
+                        ToolCapability.PROJECT_READ,
+                        ToolCapability.PROJECT_EXEC_DELEGATE,
+                    })
+                else:
+                    default_caps = frozenset({
+                        ToolCapability.COMPUTE,
+                        ToolCapability.SESSION_HISTORY_READ,
+                        ToolCapability.SESSION_STATE_WRITE,
+                    })
             except Exception:
                 default_caps = frozenset()
             try:

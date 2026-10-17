@@ -1424,5 +1424,831 @@ class TestR1R5R6EndToEndCreateRuntime(unittest.TestCase):
         t.join(timeout=5)
 
 
+# ============================================================================
+# R1/R5/R6 round 5：终态通知、信号丢失修复、真实 CancellationToken 透传、
+# tool_name 校验、项目会话能力一致。
+# ============================================================================
+
+
+def _make_simple_runtime(temp_dir, handler_calls, project_id=None):
+    """构造一个最小可用的 RuntimeContext，含 _terminal_outcomes / wait / signal。
+
+    返回 (runtime, store, agent_runs_service, registry) 以便测试在已有
+    _execute_confirmed_request 之外独立验证路由层和 runtime 信号。
+    """
+    from mini_deerflow.runtime import RuntimeContext, RuntimeConfig
+    from mini_deerflow.thread_store import InMemoryThreadStore
+    from mini_deerflow.tools import Tool, ToolRegistry
+    from mini_deerflow.confirmation_manager import ConfirmationManager as _CM
+    from mini_deerflow.api.services.agent_runs import AgentRunService
+    from mini_deerflow.middleware import CancellationToken
+    import os
+    # 关键：使用临时 store path 避免测试间残留 PENDING 数据
+    store_path = os.path.join(temp_dir, "confirmations.json")
+    os.environ["MINI_DEERFLOW_CONFIRMATION_STORE"] = store_path
+
+    store = InMemoryThreadStore()
+    if project_id is not None:
+        store.create("t-proj", project_id=project_id)
+    else:
+        store.create("t-proj")
+
+    registry = ToolRegistry()
+
+    def echo_handler(args, context=None):
+        handler_calls.append({
+            "args": dict(args or {}),
+            "ctx_cancellation_token": getattr(context, "cancellation_token", None) if context else None,
+            "ctx_run_id": getattr(context, "run_id", None) if context else None,
+        })
+        return "echo-result"
+
+    registry.register(Tool(
+        name="mcp__echo__echo",
+        description="echo",
+        parameters={"type": "object", "properties": {"m": {"type": "string"}}},
+        handler=echo_handler,
+        needs_context=True,
+    ))
+
+    # 第二个工具：用于 R6 错工具测试
+    def other_handler(args, context=None):
+        handler_calls.append({"name": "other", "args": dict(args or {})})
+        return "other-result"
+
+    registry.register(Tool(
+        name="mcp__other__do",
+        description="other",
+        parameters={"type": "object", "properties": {"m": {"type": "string"}}},
+        handler=other_handler,
+        needs_context=True,
+    ))
+
+    config = RuntimeConfig(
+        workspace_root=str(temp_dir),
+        subagent_enabled=False,
+        trace_enabled=False,
+    )
+    runtime = create_runtime(
+        store=store,
+        registry=registry,
+        config=config,
+    )
+    # 给 echo 加 confirmation 策略
+    policy = runtime.agent._tool_policy_registry
+    policy.register_metadata(make_mcp_tool_metadata(
+        "mcp__echo__echo",
+        declared_capabilities=frozenset({"COMPUTE"}),
+    ))
+    policy.set_policy("mcp__echo__echo", ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    ))
+    policy.register_metadata(make_mcp_tool_metadata(
+        "mcp__other__do",
+        declared_capabilities=frozenset({"COMPUTE"}),
+    ))
+    policy.set_policy("mcp__other__do", ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    ))
+    return runtime, store
+
+
+def create_runtime(store, registry, config):
+    """代理 create_runtime，便于 helper 局部引用。"""
+    from mini_deerflow.runtime import create_runtime as _create
+    return _create(store=store, registry=registry, config=config)
+
+
+class TestR1TerminalOutcomePersistence(unittest.TestCase):
+    """R1 round 5：终态在 _terminal_outcomes 持久化，避免信号丢失。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.handler_calls: list[dict] = []
+        self.runtime, self.store = _make_simple_runtime(
+            self.temp_dir.name, self.handler_calls
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_signal_without_waiter_persists(self):
+        """signal 在 waiter 还没注册时调用 → 终态落盘，waiter 后续注册可消费。"""
+        from mini_deerflow.middleware import CancellationToken
+
+        req = self.runtime.confirmation_manager.create(
+            run_id="r1", thread_id="t-proj", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo",
+            arguments={"m": "hi"}, ttl_seconds=60.0,
+        )
+        # 先 signal（waiter 尚未注册）
+        self.runtime.signal_confirmation(
+            req.request_id, outcome="denied", error="denied-by-test",
+        )
+        # 验证 _terminal_outcomes 已落盘
+        self.assertIn(req.request_id, self.runtime._terminal_outcomes,
+                     "R1 round 5: signal 即使 waiter 缺席也应持久化终态")
+        # 再调用 wait：直接消费已有终态
+        slot = self.runtime.wait_for_confirmation(
+            request_id=req.request_id,
+            run_id="r1", thread_id="t-proj",
+            tool_name="mcp__echo__echo", ttl_seconds=5.0,
+            cancellation_token=CancellationToken(),
+        )
+        self.assertEqual(slot.get("outcome"), "denied",
+                       f"R1 round 5: wait 应立即消费已存终态，实际 {slot}")
+
+    def test_deny_route_wakes_waiter(self):
+        """R1 round 5：API deny 路由唤醒 Agent 的 waiter。"""
+        from fastapi.testclient import TestClient
+        from mini_deerflow.api.app import create_app
+        from mini_deerflow.api.config import ApiSettings
+        from mini_deerflow.api.dependencies import get_runtime
+        from mini_deerflow.middleware import CancellationToken
+
+        req = self.runtime.confirmation_manager.create(
+            run_id="r1", thread_id="t-proj", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo",
+            arguments={"m": "hi"}, ttl_seconds=60.0,
+        )
+
+        settings = ApiSettings()
+        app = create_app(settings=settings)
+        app.dependency_overrides[get_runtime] = lambda: self.runtime
+        client = TestClient(app)
+
+        # 后台线程启动 wait_for_confirmation
+        result: dict[str, Any] = {}
+        def waker():
+            slot = self.runtime.wait_for_confirmation(
+                request_id=req.request_id,
+                run_id="r1", thread_id="t-proj",
+                tool_name="mcp__echo__echo", ttl_seconds=5.0,
+                cancellation_token=CancellationToken(),
+            )
+            result["slot"] = slot
+
+        t = threading.Thread(target=waker, daemon=True)
+        t.start()
+        time.sleep(0.1)  # 让 waiter 注册
+
+        # API 拒决
+        resp = client.post(
+            f"{settings.api_prefix}/confirmations/{req.request_id}/deny",
+            json={"decided_by": "tester"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        t.join(timeout=3)
+        self.assertIn("slot", result, "R1: wait 线程应在 deny 后结束")
+        slot = result.get("slot", {})
+        self.assertEqual(slot.get("outcome"), "denied",
+                       f"R1 round 5: deny 应唤醒 waiter；实际 {slot}")
+        # handler 未调用
+        self.assertEqual(len(self.handler_calls), 0,
+                       "R1: deny 不应触发 handler")
+
+    def test_cancel_route_wakes_waiter(self):
+        """R1 round 5：API cancel 路由唤醒 Agent 的 waiter。"""
+        from fastapi.testclient import TestClient
+        from mini_deerflow.api.app import create_app
+        from mini_deerflow.api.config import ApiSettings
+        from mini_deerflow.api.dependencies import get_runtime
+        from mini_deerflow.middleware import CancellationToken
+
+        req = self.runtime.confirmation_manager.create(
+            run_id="r1", thread_id="t-proj", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo",
+            arguments={"m": "hi"}, ttl_seconds=60.0,
+        )
+
+        settings = ApiSettings()
+        app = create_app(settings=settings)
+        app.dependency_overrides[get_runtime] = lambda: self.runtime
+        client = TestClient(app)
+
+        result: dict[str, Any] = {}
+        def waker():
+            slot = self.runtime.wait_for_confirmation(
+                request_id=req.request_id,
+                run_id="r1", thread_id="t-proj",
+                tool_name="mcp__echo__echo", ttl_seconds=5.0,
+                cancellation_token=CancellationToken(),
+            )
+            result["slot"] = slot
+
+        t = threading.Thread(target=waker, daemon=True)
+        t.start()
+        time.sleep(0.1)
+
+        resp = client.post(
+            f"{settings.api_prefix}/confirmations/{req.request_id}/cancel",
+            json={"decided_by": "tester"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        t.join(timeout=3)
+        slot = result.get("slot", {})
+        self.assertEqual(slot.get("outcome"), "cancelled",
+                       f"R1 round 5: cancel 应唤醒 waiter；实际 {slot}")
+
+    def test_early_execute_signal_not_lost(self):
+        """R1 round 5：pending 发布后、waiter 注册前 execute 完成的信号不丢失。
+
+        场景：
+        - 创建一个 pending（waiter 还没注册）
+        - 立即 signal_confirmation（模拟 execute 完成在 waiter 之前）
+        - 之后才调用 wait_for_confirmation
+        - wait 应立即返回已存的 executed 结果（不阻塞、不超时）
+        """
+        from mini_deerflow.middleware import CancellationToken
+
+        req = self.runtime.confirmation_manager.create(
+            run_id="r1", thread_id="t-proj", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo",
+            arguments={"m": "early"}, ttl_seconds=60.0,
+        )
+        # 先 signal（waiter 还没注册）
+        self.runtime.signal_confirmation(
+            req.request_id, outcome="executed", result="early-result",
+        )
+        # 之后 wait：应立即返回
+        start = time.time()
+        slot = self.runtime.wait_for_confirmation(
+            request_id=req.request_id,
+            run_id="r1", thread_id="t-proj",
+            tool_name="mcp__echo__echo", ttl_seconds=2.0,
+            cancellation_token=CancellationToken(),
+        )
+        elapsed = time.time() - start
+        self.assertEqual(slot.get("outcome"), "executed",
+                       f"R1 round 5: 早到 signal 应被消费，实际 {slot}")
+        self.assertEqual(slot.get("result"), "early-result")
+        self.assertLess(elapsed, 0.5,
+                       f"R1: wait 应立即返回，不应阻塞；实际等了 {elapsed:.2f}s")
+
+    def test_handler_exception_feeds_clear_error(self):
+        """R1 round 5：handler 抛 ValueError → 模型收到明确错误（非空串）。"""
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+        from mini_deerflow.tools import Tool
+
+        # 替换 echo handler 为抛错版本
+        def bad_handler(args, context=None):
+            self.handler_calls.append({"args": dict(args or {}), "threw": True})
+            raise ValueError("intentional failure")
+
+        bad_tool = Tool(
+            name="mcp__echo__echo",
+            description="echo",
+            parameters={"type": "object", "properties": {"m": {"type": "string"}}},
+            handler=bad_handler,
+        )
+        # 替换 registry 中的 handler
+        self.runtime.agent._registry._tools["mcp__echo__echo"] = bad_tool
+
+        real_run_id = "test-round5-fail"
+        token = CancellationToken()
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "x"}),
+            FinalAnswer(content="recovered"),
+        ]
+        # 直接给 agent 注入 scripted model
+        from tests.test_confirmation_lifecycle import _ScriptedModel
+        self.runtime.agent._model = _ScriptedModel(decisions)
+        self.runtime.integrated_agent._agent._model = self.runtime.agent._model
+
+        result_holder: dict[str, Any] = {}
+        def run_in_thread():
+            try:
+                result = self.runtime.agent_run_service.run(
+                    "t-proj", "echo x",
+                    run_id=real_run_id, cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        # 等 pending
+        deadline = time.time() + 5.0
+        pending = None
+        while time.time() < deadline:
+            reqs = [r for r in self.runtime.confirmation_store.all()
+                    if r.run_id == real_run_id and r.state == ConfirmationState.PENDING]
+            if reqs:
+                pending = reqs[0]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(pending, "R1: pending 应出现")
+
+        # 批准 + 执行
+        self.runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 10,
+        )
+        result_req = self.runtime.execute_confirmed_request(
+            request_id=pending.request_id,
+            run_id=real_run_id,
+            thread_id="t-proj",
+            tool_name="mcp__echo__echo",
+            arguments=dict(pending.arguments),
+        )
+        self.assertEqual(result_req.state.value, "executed",
+                        f"R1: handler 抛错后仍应标 executed（持久化），实际 {result_req.state.value}")
+        self.assertTrue(
+            (result_req.execution_result or "").startswith("error"),
+            f"R1: execution_result 应标 error:ValueError，实际 {result_req.execution_result!r}",
+        )
+
+        t.join(timeout=10)
+        # Agent 收到了 failed 的合成错误结果，最终能返回 FinalAnswer
+        self.assertNotIn("error", result_holder,
+                        f"R1: Agent 应能处理 handler 异常并恢复，实际异常: {result_holder.get('error')}")
+
+
+class TestR5RealCancellationTokenPropagation(unittest.TestCase):
+    """R5 round 5：ExecutionContext 透传真实 CancellationToken。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.handler_calls: list[dict] = []
+        self.runtime, self.store = _make_simple_runtime(
+            self.temp_dir.name, self.handler_calls
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_execute_passes_real_token_to_handler(self):
+        """执行时 handler 收到的 ctx.cancellation_token 必须是 run 的真实 token。"""
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+
+        real_run_id = "test-token-prop"
+        token = CancellationToken()
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "x"}),
+            FinalAnswer(content="ok"),
+        ]
+        from tests.test_confirmation_lifecycle import _ScriptedModel
+        self.runtime.agent._model = _ScriptedModel(decisions)
+        self.runtime.integrated_agent._agent._model = self.runtime.agent._model
+
+        result_holder: dict[str, Any] = {}
+        def run_in_thread():
+            try:
+                result = self.runtime.agent_run_service.run(
+                    "t-proj", "echo x",
+                    run_id=real_run_id, cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        deadline = time.time() + 5.0
+        pending = None
+        while time.time() < deadline:
+            reqs = [r for r in self.runtime.confirmation_store.all()
+                    if r.run_id == real_run_id and r.state == ConfirmationState.PENDING]
+            if reqs:
+                pending = reqs[0]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(pending)
+
+        self.runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 10,
+        )
+        self.runtime.execute_confirmed_request(
+            request_id=pending.request_id,
+            run_id=real_run_id,
+            thread_id="t-proj",
+            tool_name="mcp__echo__echo",
+            arguments=dict(pending.arguments),
+        )
+
+        t.join(timeout=10)
+        # 关键断言：handler 收到的 token 与 run 入口的 token 是同一对象
+        self.assertEqual(len(self.handler_calls), 1,
+                        f"R5: handler 应被调用 1 次，实际 {len(self.handler_calls)}")
+        captured_token = self.handler_calls[0].get("ctx_cancellation_token")
+        self.assertIsNotNone(captured_token,
+                           "R5 round 5: handler 收到的 ctx.cancellation_token 不应为 None")
+        self.assertIs(captured_token, token,
+                     "R5 round 5: handler 收到的 cancellation_token 应与 run 入口的 token 同一对象")
+        self.assertEqual(self.handler_calls[0].get("ctx_run_id"), real_run_id,
+                       "R5: ctx.run_id 应与 run 入口一致")
+
+    def test_long_running_handler_cancelled_by_original_stop(self):
+        """R5 round 5：长任务 handler 在 run 入口 token 取消时收到 cancel 信号。
+
+        模拟：
+        - 注册可取消本地长 handler（不调真实 Provider）
+        - 通过 AgentRunService 启动 run（注册真实 token）
+        - approve + execute_confirmed_request
+        - 触发 token.cancel()（原 stop 入口）
+        - handler 在合理时间内收到 cancel
+        """
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+
+        cancel_received: dict[str, bool] = {}
+        long_handler_done: dict[str, bool] = {}
+
+        # 替换 echo 为长 handler：每 0.05s 检查 token
+        from mini_deerflow.tools import Tool
+        def long_handler(args, context=None):
+            self.handler_calls.append({
+                "args": dict(args or {}),
+                "ctx_cancellation_token": getattr(context, "cancellation_token", None) if context else None,
+            })
+            token_obj = getattr(context, "cancellation_token", None) if context else None
+            # 模拟长任务：最多等 5s，每 0.05s 检查 cancel
+            for _ in range(100):
+                if token_obj is not None and token_obj.is_cancelled():
+                    cancel_received["yes"] = True
+                    raise RuntimeError("cancelled by token")
+                time.sleep(0.05)
+            long_handler_done["yes"] = True
+            return "long-done"
+
+        self.runtime.agent._registry._tools["mcp__echo__echo"] = Tool(
+            name="mcp__echo__echo",
+            description="echo",
+            parameters={"type": "object", "properties": {"m": {"type": "string"}}},
+            handler=long_handler,
+            needs_context=True,
+        )
+
+        real_run_id = "test-long-cancel"
+        token = CancellationToken()
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "x"}),
+            FinalAnswer(content="bye"),
+        ]
+        from tests.test_confirmation_lifecycle import _ScriptedModel
+        self.runtime.agent._model = _ScriptedModel(decisions)
+        self.runtime.integrated_agent._agent._model = self.runtime.agent._model
+
+        result_holder: dict[str, Any] = {}
+        def run_in_thread():
+            try:
+                result = self.runtime.agent_run_service.run(
+                    "t-proj", "echo x",
+                    run_id=real_run_id, cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        # 等 pending
+        deadline = time.time() + 5.0
+        pending = None
+        while time.time() < deadline:
+            reqs = [r for r in self.runtime.confirmation_store.all()
+                    if r.run_id == real_run_id and r.state == ConfirmationState.PENDING]
+            if reqs:
+                pending = reqs[0]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(pending, "R5: pending 应出现")
+
+        # 批准（用 future now 避免过期）
+        self.runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 60,
+        )
+
+        # 在后台执行 execute_confirmed_request（不阻塞测试）
+        exec_result: dict[str, Any] = {}
+        def do_execute():
+            try:
+                result_req = self.runtime.execute_confirmed_request(
+                    request_id=pending.request_id,
+                    run_id=real_run_id,
+                    thread_id="t-proj",
+                    tool_name="mcp__echo__echo",
+                    arguments=dict(pending.arguments),
+                )
+                exec_result["req"] = result_req
+            except Exception as e:
+                exec_result["error"] = e
+        exec_thread = threading.Thread(target=do_execute, daemon=True)
+        exec_thread.start()
+
+        # 等 handler 进入
+        time.sleep(0.3)
+        # 触发原 stop 入口
+        token.cancel()
+
+        exec_thread.join(timeout=10)
+        t.join(timeout=10)
+
+        # 关键：handler 收到 cancel 信号
+        self.assertTrue(cancel_received.get("yes", False),
+                       f"R5 round 5: 长 handler 应在原 stop 入口取消时收到 cancel，实际 {cancel_received}")
+        self.assertNotIn("yes", long_handler_done,
+                       "R5: handler 不应完整跑完（应被取消）")
+
+
+class TestR6ToolNameAndProjectCaps(unittest.TestCase):
+    """R6 round 5：tool_name 校验 + 项目会话能力一致。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.handler_calls: list[dict] = []
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_wrong_tool_name_rejected_no_handler(self):
+        """错工具名 → 409 拒绝 + handler 未被调用。"""
+        runtime, _ = _make_simple_runtime(
+            self.temp_dir.name, self.handler_calls,
+        )
+        req = runtime.confirmation_manager.create(
+            run_id="r1", thread_id="t-proj", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo",
+            arguments={"m": "x"}, ttl_seconds=60.0,
+        )
+        runtime.confirmation_manager.approve(
+            req.request_id, decided_by="tester", now=time.time() + 10,
+        )
+        # 直接用 mcp__other__do 但请求绑 mcp__echo__echo
+        with self.assertRaises(ConfirmationError) as ctx:
+            runtime.execute_confirmed_request(
+                request_id=req.request_id,
+                run_id="r1", thread_id="t-proj",
+                tool_name="mcp__other__do",  # 错工具
+                arguments=dict(req.arguments),
+            )
+        self.assertIn("tool_name", str(ctx.exception).lower(),
+                     f"R6: 错工具应明确拒绝，实际 {ctx.exception}")
+        self.assertEqual(len(self.handler_calls), 0,
+                       "R6 round 5: 错工具不应触发任何 handler")
+
+    def test_wrong_tool_name_rejected_via_api(self):
+        """API 路径：错工具名 → 409 + handler 未被调用。"""
+        from fastapi.testclient import TestClient
+        from mini_deerflow.api.app import create_app
+        from mini_deerflow.api.config import ApiSettings
+        from mini_deerflow.api.dependencies import get_runtime
+
+        runtime, _ = _make_simple_runtime(
+            self.temp_dir.name, self.handler_calls,
+        )
+        req = runtime.confirmation_manager.create(
+            run_id="r1", thread_id="t-proj", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo",
+            arguments={"m": "x"}, ttl_seconds=60.0,
+        )
+        runtime.confirmation_manager.approve(
+            req.request_id, decided_by="tester", now=time.time() + 10,
+        )
+
+        settings = ApiSettings()
+        app = create_app(settings=settings)
+        app.dependency_overrides[get_runtime] = lambda: runtime
+        client = TestClient(app)
+
+        resp = client.post(
+            f"{settings.api_prefix}/confirmations/{req.request_id}/execute",
+            json={
+                "run_id": "r1", "thread_id": "t-proj",
+                "tool_name": "mcp__other__do",  # 错工具
+                "arguments": dict(req.arguments),
+            },
+        )
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertIn("tool_name", resp.text.lower(),
+                     f"R6: 错工具 API 应 409 拒绝，实际 {resp.text}")
+        self.assertEqual(len(self.handler_calls), 0,
+                       "R6: 错工具 API 路径不应触发 handler")
+
+    def test_project_thread_grants_project_caps(self):
+        """项目会话 → AgentRunService 注入的 authority 含 PROJECT_READ/EXEC_DELEGATE。"""
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.thread_store import InMemoryThreadStore
+
+        # 用 project thread
+        store = InMemoryThreadStore()
+        store.create("t-p", project_id="proj-1")
+        runtime, _ = _make_simple_runtime(
+            self.temp_dir.name, self.handler_calls, project_id="proj-1",
+        )
+        # 把 store 换为带 project 的（helper 已经在 store 中创建了 t-proj）
+        # 直接覆盖：使用 helper 中已创建的 store 替换
+        # helper 已经用 project_id="proj-1" 创建了 t-proj，runtime 已绑定
+        # 这里验证 authority 内容
+        # 模拟启动一个 run
+        from mini_deerflow.models import FinalAnswer, ToolCall
+        from tests.test_confirmation_lifecycle import _ScriptedModel
+        # 不需要 scripted model 走到 tool call；只验证 authority 注入
+        # 直接调 register_run 用 AgentRunService 的同一逻辑不可见。
+        # 改用：构造一个集成调用，让 service 启动即停
+        decisions = [
+            FinalAnswer(content="bye"),
+        ]
+        runtime.agent._model = _ScriptedModel(decisions)
+        runtime.integrated_agent._agent._model = runtime.agent._model
+
+        token = CancellationToken()
+        # 直接 register_run 验证能力集生成逻辑（在 agent_runs.py 的 run 方法里）
+        # 我们在 helper 改 store 之前已经注入了 service，所以应能用 service 启动 run
+        result_holder: dict[str, Any] = {}
+
+        def run_in_thread():
+            try:
+                # 用 service 启动 run（哪怕立刻 FinalAnswer）
+                result = runtime.agent_run_service.run(
+                    "t-proj", "hi",  # helper 已经把 t-proj 创成 project thread
+                    run_id="test-proj-caps", cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+        t.join(timeout=10)
+        # service 在 run 启动时 register_run，结束即清理——我们要捕获注册瞬间。
+        # 改法：直接调 service 的内部逻辑可能不便。改用手动 register_run
+        # 模拟其能力生成路径（agent_runs.py 同一规则）
+        # 这里改为：调用 _runtime 自身时检查 _active_run_authorities
+        # 因为 run 结束被 unregister 掉了。
+        # 改：另起一个 run，在 register 之后 sleep，再 approve
+        # 用 monkey-patch register_run 拦截
+        from mini_deerflow.tool_authorization import RunAuthority
+        from mini_deerflow.tool_contracts import ToolCapability, ExecutorPrincipal as _EP
+
+        captured: dict[str, RunAuthority] = {}
+        original = runtime.register_run
+        def spy_register_run(run_id, authority, token):
+            captured["authority"] = authority
+            return original(run_id, authority, token)
+        runtime.register_run = spy_register_run
+
+        token2 = CancellationToken()
+        decisions2 = [FinalAnswer(content="bye2")]
+        runtime.agent._model = _ScriptedModel(decisions2)
+        runtime.integrated_agent._agent._model = runtime.agent._model
+
+        t2 = threading.Thread(
+            target=lambda: runtime.agent_run_service.run(
+                "t-proj", "hi",
+                run_id="test-proj-caps-2", cancellation_token=token2,
+            ),
+            daemon=True,
+        )
+        t2.start()
+        t2.join(timeout=10)
+        self.assertIn("authority", captured,
+                     "R6: spy 应捕获到 authority")
+        auth = captured["authority"]
+        self.assertIn(ToolCapability.PROJECT_READ, auth.granted_capabilities,
+                     f"R6: 项目会话应授 PROJECT_READ，实际 {auth.granted_capabilities}")
+        self.assertIn(ToolCapability.PROJECT_EXEC_DELEGATE, auth.granted_capabilities,
+                     f"R6: 项目会话应授 PROJECT_EXEC_DELEGATE，实际 {auth.granted_capabilities}")
+
+    def test_project_thread_e2e_execute_with_project_caps(self):
+        """项目会话：AgentRunService 注入的 authority 含 PROJECT_READ/EXEC_DELEGATE
+        → 需 PROJECT_READ 能力的工具 confirm 成功执行。
+        """
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.thread_store import InMemoryThreadStore
+        from mini_deerflow.tools import Tool, ToolRegistry
+        from mini_deerflow.runtime import RuntimeConfig
+        from mini_deerflow.tool_authorization import ToolPolicy
+        from mini_deerflow.tool_contracts import make_mcp_tool_metadata
+
+        # 项目 thread
+        proj_store = InMemoryThreadStore()
+        proj_store.create("t-proj-x", project_id="proj-x")
+        # 注册一个声明 PROJECT_READ 能力的工具
+        proj_calls: list[dict] = []
+        def proj_echo(args, context=None):
+            proj_calls.append({"args": dict(args or {}),
+                               "caps": getattr(context, "granted_capabilities", None)})
+            return "proj-ok"
+
+        proj_reg = ToolRegistry()
+        proj_reg.register(Tool(
+            name="mcp__proj__read",
+            description="read project",
+            parameters={"type": "object", "properties": {"m": {"type": "string"}}},
+            handler=proj_echo,
+            needs_context=True,
+        ))
+        # 用项目 thread + 该工具的 runtime
+        from mini_deerflow.runtime import create_runtime
+        with TemporaryDirectory() as td:
+            runtime = create_runtime(
+                store=proj_store, registry=proj_reg,
+                config=RuntimeConfig(workspace_root=td, subagent_enabled=False, trace_enabled=False),
+            )
+            p = runtime.agent._tool_policy_registry
+            p.register_metadata(make_mcp_tool_metadata(
+                "mcp__proj__read",
+                declared_capabilities=frozenset({"PROJECT_READ"}),
+            ))
+            p.set_policy("mcp__proj__read", ToolPolicy(
+                enabled=True,
+                allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+                requires_confirmation=True,
+            ))
+            # 关键：项目会话 — AgentRunService 启动 run 应注入含 PROJECT_READ 的 authority
+            # 我们直接通过 service 启动并捕获 authority
+            from mini_deerflow.models import FinalAnswer, ToolCall
+            from tests.test_confirmation_lifecycle import _ScriptedModel
+            decisions = [
+                ToolCall(id="c1", name="mcp__proj__read", arguments={"m": "x"}),
+                FinalAnswer(content="done"),
+            ]
+            runtime.agent._model = _ScriptedModel(decisions)
+            runtime.integrated_agent._agent._model = runtime.agent._model
+
+            real_run_id = "test-project-e2e"
+            token = CancellationToken()
+            captured_auth = {}
+            original_register = runtime.register_run
+            def spy(run_id, authority, ct):
+                captured_auth["auth"] = authority
+                return original_register(run_id, authority, ct)
+            runtime.register_run = spy
+
+            result_holder: dict[str, Any] = {}
+            def run_in_thread():
+                try:
+                    result = runtime.agent_run_service.run(
+                        "t-proj-x", "read",
+                        run_id=real_run_id, cancellation_token=token,
+                    )
+                    result_holder["result"] = result
+                except Exception as e:
+                    result_holder["error"] = e
+
+            t = threading.Thread(target=run_in_thread, daemon=True)
+            t.start()
+            # 等 pending 出现
+            deadline = time.time() + 5.0
+            pending = None
+            while time.time() < deadline:
+                reqs = [r for r in runtime.confirmation_store.all()
+                        if r.run_id == real_run_id and r.state == ConfirmationState.PENDING]
+                if reqs:
+                    pending = reqs[0]
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(pending, "R6: 项目会话 pending 应出现")
+
+            # 关键断言：authority 含 PROJECT_READ
+            self.assertIn("auth", captured_auth, "R6: 应捕获到 authority")
+            auth = captured_auth["auth"]
+            from mini_deerflow.tool_contracts import ToolCapability
+            self.assertIn(ToolCapability.PROJECT_READ, auth.granted_capabilities,
+                         f"R6: 项目会话 authority 应含 PROJECT_READ，实际 {auth.granted_capabilities}")
+
+            # 批准 + execute
+            runtime.confirmation_manager.approve(
+                pending.request_id, decided_by="tester", now=time.time() + 10,
+            )
+            try:
+                result_req = runtime.execute_confirmed_request(
+                    request_id=pending.request_id,
+                    run_id=real_run_id,
+                    thread_id="t-proj-x",
+                    tool_name="mcp__proj__read",
+                    arguments=dict(pending.arguments),
+                )
+            except ConfirmationError as e:
+                self.fail(f"R6 round 5: 项目会话正常 execute 应成功，不应 409：{e}")
+            self.assertEqual(result_req.state.value, "executed",
+                           f"R6: execute 应标 executed，实际 {result_req.state.value}")
+            self.assertEqual(len(proj_calls), 1,
+                           f"R6: handler 应调用 1 次，实际 {len(proj_calls)}")
+
+            t.join(timeout=10)
+            self.assertNotIn("error", result_holder,
+                           f"R6: Agent run 异常: {result_holder.get('error')}")
+            self.assertEqual(result_holder["result"].answer, "done")
+
+
 if __name__ == "__main__":
     unittest.main()
