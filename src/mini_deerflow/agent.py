@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Callable, Iterator, TypeVar
 
 from mini_deerflow.context_assembler import AssembledContext, ContextAssembler
@@ -418,8 +420,10 @@ class Agent:
                 ))
 
                 # Tool call：通过 middleware_pipeline 包装（含 budget 检查/记录）
+                # R1 round 4：tool_ctx.run_id 取 Agent.run 入口的 run_id，
+                # 保证确认请求绑定的 run_id 与 IntegratedAgent/AgentRunService 一致。
                 tool_ctx = ExecutionContext(
-                    run_id="",
+                    run_id=run_id or "",
                     thread_id=thread_id,
                     operation=OperationType.TOOL_CALL,
                     operation_name=decision.name,
@@ -467,9 +471,11 @@ class Agent:
                         if auth_decision.is_denied:
                             raise ToolAuthorizationError(auth_decision)
                         if auth_decision.is_confirm:
-                            # R1：若 runtime 提供 confirmation_manager，自动创建 pending 请求，
-                            # 把 request_id 注入决策的 metadata，外层 API 批准后调 execute_confirmed_request。
+                            # R1 round 4：使用真实 run_id 创建 pending，挂起等待 API 决议
+                            # - run_id 取自当前 ExecutionContext（与运行入口一致）
+                            # - 等待 outcome 决定返回真实工具结果或合成错误
                             cm = getattr(self, "_confirmation_manager", None)
+                            runtime_obj = getattr(self, "_runtime", None)
                             if cm is not None:
                                 from mini_deerflow.tool_contracts import (
                                     ExecutorPrincipal as _EP,
@@ -477,8 +483,17 @@ class Agent:
                                 principal = _EP[
                                     authority.principal.name
                                 ] if hasattr(authority.principal, "name") else authority.principal
+                                # R1 round 4：run_id 贯通——优先取 ExecutionContext
+                                # 的 run_id（与 IntegratedAgent.run 传入的一致），
+                                # 回退到 authority.run_id（per-tool-call 构造），
+                                # 最后才用 "main"（向后兼容）。
+                                real_run_id = (
+                                    getattr(_ctx, "run_id", None)
+                                    or authority.run_id
+                                    or "main"
+                                )
                                 pending = cm.create(
-                                    run_id=authority.run_id or "main",
+                                    run_id=real_run_id,
                                     thread_id=thread_id,
                                     project_id=thread.project_id,
                                     principal=principal,
@@ -490,6 +505,40 @@ class Agent:
                                     auth_decision.metadata["request_id"] = pending.request_id
                                 except Exception:
                                     pass
+                                # R1 round 4：runtime 提供 wait 接口时，
+                                # 在 Agent 线程中挂起等待 API 决议，
+                                # 而非直接 raise 结束本 run。
+                                if runtime_obj is not None and hasattr(
+                                    runtime_obj, "wait_for_confirmation"
+                                ):
+                                    remaining = max(
+                                        0.0,
+                                        pending.expires_at - time.time(),
+                                    )
+                                    slot = runtime_obj.wait_for_confirmation(
+                                        request_id=pending.request_id,
+                                        run_id=real_run_id,
+                                        thread_id=thread_id,
+                                        tool_name=_name,
+                                        ttl_seconds=remaining,
+                                        cancellation_token=getattr(
+                                            _ctx, "cancellation_token", None
+                                        ),
+                                    )
+                                    outcome = slot.get("outcome", "expired")
+                                    if outcome == "executed":
+                                        # 工具实际执行结果回灌到 working_messages，
+                                        # 让模型继续推进。
+                                        return slot.get("result") or ""
+                                    # 拒绝/过期/取消/失败：合成错误结果反馈给模型
+                                    err = slot.get("error", "confirmation " + outcome)
+                                    return json.dumps(
+                                        {
+                                            "ok": False,
+                                            "error": f"confirmation_{outcome}: {err}",
+                                            "unknown": True,
+                                        }
+                                    )
                             raise ToolAuthorizationError(auth_decision)
                         # 授权通过：记录已授予能力，供 handler（如 subagent_submit）读取并传递
                         _ctx.granted_capabilities = default_caps

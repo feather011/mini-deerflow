@@ -1099,5 +1099,330 @@ class TestR3StoreSerializationRound3(unittest.TestCase):
         self.assertEqual(len(handler_calls), 1)
 
 
+# ============================================================================
+# R1/R5/R6 round 4：原 create_runtime + AgentRunService 正路径 E2E
+# ============================================================================
+
+
+class _ScriptedModel:
+    """按预设序列返回决策。"""
+    def __init__(self, decisions):
+        from collections import deque
+        self._queue = deque(decisions)
+
+    def decide(self, messages, tools=None):
+        return self._queue.popleft()
+
+
+class TestR1R5R6EndToEndCreateRuntime(unittest.TestCase):
+    """R1/R5/R6 round 4：原 create_runtime + AgentRunService 正路径 E2E。
+
+    目标：
+    1. 启动真实 AgentRunService.run（run_id 由调用方提供并贯通全链路）
+    2. Agent 调用需要确认的工具 → pending 绑定的 run_id 是真实 run_id（不是 "main"）
+    3. 批准 + API execute → 真实 handler 调用一次
+    4. Agent 继续返回最终答案
+    5. Run 结束后 runtime._active_run_authorities 中该 run_id 已清理
+    """
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _build_runtime(self, handler_calls, decision_results):
+        """构造真实 create_runtime + 计数 handler + scripted model。
+
+        decision_results: 给 _ScriptedModel 的决策列表（ToolCall/FinalAnswer）。
+        """
+        from mini_deerflow.runtime import create_runtime, RuntimeConfig
+        from mini_deerflow.thread_store import InMemoryThreadStore
+        from mini_deerflow.tools import ToolRegistry
+        from mini_deerflow.tool_contracts import (
+            make_mcp_tool_metadata,
+            ToolPolicy,
+        )
+
+        store = InMemoryThreadStore()
+        store.create("t-e2e")
+        registry = ToolRegistry()
+
+        # 注册一个计数 handler
+        def echo_handler(args, context=None):
+            handler_calls.append({"args": dict(args or {}), "ctx": context})
+            return "echo-result"
+
+        registry.register(Tool(
+            name="mcp__echo__echo",
+            description="echo",
+            parameters={"type": "object", "properties": {"m": {"type": "string"}}},
+            handler=echo_handler,
+        ))
+
+        config = RuntimeConfig(
+            workspace_root=str(self.temp_dir.name),
+            subagent_enabled=False,
+            trace_enabled=False,
+        )
+        runtime = create_runtime(
+            store=store,
+            registry=registry,
+            config=config,
+        )
+        # 在 create_runtime 内部构造的 tool_policy_registry 上加策略：
+        # 该实例同时被 agent 和 confirmation_manager 引用，一改两生效。
+        policy_registry = runtime.agent._tool_policy_registry
+        policy_registry.register_metadata(make_mcp_tool_metadata(
+            "mcp__echo__echo",
+            declared_capabilities=frozenset({"COMPUTE"}),
+        ))
+        policy_registry.set_policy("mcp__echo__echo", ToolPolicy(
+            enabled=True,
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=True,
+        ))
+        # 注入 scripted model（避免真实模型）
+        runtime.agent._model = _ScriptedModel(decision_results)
+        runtime.integrated_agent._agent._model = runtime.agent._model
+        return runtime, store
+
+    def _wait_for_pending(self, runtime, run_id, timeout=5.0):
+        """等待 pending 出现并验证 run_id 绑定。"""
+        deadline = time.time() + timeout
+        all_reqs = []
+        while time.time() < deadline:
+            # 列出所有请求（仅 PENDING 状态）
+            all_reqs = runtime.confirmation_store.all()
+            pending = [r for r in all_reqs if r.state == ConfirmationState.PENDING]
+            if pending:
+                # 找到绑定目标 run_id 的 pending
+                matched = [r for r in pending if r.run_id == run_id]
+                if matched:
+                    return matched[0]
+            time.sleep(0.05)
+        # 超时：报错
+        states = [(r.request_id[:8], r.run_id, r.state.value) for r in all_reqs]
+        raise AssertionError(
+            f"等待 pending 超时（run_id={run_id}），已有请求: {states}"
+        )
+
+    def test_real_create_runtime_e2e(self):
+        """原 create_runtime + AgentRunService 正路径：pending 绑真 run_id + handler 真实计数 + Agent 继续。"""
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+
+        handler_calls: list[dict] = []
+        # Agent 第一次返回 tool call（要确认的 echo 工具），第二次返回最终答案
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "hi"}),
+            FinalAnswer(content="done"),
+        ]
+        runtime, store = self._build_runtime(handler_calls, decisions)
+
+        real_run_id = "test-real-run-001"
+        token = CancellationToken()
+
+        # 在后台线程中启动真实 AgentRunService.run
+        result_holder: dict[str, Any] = {}
+
+        def run_in_thread():
+            try:
+                # 用 service 而非直接 IntegratedAgent，触发 register_run 真实生产者
+                result = runtime.agent_run_service.run(
+                    "t-e2e",
+                    "echo hi",
+                    run_id=real_run_id,
+                    cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        # 等 pending 出现，并验证 run_id 绑定
+        try:
+            pending = self._wait_for_pending(runtime, real_run_id, timeout=5.0)
+        except Exception:
+            t.join(timeout=2)
+            raise
+
+        # 关键断言 1：pending.run_id == 真实 run_id（不是 "main"）
+        self.assertEqual(
+            pending.run_id, real_run_id,
+            f"R1: pending 绑定的 run_id 应是 {real_run_id}，实际 {pending.run_id!r}"
+        )
+
+        # 关键断言 2：authority 已注册
+        self.assertIn(real_run_id, runtime._active_run_authorities,
+                     "R6: RunAuthority 应由 AgentRunService 注入")
+        authority = runtime._active_run_authorities[real_run_id]
+        self.assertEqual(authority.run_id, real_run_id)
+        self.assertEqual(authority.thread_id, "t-e2e")
+        # 验证 granted_capabilities 是真实的能力集（不是空 frozenset）
+        self.assertGreater(len(authority.granted_capabilities), 0,
+                          "R6: 父权限应有真实授予能力")
+
+        # 关键断言 3：handler 在批准前未调用
+        self.assertEqual(len(handler_calls), 0,
+                        "R1: 批准前 handler 不应被调用")
+
+        # 批准
+        runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 10
+        )
+
+        # 执行（走真实 execute_confirmed_request）
+        runtime.execute_confirmed_request(
+            request_id=pending.request_id,
+            run_id=real_run_id,
+            thread_id="t-e2e",
+            tool_name=pending.tool_name,
+            arguments=dict(pending.arguments),
+        )
+
+        # 关键断言 4：handler 被调用 1 次
+        self.assertEqual(len(handler_calls), 1,
+                        f"R1: API execute 后 handler 应调用 1 次，实际 {len(handler_calls)}")
+
+        # 等 run 结束
+        t.join(timeout=10)
+        self.assertFalse(t.is_alive(), "Agent run 应在合理时间内完成")
+        self.assertNotIn("error", result_holder,
+                        f"Agent run 异常: {result_holder.get('error')}")
+        result = result_holder.get("result")
+        self.assertIsNotNone(result, "Agent run 应返回结果")
+        # Agent 应该返回最终答案 "done"
+        self.assertEqual(result.answer, "done",
+                        f"R1: Agent 应回灌最终答案，实际 {result.answer!r}")
+
+        # 关键断言 5：run 结束后 authority 已清理
+        self.assertNotIn(real_run_id, runtime._active_run_authorities,
+                        "R6: run 结束后 RunAuthority 应被清理")
+        # token 也应清理
+        self.assertNotIn(real_run_id, runtime._runtime_cancellation_tokens,
+                        "R5: run 结束后 CancellationToken 应被清理")
+
+    def test_e2e_forged_run_id_rejected(self):
+        """R6 round 4：伪造 run_id 绑定 → execute 端 409 拒绝。"""
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+
+        handler_calls: list[dict] = []
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "hi"}),
+            FinalAnswer(content="done"),
+        ]
+        runtime, _ = self._build_runtime(handler_calls, decisions)
+
+        real_run_id = "test-real-run-002"
+        token = CancellationToken()
+
+        result_holder: dict[str, Any] = {}
+
+        def run_in_thread():
+            try:
+                result = runtime.agent_run_service.run(
+                    "t-e2e",
+                    "echo hi",
+                    run_id=real_run_id,
+                    cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        pending = self._wait_for_pending(runtime, real_run_id, timeout=5.0)
+
+        # 批准
+        runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 10
+        )
+
+        # 尝试用伪造 run_id 执行
+        with self.assertRaises(ConfirmationError) as ctx:
+            runtime.execute_confirmed_request(
+                request_id=pending.request_id,
+                run_id="forged-run-id",  # 伪造
+                thread_id="t-e2e",
+                tool_name=pending.tool_name,
+                arguments=dict(pending.arguments),
+            )
+        self.assertIn("run_id", str(ctx.exception).lower(),
+                     f"应拒绝伪造 run_id，实际错误: {ctx.exception}")
+
+        # 关键：handler 未被调用
+        self.assertEqual(len(handler_calls), 0,
+                        "R6: 伪造绑定应阻止 handler 调用")
+
+        # 清理
+        token.cancel()
+        t.join(timeout=3)
+
+    def test_e2e_run_cancelled_blocks_execute(self):
+        """R5 round 4：原 stop() 取消后，execute 端被 409 拒绝。"""
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+
+        handler_calls: list[dict] = []
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "hi"}),
+            FinalAnswer(content="done"),
+        ]
+        runtime, _ = self._build_runtime(handler_calls, decisions)
+
+        real_run_id = "test-real-run-003"
+        token = CancellationToken()
+
+        result_holder: dict[str, Any] = {}
+
+        def run_in_thread():
+            try:
+                result = runtime.agent_run_service.run(
+                    "t-e2e",
+                    "echo hi",
+                    run_id=real_run_id,
+                    cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception:
+                result_holder["error"] = "cancelled or failed"
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        pending = self._wait_for_pending(runtime, real_run_id, timeout=5.0)
+
+        # 批准
+        runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 10
+        )
+
+        # 取消 run（模拟真实 stop 路径）
+        token.cancel()
+        # 等待取消生效
+        time.sleep(0.1)
+
+        # 尝试执行：应被 _is_run_alive 拒绝
+        with self.assertRaises(ConfirmationError) as ctx:
+            runtime.execute_confirmed_request(
+                request_id=pending.request_id,
+                run_id=real_run_id,
+                thread_id="t-e2e",
+                tool_name=pending.tool_name,
+                arguments=dict(pending.arguments),
+            )
+        # handler 未调用
+        self.assertEqual(len(handler_calls), 0,
+                        "R5: run 取消后应阻止 handler 调用")
+
+        t.join(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()

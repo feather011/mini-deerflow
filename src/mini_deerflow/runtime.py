@@ -12,10 +12,11 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import TYPE_CHECKING, Any
 
 from mini_deerflow.agent import Agent
@@ -74,6 +75,7 @@ from mini_deerflow.project_store import (
 )
 from mini_deerflow.tools import ToolRegistry
 from mini_deerflow.tool_authorization import ToolPolicyRegistry
+from mini_deerflow.tool_contracts import RunAuthority
 from mini_deerflow.confirmation import ConfirmationStore, ConfirmationError, ConfirmationRequest
 from mini_deerflow.confirmation_manager import ConfirmationManager
 
@@ -157,6 +159,25 @@ class RuntimeConfig:
 # =============================================================================
 # Middleware 适配层
 # =============================================================================
+
+@dataclass
+class _ConfirmationWaiter:
+    """TOOL-04 R1 round 4：Agent CONFIRM 时的等待器。
+
+    Agent 在需要用户确认的工具前挂起；API approve/deny/cancel/expire
+    或 run stop 通过 signal_confirmation 唤醒；Agent 拿到 result 或
+    outcome 后继续返回。
+    """
+    request_id: str
+    run_id: str
+    thread_id: str
+    tool_name: str
+    event: Event = field(default_factory=Event)
+    # slot["outcome"]: "executed" | "denied" | "cancelled" | "expired" | "failed"
+    # slot["result"]: 工具实际执行结果（仅 executed 时有）
+    # slot["error"]: 错误描述（denied/cancelled/expired/failed 时有）
+    slot: dict[str, Any] = field(default_factory=dict)
+
 
 class AgentMiddleware(Middleware[str]):
     """Agent 执行中间件适配。"""
@@ -401,12 +422,136 @@ class RuntimeContext:
         # 注入 coordinator（构造期循环依赖，延后绑定）
         if self.agent_run_service is not None:
             self.agent_run_service._coordinator = self.thread_run_coordinator
+            self.agent_run_service._runtime = self
         if self.run_stream_manager is not None:
             self.run_stream_manager._coordinator = self.thread_run_coordinator
+            self.run_stream_manager._runtime = self
+
+        # TOOL-04 R5/R6 round 4：运行期真实生产者
+        # - _active_run_authorities: run_id -> RunAuthority（由 AgentRunService 注入）
+        # - _runtime_cancellation_tokens: run_id -> CancellationToken（由运行入口注入）
+        # - _cancelled_runs: 被 stop()/失败 标记的 run_id 集合（由 stop/failure 维护）
+        # - _confirmation_waiters: request_id -> _ConfirmationWaiter（Agent CONFIRM 时挂起）
+        self._active_run_authorities: dict[str, RunAuthority] = {}
+        self._runtime_cancellation_tokens: dict[str, CancellationToken] = {}
+        self._cancelled_runs: set[str] = set()
+        self._confirmation_waiters: dict[str, _ConfirmationWaiter] = {}
+        # 注册时 lock；不锁整个表，只锁单 waiter 注册动作
+        self._waiter_lock = Lock()
 
     def get_project_lock(self, project_id: str) -> Lock:
         """返回项目锁（惰性创建）。Agent 工具层与 API 层共用同一字典。"""
         return _get_project_lock(project_id)
+
+    # ------------------------------------------------------------------
+    # TOOL-04 R1/R5/R6 round 4：运行期真实生产者 + 等待/恢复
+    # ------------------------------------------------------------------
+
+    def register_run(
+        self,
+        run_id: str,
+        authority: RunAuthority | None,
+        cancellation_token: CancellationToken | None,
+    ) -> None:
+        """R6/R5：运行入口（AgentRunService / RunStreamManager）调用。
+
+        在 run 启动时记录真实的 RunAuthority 和 CancellationToken，
+        作为执行端 `_execute_confirmed_request` 查找父权限的可信来源，
+        以及 `_is_run_alive` 判定运行是否仍存活的依据。
+        """
+        if authority is not None:
+            self._active_run_authorities[run_id] = authority
+        if cancellation_token is not None:
+            self._runtime_cancellation_tokens[run_id] = cancellation_token
+
+    def unregister_run(self, run_id: str, cancelled: bool = False) -> None:
+        """R5/R6：run 结束（成功/失败/取消）时清理权威与令牌记录。
+
+        cancelled=True 时把 run_id 写入 _cancelled_runs（保持一次取消标记），
+        使执行端的存活判定永久拒绝旧 run；同一 thread 后续新 run 不复用旧 run_id。
+        """
+        if cancelled:
+            self._cancelled_runs.add(run_id)
+        # 唤醒该 run 仍在等待的确认请求为 cancelled
+        for waiter in list(self._confirmation_waiters.values()):
+            if waiter.run_id == run_id and not waiter.event.is_set():
+                waiter.slot["outcome"] = "cancelled"
+                waiter.slot["error"] = "run ended or cancelled"
+                waiter.event.set()
+        self._active_run_authorities.pop(run_id, None)
+        self._runtime_cancellation_tokens.pop(run_id, None)
+
+    def wait_for_confirmation(
+        self,
+        request_id: str,
+        run_id: str,
+        thread_id: str,
+        tool_name: str,
+        ttl_seconds: float,
+        cancellation_token: CancellationToken | None,
+    ) -> dict[str, Any]:
+        """R1 round 4：Agent CONFIRM 时挂起等待 API 决议。
+
+        返回 slot 字典（outcome / result / error）。
+        - 等待期间 cancellation_token 置位或 run 取消 → outcome="cancelled"
+        - TTL 到期且无决议 → outcome="expired"
+        - API execute 成功 → outcome="executed", result=工具结果
+        - API deny → outcome="denied"
+        """
+        waiter = _ConfirmationWaiter(
+            request_id=request_id,
+            run_id=run_id,
+            thread_id=thread_id,
+            tool_name=tool_name,
+        )
+        with self._waiter_lock:
+            self._confirmation_waiters[request_id] = waiter
+        try:
+            deadline = ttl_seconds if ttl_seconds > 0 else 300.0
+            # 轮询间隔：可让 cancellation_token / cancelled_runs 及时生效
+            poll = 0.2
+            elapsed = 0.0
+            while elapsed < deadline:
+                # 取消路径：cancellation_token 置位或 run 被外部 stop
+                if cancellation_token is not None and cancellation_token.is_cancelled():
+                    waiter.slot.setdefault("outcome", "cancelled")
+                    waiter.slot.setdefault("error", "cancellation_token set")
+                    break
+                if run_id in self._cancelled_runs:
+                    waiter.slot.setdefault("outcome", "cancelled")
+                    waiter.slot.setdefault("error", "run cancelled")
+                    break
+                if waiter.event.wait(timeout=poll):
+                    break
+                elapsed += poll
+            else:
+                # 超时未唤醒
+                if "outcome" not in waiter.slot:
+                    waiter.slot["outcome"] = "expired"
+                    waiter.slot["error"] = "confirmation ttl expired"
+            return dict(waiter.slot)
+        finally:
+            with self._waiter_lock:
+                self._confirmation_waiters.pop(request_id, None)
+
+    def signal_confirmation(
+        self,
+        request_id: str,
+        outcome: str,
+        result: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """R1 round 4：API 决议 / 执行完成后唤醒等待的 Agent。"""
+        with self._waiter_lock:
+            waiter = self._confirmation_waiters.get(request_id)
+        if waiter is None:
+            return
+        waiter.slot["outcome"] = outcome
+        if result is not None:
+            waiter.slot["result"] = result
+        if error is not None:
+            waiter.slot["error"] = error
+        waiter.event.set()
 
     def shutdown(self) -> None:
         """关闭所有资源；幂等，重复调用安全。
@@ -860,17 +1005,21 @@ def create_runtime(
     policy_registry: ToolPolicyRegistry = tool_policy_registry
 
     def _is_run_alive(run_id: str, thread_id: str) -> bool:
-        # R5 round 3：检查 thread 当前 run_id 与 caller 提供的一致，
+        # R5 round 4：检查 thread 当前 run_id 与 caller 提供的一致，
         # 且该 run_id 未被取消 / 结束。
+        # 真实取消来源：_cancelled_runs（stop/失败维护）与 CancellationToken。
         coord = runtime.thread_run_coordinator
         # thread 正在跑 + 跑的是 caller 提供的 run_id
         with coord._lock:
             current = coord._running.get(thread_id)
         if current is None or current != run_id:
             return False
-        # 检查 run 是否已 cancel
-        cancelled_runs = getattr(runtime, "_cancelled_runs", None)
-        if isinstance(cancelled_runs, set) and run_id in cancelled_runs:
+        # 检查 run 是否已 cancel（stop 入口写入的取消集合）
+        if run_id in runtime._cancelled_runs:
+            return False
+        # 真实 CancellationToken：来自 run 入口注册的令牌
+        token = runtime._runtime_cancellation_tokens.get(run_id)
+        if token is not None and token.is_cancelled():
             return False
         return True
 
@@ -908,7 +1057,9 @@ def create_runtime(
     )
 
     # R1：runtime.execute_confirmed_request 真实从 ToolRegistry 调工具 handler。
-    # R6：从父 Run 的 ExecutionContext 快照得到 parent_authority 与冻结参数。
+    # R6 round 4：父 RunAuthority 严格取自 runtime._active_run_authorities[run_id]，
+    # 该 dict 由 AgentRunService/RunStreamManager 在 run 启动时注入。
+    # 找不到 → 明确拒绝（不能反构客户端请求伪造能力）。
     # 该回调由 API 路由 /confirmations/{id}/execute 调用（生产正路径）。
     from mini_deerflow.tool_authorization import RunAuthority as _RA
     from mini_deerflow.tool_contracts import ExecutorPrincipal as _EP
@@ -927,6 +1078,15 @@ def create_runtime(
         req = confirmation_store.get(request_id)
         if req is None:
             raise ConfirmationError(f"未知确认请求: {request_id}")
+        # R6 round 4：run/thread 严格匹配，伪造绑定直接拒绝
+        if req.run_id != run_id:
+            raise ConfirmationError(
+                f"run_id 不匹配：请求绑定 {req.run_id}，调用提供 {run_id}"
+            )
+        if req.thread_id != thread_id:
+            raise ConfirmationError(
+                f"thread_id 不匹配：请求绑定 {req.thread_id}，调用提供 {thread_id}"
+            )
         # R6：执行前参数 hash 复核——caller 传 arguments 必须与 req.arguments_hash 一致
         from mini_deerflow.confirmation import _hash_arguments
         caller_hash = _hash_arguments(arguments_snapshot)
@@ -935,70 +1095,89 @@ def create_runtime(
                 f"参数不匹配：批准时 hash={req.arguments_hash[:12]} "
                 f"调用 hash={caller_hash[:12]}"
             )
-        # R6：从真实运行（agent / integrated_agent / runtime）找父 ExecutionContext
-        # 真实生产中父 Run 上下文应已保存到 runtime._active_runs[run_id] 或类似。
-        # 这里给出优先查找路径；没有则保守回退，但不允许伪造能力。
-        parent_authority: RunAuthority | None = None
-        # 1) 从 runtime._active_run_authorities（如果调用方提供）
-        active_authorities = getattr(runtime, "_active_run_authorities", None)
-        if isinstance(active_authorities, dict):
-            parent_authority = active_authorities.get(run_id)
-        # 2) 从 agent 保存的 _last_run_authority（如果存在）
+        # R6 round 4：父 RunAuthority 必须由真实运行入口注入；缺失则明确拒绝
+        parent_authority: RunAuthority | None = runtime._active_run_authorities.get(run_id)
         if parent_authority is None:
-            agent_obj = runtime.agent or runtime.integrated_agent
-            last_auth = getattr(agent_obj, "_last_run_authority", None) if agent_obj else None
-            if isinstance(last_auth, dict):
-                parent_authority = last_auth.get(run_id)
-        # 3) 回退：从 req 重建（仅做基础一致性检查，不补能力）
-        if parent_authority is None:
-            parent_authority = _RA(
-                principal=_EP[req.principal],
-                thread_id=req.thread_id,
-                run_id=req.run_id,
-                project_id=req.project_id,
-                granted_capabilities=frozenset(),  # 不自授能力
+            raise ConfirmationError(
+                f"RunAuthority 缺失：run {run_id} 不存在或已结束，无可信父权限"
+            )
+        # 双重校验父权限的 thread_id 与请求一致（防止权限串号）
+        if parent_authority.thread_id != thread_id:
+            raise ConfirmationError(
+                f"父权限 thread_id 不匹配：{parent_authority.thread_id} vs {thread_id}"
             )
 
+        captured_result: list[str] = []
+
         def _invoker(name: str, args: dict) -> str:
-            # 重要：handler 必须返回的 JSON 解析后才算"成功"
+            # handler 必须返回的 JSON 解析后才算"成功"
             # 现有工具返回 JSON 字符串（_ok / _error 工厂）；按工具结果契约判成功/失败/unknown
             tool = registry.get(name)
             if tool is None:
                 raise ValueError(f"工具未注册: {name}")
             from mini_deerflow.middleware import ExecutionContext as _EC
+            # 使用父 RunAuthority 实际授予的能力（不可伪造）
             ctx = _EC(
                 run_id=run_id,
                 thread_id=thread_id,
-                granted_capabilities=frozenset(),
+                granted_capabilities=parent_authority.granted_capabilities,
             )
             result_str = tool.execute(args, context=ctx)
+            captured_result.append(result_str)
             # 按工具结果契约判别
             if not result_str:
                 return '{"ok": false, "error": "empty_result", "unknown": true}'
             try:
                 parsed = json.loads(result_str)
             except (ValueError, TypeError):
-                # 非 JSON：当作字符串返回，但 ok 仅在非空 + 非 error 前缀时为 true
+                # 非 JSON：当作字符串返回
                 return result_str
             return result_str
 
-        return confirmation_manager.claim_and_execute(
+        result_req = confirmation_manager.claim_and_execute(
             request_id,
             parent_authority=parent_authority,
             invoker=_invoker,
         )
 
+        # R1 round 4：执行完成后唤醒 Agent 的等待
+        # - 状态 EXECUTED → outcome="executed" + 工具结果
+        # - 其他失败/拒绝 → outcome="failed" + 错误描述
+        try:
+            if result_req.state.value == "executed":
+                runtime.signal_confirmation(
+                    request_id,
+                    outcome="executed",
+                    result=captured_result[0] if captured_result else "",
+                )
+            else:
+                # claim_and_execute 拒绝时（如权限降级）也唤醒，但告知失败
+                err = result_req.denial_reason or "claim rejected"
+                runtime.signal_confirmation(
+                    request_id,
+                    outcome="failed",
+                    error=err,
+                )
+        except Exception:
+            # 信号失败不应影响主流程
+            pass
+
+        return result_req
+
     runtime.execute_confirmed_request = _execute_confirmed_request
 
-    # R1：把 confirmation_manager 注入到 agent（CONFIRM 时自动创建 pending）
+    # R1 round 4：把 runtime 自身注入到 agent/integrated_agent，
+    # Agent 在 CONFIRM 时调用 runtime.wait_for_confirmation 挂起等待。
     if agent is not None:
         try:
             agent._confirmation_manager = confirmation_manager
+            agent._runtime = runtime
         except Exception:
             pass
     if integrated_agent is not None:
         try:
             integrated_agent._confirmation_manager = confirmation_manager
+            integrated_agent._runtime = runtime
         except Exception:
             pass
 
