@@ -240,13 +240,16 @@ class Agent:
                 session_caps = frozenset({
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
+                    ToolCapability.SESSION_STATE_WRITE,
                 })
                 session_project_id: str | None = None
             else:
                 session_caps = frozenset({
                     ToolCapability.PROJECT_READ,
+                    ToolCapability.PROJECT_EXEC_DELEGATE,
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
+                    ToolCapability.SESSION_STATE_WRITE,
                 })
                 session_project_id = thread.project_id
             visible_names: set[str] = set()
@@ -438,17 +441,20 @@ class Agent:
                     if self._tool_policy_registry is not None:
                         # 根据会话类型授予默认基础能力
                         if thread.project_id is None:
-                            # 普通会话：允许 calculator(history_search 等
+                            # 普通会话：calculator / history / task_note
                             default_caps = frozenset({
                                 ToolCapability.COMPUTE,
                                 ToolCapability.SESSION_HISTORY_READ,
+                                ToolCapability.SESSION_STATE_WRITE,
                             })
                         else:
-                            # 项目会话：允许 project_read_file/calculator/history_search
+                            # 项目会话：项目读写 + 普通会话基础能力
                             default_caps = frozenset({
                                 ToolCapability.PROJECT_READ,
+                                ToolCapability.PROJECT_EXEC_DELEGATE,
                                 ToolCapability.COMPUTE,
                                 ToolCapability.SESSION_HISTORY_READ,
+                                ToolCapability.SESSION_STATE_WRITE,
                             })
                         authority = self._tool_policy_registry.get_authority(
                             thread_id=thread_id,
@@ -457,9 +463,11 @@ class Agent:
                             granted_capabilities=default_caps,
                             principal=self._run_principal,
                         )
-                        decision = check_tool_access(self._tool_policy_registry, _name, authority)
-                        if decision.is_denied or decision.is_confirm:
-                            raise ToolAuthorizationError(decision)
+                        auth_decision = check_tool_access(self._tool_policy_registry, _name, authority)
+                        if auth_decision.is_denied or auth_decision.is_confirm:
+                            raise ToolAuthorizationError(auth_decision)
+                        # 授权通过：记录已授予能力，供 handler（如 subagent_submit）读取并传递
+                        _ctx.granted_capabilities = default_caps
                     # 真正发起调用前原子消费额度（成功/失败都计）
                     if self._budget is not None:
                         self._budget.consume_tool_call()

@@ -2324,3 +2324,143 @@ def _do_tool_call(...) -> str:
 - 未修改前端及聊天确认卡 ✅
 - 未修改 SSE / run.* 事件 ✅
 - 未修改 Phase 26 schema 和结果持久化 ✅
+
+### TOOL-02 第2轮审查修复（2026-10-16）
+
+审查 SHA：`651782b`，修复推送 SHA：`292ff1e`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R1: session_caps 仍缺 PROJECT_EXEC_DELEGATE/SESSION_STATE_WRITE | agent.py 两个分支的可见性能力集不一致 | 补全两个分支的 session_caps |
+| R2: 父授权被覆盖为空 | `_BudgetAwareAgent.__init__` L313 覆盖 L311 | 移除覆盖行；submit 默认值 `field()` → `frozenset()`；subagent_submit 加 `needs_context=True` |
+| R3: RUNS_COMMAND 全局豁免 | `requires_confirmation()` 排除 RUNS_COMMAND | 移除 RUNS_COMMAND；project_execute 在 `evaluate_tool_access` 中保持受控派发例外 |
+| R4: task_note 默认 CONFIRM | WRITES_SESSION 视为外部副作用 | WRITES_SESSION 移入安全集合，task_note 默认 ALLOW；6 个测试改用显式确认策略验证 CONFIRM 机制 |
+
+**测试结果**：TOOL-02 定向 86 passed，全量回归 3319 passed / 9 failed（无新增）
+
+### TOOL-02 第3轮审查修复（2026-10-16）
+
+审查 SHA：`5e55ca0`，修复推送 SHA：`0276e7b`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R2a: 项目会话子代理 project_read_file 失败 | `_BudgetAwareAgent` 硬编码 `project_id=None`，无项目上下文 | SubagentTask/Runner/Agent 链路贯穿 `parent_project_id`；`_SubmitHandler` 从父线程提取并传递 |
+| R2b: MINI_SUBAGENT 可见性不过滤 | `model_tools` 只用 `allowed_tools`，不接 `tool_policy_registry` | `_BudgetAwareAgent.run()` 加 `tool_policy_registry` 可见性过滤（与主 Agent 同构） |
+
+**测试结果**：TOOL-02 + Subagent 定向 160 passed，全量回归（归因待核实）
+
+### TOOL-02 第4轮审查修复（2026-10-16）
+
+审查 SHA：`180d6f9`，修复推送 SHA：`ff1f219`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R2a-1: project_id 获取 AttributeError | `_SubmitHandler` 用 `manager._store` 但 Manager 无此属性 | `create_subagent_tools` 加 `thread_store` 参数；Handler 通过 `thread_store.get(parent_thread_id)` 反查 |
+| R2a-2: 项目文件读取失败 | `SubagentRunner._run_task` 创建隔离 `InMemoryThreadStore()`，无项目数据 | Manager 和 `_run_task` 使用共享 `thread_store` |
+
+**测试结果**：TOOL-02 + Subagent 定向 160 passed
+
+### TOOL-02 第5轮审查修复（2026-10-16）
+
+审查 SHA：`942c4e5`，修复推送 SHA：`cd507f5`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R2a-1: depth 参数覆盖 | `thread_store` 作为位置参数4传入覆盖 `depth` | 改用关键字参数 `thread_store=thread_store` |
+| R2a-2: 子线程 project_id 未设置 | `store.create(thread_id)` 后未设 `project_id` | 创建后设置 `sub_thread.project_id = self.parent_project_id` |
+| R2a-3: parent_thread_id 为 "default" | `create_subagent_tools` 硬编码 "default" | 从 `ExecutionContext.thread_id` 获取真实父线程 |
+
+**测试结果**：TOOL-02 + Subagent 定向 160 passed
+
+### TOOL-02 第6轮审查修复（2026-10-16）
+
+审查 SHA：`26e2374`，修复推送 SHA：`68ef44a`
+
+| 问题 | 根因 | 修复 |
+|------|------|------|
+| R2a-3-run: parent_run_id 仍为 "main" | `parent_run_id` 使用 `self._parent_run_id`（hardcoded） | 从 `ExecutionContext.run_id` 获取真实父 run_id |
+
+**测试结果**：TOOL-02 + Subagent 定向 160 passed
+
+### TOOL-02 E2E 行为测试补齐（2026-10-16）
+
+推送 SHA：`56c4e29`（审查 V1 要求）
+
+**新增测试文件**：`tests/test_tool_e2e_behavior.py`（442 行，10 个测试）
+
+| 测试 | 验证内容 | 结果 |
+|------|---------|------|
+| test_uncategorized_hidden_from_model | uncategorized 工具 DENY | PASS |
+| test_normal_session_project_read_hidden | 普通会话 scope_mismatch DENY | PASS |
+| test_explicit_confirm_blocks_handler | CONFIRM 策略触发 CONFIRM，handler 不执行 | PASS |
+| test_project_read_file_direct_execute_ok | 直接 Tool.execute: ok=true 含文件内容 | PASS |
+| test_project_read_file_nonexistent_fails | 不存在文件返回错误 | PASS |
+| test_subagent_manager_submit_succeeds | Manager.submit 返回 ok=true | PASS |
+| test_subagent_tool_reads_project_file | 项目会话中 project_read_file 可访问文件 | PASS |
+| test_different_run_ids_submit_independently | 不同 run_id 独立提交 | PASS |
+| test_same_run_id_respects_limit | 同 run_id 共享计数，达上限抛异常 | PASS |
+| test_sandbox_write_uncategorized_deny | sandbox_write_file DENY，handler 不执行 | PASS |
+
+**完整定向**：170 passed in 16.38s
+
+### TOOL-02 V1-project submit→collect 真实链路（2026-10-17）
+
+推送 SHA：`eb2bbb4`
+
+**修复**：将 V1-project 测试从手动 Runner 调用改为 `Manager.submit` → 后台自动运行 → `Manager.collect` 真实链路。
+
+**关键改动**：
+- ScriptedModel 提取 tool result 并注入 FinalAnswer
+- `Manager.submit(..., model=scripted_model, registry=self.tool_reg)` 让 Manager 在后台线程执行
+- `Manager.collect(task_id, timeout=30)` 等待并回收结果
+- 验证 `result.output` 包含文件内容 "hello from project"
+- 验证模型确实调用了 `project_read_file`
+
+| 测试 | 验证内容 | 结果 |
+|------|---------|------|
+| test_subagent_reads_project_file_via_submit_collect | submit→Manager运行→collect 含文件内容 | PASS |
+
+**测试结果**：
+```
+tests/test_tool_e2e_behavior.py: 10 passed in 0.22s
+TOOL-02 + Subagent 定向（8 文件）：170 passed in 17.27s
+```
+
+**改动文件**：
+- `tests/test_tool_e2e_behavior.py`（重写 test_subagent_reads_project_file，ScriptedModel 改进）
+
+---
+
+### TOOL-02 V1 真实入口测试修复（2026-10-17）
+
+推送 SHA：`49dfd91`（用户授权额外一次收尾）
+
+**问题**：V1 审查要求真实 submit/Agent/Runner 链路测试，但原 10 个测试部分依赖 check_tool_access/evaluate_tool_access（策略函数调用），而非真实 Agent.run 路径。
+
+**修复内容**：
+- 重写 `tests/test_tool_e2e_behavior.py`（443 行，9 个测试）
+- 可见性测试改用 `Agent.run` + tool_specs 捕获（真实路径）
+- submit 测试改用 `ExecutionContext` + `tool.execute`（真实 handler）
+- 验证 `Task.parent_run_id`/`parent_thread_id` 从 `ExecutionContext` 继承
+- 所有测试通过真实 handler 链路，而非策略函数
+
+| 测试 | 验证内容 | 结果 |
+|------|---------|------|
+| test_tool_visibility_denied_hidden | DENY 工具不在 tool_specs 中 | PASS |
+| test_tool_visibility_confirm_visible | CONFIRM 工具仍发给模型 | PASS |
+| test_handler_inherits_run_id_from_context | parent_run_id 从 context.run_id 继承 | PASS |
+| test_handler_inherits_thread_id_from_context | parent_thread_id 从 context.thread_id 继承 | PASS |
+| test_two_runs_submit_independently_via_tool | 不同 run_id 独立提交 | PASS |
+| test_same_run_via_tool_respects_limit | 同 run_id 达上限抛异常 | PASS |
+| test_project_read_file_direct_execute_ok | 直接 Tool.execute 返回文件内容 | PASS |
+| test_project_read_file_nonexistent_fails | 不存在文件返回错误 | PASS |
+| test_explicit_confirm_blocks_handler | CONFIRM 触发 handler 不执行 | PASS |
+
+**测试结果**：
+```
+tests/test_tool_e2e_behavior.py: 9 passed in 0.11s
+TOOL-02 + Subagent 定向（8 文件）：169 passed in 16.05s
+```
+
+**改动文件**：
+- `tests/test_tool_e2e_behavior.py`（重写）

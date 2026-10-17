@@ -54,6 +54,7 @@ from mini_deerflow.history_index import HistoryIndexService, HistoryVectorIndex
 from mini_deerflow.history_tools import build_history_read_tool, build_history_search_tool
 from mini_deerflow.mcp_config import MCPServerConfig
 from mini_deerflow.mcp_manager import MCPClientManager
+from mini_deerflow.mcp_tool_state import MCPToolStateStore
 from mini_deerflow.model_config import ModelSettings
 from mini_deerflow.model_factory import create_model
 from mini_deerflow.models import FinalAnswer, Message, Model, ToolCall
@@ -347,6 +348,7 @@ class RuntimeContext:
         agent_run_service: "AgentRunService | None" = None,
         file_service: "WorkspaceFileService | None" = None,
         mcp_manager: MCPClientManager | None = None,
+        mcp_tool_state_store: "MCPToolStateStore | None" = None,
         context_store: "ContextStore | None" = None,
         context_assembler: "ContextAssembler | None" = None,
         project_store: ProjectStore | None = None,
@@ -371,6 +373,8 @@ class RuntimeContext:
         self.file_service = file_service
         # 22 MCP 客户端管理器（未启用时为 None 或空配置的管理器）
         self.mcp_manager = mcp_manager
+        # TOOL-03：MCP 工具授权状态存储（启用状态 + 分主体授权）
+        self.mcp_tool_state_store = mcp_tool_state_store
         # 24 Context Engineering（context_enabled=False 时两者皆为 None）
         self.context_store = context_store
         self.context_assembler = context_assembler
@@ -657,12 +661,15 @@ def create_runtime(
             context_assembler=context_assembler,
             # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
             tool_policy_registry=tool_policy_registry,
+            # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问和 project_id 反查）
+            thread_store=store,
         )
         # 注册子任务工具
         tools = create_subagent_tools(
             manager=manager,
             parent_run_id=run_id,
             parent_thread_id="default",
+            thread_store=store,
         )
         registry.register_many(tools)
 
@@ -723,10 +730,51 @@ def create_runtime(
     # registry 就地变更、Agent 持有同一引用，因此先启动 MCP 再建 Agent 最直观。
     # mcp_servers 为空（默认）时 start() 直接返回 0，不会创建任何子进程或线程。
     mcp_manager = MCPClientManager(config.mcp_servers)
-    if config.mcp_servers:
-        # required 服务器失败会在这里 fail-closed 抛 MCPStartupError；
-        # start() 内部已自行清理事件循环桥与子进程，不留半开状态。
-        mcp_manager.start(registry)
+    mcp_tool_state_store = MCPToolStateStore()
+    mcp_started = False
+    try:
+        if config.mcp_servers:
+            # required 服务器失败会在这里 fail-closed 抛 MCPStartupError；
+            # start() 内部已自行清理事件循环桥与子进程，不留半开状态。
+            mcp_manager.start(registry)
+            mcp_started = True
+            # TOOL-03 R2：MCP 工具元数据 + 持久化授权状态应用到策略注册表
+            # 按 server 声明的可信分类（tool_capabilities / tool_side_effects）
+            # 传递到 make_mcp_tool_metadata，避免所有工具都被默认拒绝
+            from mini_deerflow.tool_contracts import make_mcp_tool_metadata
+            # server_name -> config 索引
+            configs_by_name = {c.name: c for c in config.mcp_servers}
+            for qname in mcp_manager.registered_names:
+                server_name, _ = mcp_manager._tools[qname]
+                server_config = configs_by_name.get(server_name)
+                if server_config is not None:
+                    declared_caps = server_config.tool_capabilities
+                    declared_sides = server_config.tool_side_effects
+                else:
+                    declared_caps = frozenset()
+                    declared_sides = frozenset()
+                tool_policy_registry.register_metadata(make_mcp_tool_metadata(
+                    qname,
+                    declared_capabilities=declared_caps,
+                    declared_side_effects=declared_sides,
+                ))
+                state = mcp_tool_state_store.get(qname)
+                from mini_deerflow.tool_authorization import ToolPolicy as _TP
+                tool_policy_registry.set_policy(
+                    qname,
+                    _TP(
+                        enabled=state.enabled,
+                        allowed_principals=state.allowed_principals,
+                    ),
+                )
+    except BaseException:
+        # TOOL-03 R6：状态加载/应用失败时清理已启动的 MCP 资源，再原样抛
+        if mcp_started:
+            try:
+                mcp_manager.stop()
+            except Exception:
+                pass
+        raise
 
     # TOOL-02：策略注册表已在上面创建并注入 SubagentManager 和 Agent
     agent = Agent(
@@ -806,6 +854,8 @@ def create_runtime(
         agent_run_service=agent_run_service,
         file_service=file_service,
         mcp_manager=mcp_manager,
+        # TOOL-03：MCP 工具授权状态（启用状态 + 分主体授权）持久化存储
+        mcp_tool_state_store=mcp_tool_state_store,
         context_store=context_store,
         context_assembler=context_assembler,
         project_store=project_store,
