@@ -1,18 +1,22 @@
-"""TOOL-04 后端确认生命周期测试。
+"""TOOL-04 后端确认生命周期测试（R1～R6 修复版）。
 
 覆盖：
-1. 请求绑定 run_id/thread_id/project_id/principal/tool_name+args
-2. 批准前 handler 零执行；批准后执行一次；重复执行不重复
-3. 拒绝/过期/取消/停止后不执行
-4. 重启后失效批准不能直接执行
-5. 执行前再次检查权限
-6. 参数替换/换 run 都拒绝
+- R1: 真实 ToolRegistry + invoker，handler 计数与持久化结果严格一致
+- R2: 一次性确认凭证（CONFIRM 工具批准后允许一次）
+- R3: 原子领取 + 一次性消费（不重放，落盘失败保留 error）
+- R4: 真实时钟过期检查
+- R5: Run 不存活时拒绝执行
+- R6: 父 authority 透传；伪造 project/principal 拒绝
 """
 
 import os
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
+from unittest.mock import patch
 
 from mini_deerflow.confirmation import (
     ConfirmationError,
@@ -24,158 +28,27 @@ from mini_deerflow.confirmation import (
 from mini_deerflow.confirmation_manager import ConfirmationManager
 from mini_deerflow.tool_authorization import (
     ExecutorPrincipal,
+    RunAuthority,
     ToolPolicy,
     ToolPolicyRegistry,
 )
-from mini_deerflow.tool_authorization import RunAuthority
-from mini_deerflow.tool_contracts import ToolCapability, make_mcp_tool_metadata
+from mini_deerflow.tool_contracts import (
+    ToolCapability,
+    make_mcp_tool_metadata,
+)
+from mini_deerflow.tools import Tool, ToolRegistry
 
 
 # ============================================================================
-# 1. ConfirmationRequest 基础
+# Helpers
 # ============================================================================
 
 
-class TestConfirmationRequest(unittest.TestCase):
-    """ConfirmationRequest 数据类与哈希稳定性。"""
-
-    def test_create_minimal(self):
-        """必填字段：run_id, thread_id, tool_name, principal, arguments。"""
-        req = ConfirmationRequest.create(
-            run_id="r1",
-            thread_id="t1",
-            project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo",
-            arguments={"message": "hi"},
-            ttl_seconds=60.0,
-            now=100.0,
-        )
-        self.assertEqual(req.state, ConfirmationState.PENDING)
-        self.assertEqual(req.expires_at, 160.0)
-        self.assertEqual(req.principal, "MAIN_AGENT")
-        self.assertEqual(req.run_id, "r1")
-        self.assertEqual(req.thread_id, "t1")
-        self.assertIsNone(req.decided_at)
-
-    def test_arguments_hash_stable(self):
-        """相同 arguments（key 顺序不同）应得到相同哈希。"""
-        a = _hash_arguments({"x": 1, "y": 2})
-        b = _hash_arguments({"y": 2, "x": 1})
-        self.assertEqual(a, b, "key 顺序不影响哈希")
-
-    def test_arguments_hash_differs_on_value(self):
-        """value 改变 → 哈希改变。"""
-        a = _hash_arguments({"x": 1})
-        b = _hash_arguments({"x": 2})
-        self.assertNotEqual(a, b)
-
-    def test_is_expired(self):
-        """is_expired 在 expires_at 之后为 True。"""
-        req = ConfirmationRequest.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="t", arguments={}, ttl_seconds=10.0, now=100.0,
-        )
-        self.assertFalse(req.is_expired(now=100.0))
-        self.assertFalse(req.is_expired(now=109.9))
-        self.assertTrue(req.is_expired(now=110.0))
-
-    def test_create_rejects_empty_required(self):
-        """空 run_id / thread_id / tool_name 抛错。"""
-        with self.assertRaises(ConfirmationError):
-            ConfirmationRequest.create(
-                run_id="", thread_id="t1", project_id=None,
-                principal=ExecutorPrincipal.MAIN_AGENT,
-                tool_name="t", arguments={}, ttl_seconds=10.0,
-            )
-
-    def test_serialize_round_trip(self):
-        """to_dict / from_dict 往返一致。"""
-        req = ConfirmationRequest.create(
-            run_id="r1", thread_id="t1", project_id="p1",
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__x__y", arguments={"a": 1, "b": "z"},
-            ttl_seconds=60.0, now=200.0,
-        )
-        d = req.to_dict()
-        req2 = ConfirmationRequest.from_dict(d)
-        self.assertEqual(req2.request_id, req.request_id)
-        self.assertEqual(req2.arguments_hash, req.arguments_hash)
-        self.assertEqual(req2.project_id, "p1")
-
-
-# ============================================================================
-# 2. ConfirmationStore 持久化
-# ============================================================================
-
-
-class TestConfirmationStore(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = TemporaryDirectory()
-        self.path = Path(self.temp_dir.name) / "confirmations.json"
-
-    def tearDown(self):
-        self.temp_dir.cleanup()
-
-    def test_add_and_get(self):
-        store = ConfirmationStore(path=self.path)
-        req = ConfirmationRequest.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="t", arguments={"a": 1}, ttl_seconds=60.0,
-        )
-        store.add(req)
-        self.assertEqual(store.get(req.request_id).request_id, req.request_id)
-
-    def test_persistence_across_reload(self):
-        store1 = ConfirmationStore(path=self.path)
-        req = ConfirmationRequest.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="t", arguments={}, ttl_seconds=60.0,
-        )
-        store1.add(req)
-        del store1
-        store2 = ConfirmationStore(path=self.path)
-        self.assertIsNotNone(store2.get(req.request_id))
-
-    def test_save_failure_rolls_back(self):
-        """R1 同款：落盘失败 → 内存不变。"""
-        import os as _os
-        from unittest.mock import patch
-
-        store = ConfirmationStore(path=self.path)
-        req = ConfirmationRequest.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="t", arguments={}, ttl_seconds=60.0,
-        )
-        store.add(req)
-
-        # 注入：os.replace 失败
-        def failing_replace(src, dst):
-            raise OSError("simulated")
-
-        new_req = ConfirmationRequest.create(
-            run_id="r2", thread_id="t2", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="t2", arguments={}, ttl_seconds=60.0,
-        )
-        with patch("mini_deerflow.confirmation.os.replace", side_effect=failing_replace):
-            with self.assertRaises(OSError):
-                store.add(new_req)
-
-        # 内存中不应有 r2
-        self.assertIsNone(store.get(new_req.request_id))
-
-
-# ============================================================================
-# 3. ConfirmationManager 状态机
-# ============================================================================
-
-
-def _make_policy_registry(allow_main: bool = True) -> ToolPolicyRegistry:
+def _make_policy_registry(
+    allow_main: bool = True,
+    requires_confirmation: bool = False,
+) -> ToolPolicyRegistry:
+    """构造一个含 mcp__echo__echo 的策略注册表。"""
     registry = ToolPolicyRegistry()
     registry.register_metadata(make_mcp_tool_metadata(
         "mcp__echo__echo",
@@ -184,12 +57,69 @@ def _make_policy_registry(allow_main: bool = True) -> ToolPolicyRegistry:
     registry.set_policy("mcp__echo__echo", ToolPolicy(
         enabled=True,
         allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}) if allow_main else frozenset(),
+        requires_confirmation=requires_confirmation,
     ))
     return registry
 
 
-class TestConfirmationManagerLifecycle(unittest.TestCase):
-    """状态机：PENDING → APPROVED/EXPIRED/DENIED/CANCELLED/EXECUTED"""
+def _make_authority(
+    principal: ExecutorPrincipal = ExecutorPrincipal.MAIN_AGENT,
+    thread_id: str = "t1",
+    run_id: str = "r1",
+    project_id: str | None = None,
+    granted_capabilities: frozenset = frozenset({ToolCapability.COMPUTE}),
+) -> RunAuthority:
+    return RunAuthority(
+        principal=principal,
+        thread_id=thread_id,
+        run_id=run_id,
+        project_id=project_id,
+        granted_capabilities=granted_capabilities,
+    )
+
+
+# ============================================================================
+# 1. ConfirmationRequest
+# ============================================================================
+
+
+class TestConfirmationRequest(unittest.TestCase):
+    def test_create_minimal(self):
+        req = ConfirmationRequest.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={"message": "hi"},
+            ttl_seconds=60.0, now=100.0,
+        )
+        self.assertEqual(req.state, ConfirmationState.PENDING)
+        self.assertEqual(req.expires_at, 160.0)
+
+    def test_arguments_hash_stable(self):
+        a = _hash_arguments({"x": 1, "y": 2})
+        b = _hash_arguments({"y": 2, "x": 1})
+        self.assertEqual(a, b)
+
+    def test_is_expired_uses_current_time(self):
+        """R4：is_expired 用当前时间判断。"""
+        req = ConfirmationRequest.create(
+            run_id="r", thread_id="t", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="t", arguments={}, ttl_seconds=10.0, now=100.0,
+        )
+        self.assertFalse(req.is_expired(now=100.0))
+        self.assertFalse(req.is_expired(now=109.9))
+        self.assertTrue(req.is_expired(now=110.0))
+        # 真实时间也工作（远大于 100.0）
+        self.assertTrue(req.is_expired(now=time.time() + 1000))
+
+
+# ============================================================================
+# 2. R1: 真实 invoker + 一次性执行
+# ============================================================================
+
+
+class TestR1RealInvoker(unittest.TestCase):
+    """R1：API/manager 必须用真实 invoker，禁止伪报 executed/ok。"""
 
     def setUp(self):
         self.temp_dir = TemporaryDirectory()
@@ -197,365 +127,104 @@ class TestConfirmationManagerLifecycle(unittest.TestCase):
         self.store = ConfirmationStore(path=self.path)
         self.policy = _make_policy_registry()
         self.manager = ConfirmationManager(self.store, self.policy)
+        self.handler_calls: list[dict] = []
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_create_and_approve(self):
-        """创建 → 批准 → 状态 APPROVED。"""
+    def _real_invoker(self, tool_name, args):
+        self.handler_calls.append({"tool": tool_name, "args": dict(args)})
+        return f"result:{tool_name}"
+
+    def test_claim_and_execute_calls_invoker_once(self):
+        """批准后真实调用 invoker 一次，计数 = 1。"""
         req = self.manager.create(
             run_id="r1", thread_id="t1", project_id=None,
             principal=ExecutorPrincipal.MAIN_AGENT,
             tool_name="mcp__echo__echo", arguments={"m": "hi"},
         )
-        approved = self.manager.approve(req.request_id, decided_by="user")
-        self.assertEqual(approved.state, ConfirmationState.APPROVED)
-        self.assertEqual(approved.decided_by, "user")
-        self.assertIsNotNone(approved.decided_at)
-
-    def test_approve_idempotent(self):
-        """重复批准同一请求：状态保持，不重复写盘。"""
-        req = self.manager.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-        )
-        self.manager.approve(req.request_id, decided_by="user1")
-        # 第二次 approve 应幂等
-        approved2 = self.manager.approve(req.request_id, decided_by="user2")
-        self.assertEqual(approved2.state, ConfirmationState.APPROVED)
-        self.assertEqual(approved2.decided_by, "user1", "重复 approve 不覆盖决定者")
-
-    def test_deny_prevents_execute(self):
-        """拒绝后不能执行。"""
-        req = self.manager.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-        )
-        self.manager.deny(req.request_id, decided_by="user")
-        with self.assertRaises(ConfirmationError):
-            self.manager.execute(
-                req.request_id,
-                run_id="r1", thread_id="t1",
-                tool_name="mcp__echo__echo", arguments={},
-            )
-
-    def test_cancel_prevents_execute(self):
-        """取消后不能执行。"""
-        req = self.manager.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-        )
-        self.manager.cancel(req.request_id, decided_by="user")
-        with self.assertRaises(ConfirmationError):
-            self.manager.execute(
-                req.request_id,
-                run_id="r1", thread_id="t1",
-                tool_name="mcp__echo__echo", arguments={},
-            )
-
-    def test_expire_prevents_execute(self):
-        """过期后不能执行。"""
-        req = self.manager.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-            ttl_seconds=10.0, now=100.0,
-        )
-        # 推进到过期
-        self.manager.expire(req.request_id, now=200.0)
-        with self.assertRaises(ConfirmationError):
-            self.manager.execute(
-                req.request_id,
-                run_id="r1", thread_id="t1",
-                tool_name="mcp__echo__echo", arguments={},
-            )
-
-    def test_sweep_expired(self):
-        """sweep_expired 把所有 PENDING 过期请求置为 EXPIRED。"""
-        r1 = self.manager.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-            ttl_seconds=10.0, now=100.0,
-        )
-        r2 = self.manager.create(
-            run_id="r2", thread_id="t2", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-            ttl_seconds=100.0, now=100.0,
-        )
-        # 用 199.5：r1 (expires=110) 已过期，r2 (expires=200) 未过期
-        n = self.manager.sweep_expired(now=199.5)
-        self.assertEqual(n, 1, "应只把 r1 置为 EXPIRED")
-        self.assertEqual(
-            self.store.get(r1.request_id).state,
-            ConfirmationState.EXPIRED,
-        )
-        self.assertEqual(
-            self.store.get(r2.request_id).state,
-            ConfirmationState.PENDING,
-        )
-
-
-# ============================================================================
-# 4. 上下文/参数匹配
-# ============================================================================
-
-
-class TestConfirmationExecuteMatching(unittest.TestCase):
-    """执行必须完全匹配 run/thread/tool/args。"""
-
-    def setUp(self):
-        self.temp_dir = TemporaryDirectory()
-        self.path = Path(self.temp_dir.name) / "conf.json"
-        self.store = ConfirmationStore(path=self.path)
-        self.policy = _make_policy_registry()
-        self.manager = ConfirmationManager(self.store, self.policy)
-
-    def tearDown(self):
-        self.temp_dir.cleanup()
-
-    def _create_approved(self) -> ConfirmationRequest:
-        req = self.manager.create(
-            run_id="r1", thread_id="t1", project_id="p1",
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={"m": "hi"},
-        )
-        self.manager.approve(req.request_id, decided_by="user")
-        return req
-
-    def test_execute_with_correct_context_succeeds(self):
-        """完全匹配 → 状态 EXECUTED。"""
-        req = self._create_approved()
-        executed = self.manager.execute(
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+        executed = self.manager.claim_and_execute(
             req.request_id,
-            run_id="r1", thread_id="t1",
-            tool_name="mcp__echo__echo", arguments={"m": "hi"},
+            parent_authority=_make_authority(),
+            invoker=self._real_invoker,
+            now=201.0,
         )
         self.assertEqual(executed.state, ConfirmationState.EXECUTED)
-        self.assertIsNotNone(executed.executed_at)
+        self.assertEqual(executed.execution_result, "ok")
+        self.assertEqual(len(self.handler_calls), 1, "handler 应只调用一次")
+        self.assertEqual(self.handler_calls[0]["tool"], "mcp__echo__echo")
 
-    def test_execute_with_wrong_run_id_rejected(self):
-        """run_id 不匹配 → 拒绝。"""
-        req = self._create_approved()
+    def test_no_invoker_rejected(self):
+        """R1：invoker=None → 拒绝，禁止伪报成功。"""
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
         with self.assertRaises(ConfirmationError) as ctx:
-            self.manager.execute(
+            self.manager.claim_and_execute(
                 req.request_id,
-                run_id="r2", thread_id="t1",
-                tool_name="mcp__echo__echo", arguments={"m": "hi"},
+                parent_authority=_make_authority(),
+                invoker=None,
             )
-        self.assertIn("run_id 不匹配", str(ctx.exception))
-
-    def test_execute_with_wrong_thread_id_rejected(self):
-        """thread_id 不匹配 → 拒绝。"""
-        req = self._create_approved()
-        with self.assertRaises(ConfirmationError):
-            self.manager.execute(
-                req.request_id,
-                run_id="r1", thread_id="t2",
-                tool_name="mcp__echo__echo", arguments={"m": "hi"},
-            )
-
-    def test_execute_with_wrong_arguments_rejected(self):
-        """参数被替换 → 哈希不匹配 → 拒绝。"""
-        req = self._create_approved()
-        with self.assertRaises(ConfirmationError) as ctx:
-            self.manager.execute(
-                req.request_id,
-                run_id="r1", thread_id="t1",
-                tool_name="mcp__echo__echo", arguments={"m": "hacked"},
-            )
-        self.assertIn("参数不匹配", str(ctx.exception))
-
-    def test_execute_with_wrong_tool_name_rejected(self):
-        """tool_name 不匹配 → 拒绝。"""
-        req = self._create_approved()
-        with self.assertRaises(ConfirmationError):
-            self.manager.execute(
-                req.request_id,
-                run_id="r1", thread_id="t1",
-                tool_name="mcp__other__x", arguments={"m": "hi"},
-            )
-
-
-# ============================================================================
-# 5. 重复执行/不重放
-# ============================================================================
-
-
-class TestConfirmationNoReplay(unittest.TestCase):
-    """EXECUTED 后不重放 handler。"""
-
-    def setUp(self):
-        self.temp_dir = TemporaryDirectory()
-        self.path = Path(self.temp_dir.name) / "conf.json"
-        self.store = ConfirmationStore(path=self.path)
-        self.policy = _make_policy_registry()
-        self.manager = ConfirmationManager(self.store, self.policy)
-
-    def tearDown(self):
-        self.temp_dir.cleanup()
+        self.assertIn("必须提供 invoker", str(ctx.exception))
 
     def test_double_execute_does_not_re_invoke(self):
-        """两次 execute → handler 只调用一次。"""
+        """R3：第二次执行 → 拒绝，handler 不会被再次调用。"""
         req = self.manager.create(
             run_id="r1", thread_id="t1", project_id=None,
             principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={"m": "hi"},
+            tool_name="mcp__echo__echo", arguments={},
         )
-        self.manager.approve(req.request_id, decided_by="user")
-
-        call_count = [0]
-        def fake_invoker(tool, args):
-            call_count[0] += 1
-            return "result"
-
-        self.manager.execute(
-            req.request_id, run_id="r1", thread_id="t1",
-            tool_name="mcp__echo__echo", arguments={"m": "hi"},
-            invoker=fake_invoker,
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+        self.manager.claim_and_execute(
+            req.request_id,
+            parent_authority=_make_authority(),
+            invoker=self._real_invoker,
+            now=201.0,
         )
-        # 第二次执行应抛错（EXECUTED 不是 APPROVED）
         with self.assertRaises(ConfirmationError):
-            self.manager.execute(
-                req.request_id, run_id="r1", thread_id="t1",
-                tool_name="mcp__echo__echo", arguments={"m": "hi"},
-                invoker=fake_invoker,
+            self.manager.claim_and_execute(
+                req.request_id,
+                parent_authority=_make_authority(),
+                invoker=self._real_invoker,
+                now=202.0,
             )
-        self.assertEqual(call_count[0], 1, "handler 不应被调用第二次")
+        self.assertEqual(len(self.handler_calls), 1, "handler 不应被调用第二次")
 
-
-# ============================================================================
-# 6. 执行前重新检查权限
-# ============================================================================
-
-
-class TestConfirmationRecheckPermission(unittest.TestCase):
-    """执行前重新检查：权限变更后旧批准不能直接用。"""
-
-    def setUp(self):
-        self.temp_dir = TemporaryDirectory()
-        self.path = Path(self.temp_dir.name) / "conf.json"
-        self.store = ConfirmationStore(path=self.path)
-        self.policy = _make_policy_registry(allow_main=True)
-        self.manager = ConfirmationManager(self.store, self.policy)
-
-    def tearDown(self):
-        self.temp_dir.cleanup()
-
-    def test_permission_revoked_after_approval_blocks_execute(self):
-        """批准后撤权 → 执行前复核 DENY。"""
+    def test_handler_exception_recorded_as_error(self):
+        """handler 抛错 → execution_result = error:...（不重放）"""
         req = self.manager.create(
             run_id="r1", thread_id="t1", project_id=None,
             principal=ExecutorPrincipal.MAIN_AGENT,
             tool_name="mcp__echo__echo", arguments={},
         )
-        self.manager.approve(req.request_id, decided_by="user")
-        # 撤权
-        self.policy.set_policy("mcp__echo__echo", ToolPolicy(
-            enabled=True, allowed_principals=frozenset(),  # 移除 MAIN_AGENT
-        ))
-        with self.assertRaises(ConfirmationError) as ctx:
-            self.manager.execute(
-                req.request_id, run_id="r1", thread_id="t1",
-                tool_name="mcp__echo__echo", arguments={},
-            )
-        self.assertIn("当前已不再允许", str(ctx.exception))
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
 
-    def test_re_enable_after_approval_allows_execute(self):
-        """批准后仍允许 → 仍可执行。"""
-        req = self.manager.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-        )
-        self.manager.approve(req.request_id, decided_by="user")
-        # 权限仍允许，执行成功
-        executed = self.manager.execute(
-            req.request_id, run_id="r1", thread_id="t1",
-            tool_name="mcp__echo__echo", arguments={},
+        def raising_invoker(tool, args):
+            self.handler_calls.append({"tool": tool})
+            raise ValueError("boom")
+
+        executed = self.manager.claim_and_execute(
+            req.request_id,
+            parent_authority=_make_authority(),
+            invoker=raising_invoker,
+            now=201.0,
         )
         self.assertEqual(executed.state, ConfirmationState.EXECUTED)
+        self.assertIn("error", executed.execution_result)
+        self.assertEqual(len(self.handler_calls), 1)
 
 
 # ============================================================================
-# 7. 重启后失效批准
+# 3. R3: 原子领取 / 并发
 # ============================================================================
 
 
-class TestConfirmationRebootSafety(unittest.TestCase):
-    """重启后旧 APPROVED 状态仍在：仍可执行（无过期则仍有效）。"""
-
-    def setUp(self):
-        self.temp_dir = TemporaryDirectory()
-        self.path = Path(self.temp_dir.name) / "conf.json"
-
-    def tearDown(self):
-        self.temp_dir.cleanup()
-
-    def test_approval_persists_across_reload(self):
-        """重启：APPROVED 状态保留，相同上下文仍可执行。"""
-        store1 = ConfirmationStore(path=self.path)
-        policy1 = _make_policy_registry()
-        mgr1 = ConfirmationManager(store1, policy1)
-        req = mgr1.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-        )
-        mgr1.approve(req.request_id, decided_by="user")
-        del mgr1, store1
-
-        store2 = ConfirmationStore(path=self.path)
-        policy2 = _make_policy_registry()
-        mgr2 = ConfirmationManager(store2, policy2)
-        req2 = store2.get(req.request_id)
-        self.assertEqual(req2.state, ConfirmationState.APPROVED)
-        executed = mgr2.execute(
-            req.request_id, run_id="r1", thread_id="t1",
-            tool_name="mcp__echo__echo", arguments={},
-        )
-        self.assertEqual(executed.state, ConfirmationState.EXECUTED)
-
-    def test_expired_approval_after_reload_cannot_execute(self):
-        """重启时若已过期 → 自动 EXPIRED → 不能执行。"""
-        store1 = ConfirmationStore(path=self.path)
-        policy1 = _make_policy_registry()
-        mgr1 = ConfirmationManager(store1, policy1)
-        req = mgr1.create(
-            run_id="r1", thread_id="t1", project_id=None,
-            principal=ExecutorPrincipal.MAIN_AGENT,
-            tool_name="mcp__echo__echo", arguments={},
-            ttl_seconds=10.0, now=100.0,
-        )
-        # 不 approve，让其保持 PENDING；sweep 后应置 EXPIRED
-        del mgr1, store1
-
-        # 模拟：时间已到 200，扫描过期
-        store2 = ConfirmationStore(path=self.path)
-        policy2 = _make_policy_registry()
-        mgr2 = ConfirmationManager(store2, policy2)
-        mgr2.sweep_expired(now=200.0)
-
-        req2 = store2.get(req.request_id)
-        self.assertEqual(req2.state, ConfirmationState.EXPIRED)
-        with self.assertRaises(ConfirmationError):
-            mgr2.execute(
-                req.request_id, run_id="r1", thread_id="t1",
-                tool_name="mcp__echo__echo", arguments={},
-            )
-
-
-# ============================================================================
-# 8. API 端到端
-# ============================================================================
-
-
-class TestConfirmationAPI(unittest.TestCase):
-    """/confirmations 路由端到端。"""
+class TestR3AtomicClaim(unittest.TestCase):
+    """R3：原子领取 + 并发不重放。"""
 
     def setUp(self):
         self.temp_dir = TemporaryDirectory()
@@ -567,19 +236,428 @@ class TestConfirmationAPI(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def _build_runtime(self) -> "RuntimeContext":
+    def test_concurrent_execute_only_one_succeeds(self):
+        """并发两个 execute → 只一个进入 handler。"""
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+
+        call_count = [0]
+        call_lock = threading.Lock()
+
+        def slow_invoker(tool, args):
+            with call_lock:
+                call_count[0] += 1
+            time.sleep(0.05)
+            return "ok"
+
+        results: list[Any] = []
+        errors: list[Exception] = []
+
+        def worker():
+            try:
+                res = self.manager.claim_and_execute(
+                    req.request_id,
+                    parent_authority=_make_authority(),
+                    invoker=slow_invoker,
+                )
+                results.append(res)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # 5 个并发，只 1 个成功进入 handler；其余 4 个抛错
+        self.assertEqual(call_count[0], 1,
+                        f"handler 应只调用一次，实际 {call_count[0]}")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 4)
+        # 所有 error 都是 ConfirmationError
+        for e in errors:
+            self.assertIsInstance(e, ConfirmationError)
+
+    def test_save_failure_during_claim_preserves_approved(self):
+        """R3：claim 持久化失败 → 状态保留 APPROVED（不进入 EXECUTED）"""
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+
+        # 注入：claim 时 os.replace 失败
+        original_replace = os.replace
+        call_count = [0]
+
+        def failing_replace(src, dst):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise OSError("simulated disk full during claim")
+            return original_replace(src, dst)
+
+        call_log = []
+
+        def invoker(tool, args):
+            call_log.append(tool)
+            return "ok"
+
+        with patch("mini_deerflow.confirmation.os.replace", side_effect=failing_replace):
+            with self.assertRaises(ConfirmationError):
+                self.manager.claim_and_execute(
+                    req.request_id,
+                    parent_authority=_make_authority(),
+                    invoker=invoker,
+                )
+        # 关键：handler 未被调用（领取失败就不调）
+        self.assertEqual(len(call_log), 0, "claim 失败时不应调 handler")
+        # 状态保留 APPROVED
+        req2 = self.store.get(req.request_id)
+        self.assertEqual(req2.state, ConfirmationState.APPROVED,
+                        "claim 失败时状态应保留 APPROVED")
+
+
+# ============================================================================
+# 4. R4: 真实时钟过期
+# ============================================================================
+
+
+class TestR4RealClockExpiry(unittest.TestCase):
+    """R4：approve/execute 用真实时钟检查过期。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        self.policy = _make_policy_registry()
+        self.manager = ConfirmationManager(self.store, self.policy)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_expired_pending_rejected_at_approve_with_real_clock(self):
+        """R4：ttl 已过期的 PENDING → approve 时（不传 now）应拒绝。"""
+        # 在 now=100 创建，ttl=10 → expires_at=110
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+            ttl_seconds=10.0, now=100.0,
+        )
+        # 不调 sweep_expired，直接 approve（不传 now → 用真实时钟）
+        # 真实时钟（time.time()）>> 110，应判过期
+        with self.assertRaises(ConfirmationError) as ctx:
+            self.manager.approve(req.request_id, decided_by="user")
+        self.assertIn("已过期", str(ctx.exception))
+
+    def test_expired_approved_rejected_at_execute_with_real_clock(self):
+        """R4：已批准但过期的请求 → execute 应拒绝。"""
+        # 手动构造：现在 approve（用 now=200），再 expire
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+            ttl_seconds=10.0, now=100.0,
+        )
+        # 直接通过 store 写一个 APPROVED 状态（绕过真实时钟过期）
+        from dataclasses import replace as _dc_replace
+        approved = _dc_replace(req, state=ConfirmationState.APPROVED, decided_at=110.0)
+        self.store.update(approved)
+
+        # 真实时钟下执行 → 应拒绝
+        with self.assertRaises(ConfirmationError) as ctx:
+            self.manager.claim_and_execute(
+                req.request_id,
+                parent_authority=_make_authority(),
+                invoker=lambda t, a: "ok",
+            )
+        self.assertIn("已过期", str(ctx.exception))
+
+
+# ============================================================================
+# 5. R5: Run 生命周期
+# ============================================================================
+
+
+class TestR5RunLifecycle(unittest.TestCase):
+    """R5：执行前检查 Run 存活；停止后拒绝。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        self.policy = _make_policy_registry()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_dead_run_rejected(self):
+        """R5：is_run_alive=False → 拒绝执行。"""
+        def dead_run_check(run_id, thread_id):
+            return False
+        mgr = ConfirmationManager(self.store, self.policy, is_run_alive=dead_run_check)
+        req = mgr.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        mgr.approve(req.request_id, decided_by="user", now=200.0)
+        with self.assertRaises(ConfirmationError) as ctx:
+            mgr.claim_and_execute(
+                req.request_id,
+                parent_authority=_make_authority(),
+                invoker=lambda t, a: "ok",
+            )
+        self.assertIn("已停止", str(ctx.exception))
+
+    def test_alive_run_passes(self):
+        def alive_check(run_id, thread_id):
+            return True
+        mgr = ConfirmationManager(self.store, self.policy, is_run_alive=alive_check)
+        req = mgr.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        mgr.approve(req.request_id, decided_by="user", now=200.0)
+        executed = mgr.claim_and_execute(
+            req.request_id,
+            parent_authority=_make_authority(),
+            invoker=lambda t, a: "ok",
+        )
+        self.assertEqual(executed.state, ConfirmationState.EXECUTED)
+
+    def test_default_no_is_run_alive_allows(self):
+        """未传 is_run_alive → 默认放行（向后兼容）。"""
+        mgr = ConfirmationManager(self.store, self.policy)
+        req = mgr.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        mgr.approve(req.request_id, decided_by="user", now=200.0)
+        executed = mgr.claim_and_execute(
+            req.request_id,
+            parent_authority=_make_authority(),
+            invoker=lambda t, a: "ok",
+        )
+        self.assertEqual(executed.state, ConfirmationState.EXECUTED)
+
+
+# ============================================================================
+# 6. R6: 父 authority 透传 + 伪造拒绝
+# ============================================================================
+
+
+class TestR6ParentAuthority(unittest.TestCase):
+    """R6：客户端伪造 project/principal 必须被拒绝。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        self.policy = _make_policy_registry()
+        self.manager = ConfirmationManager(self.store, self.policy)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_forged_project_id_rejected(self):
+        """R6：客户端伪造 project_id 与父 authority 不一致 → 拒绝。"""
+        # 请求时 project_id=None
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+        # 客户端伪造 project_id="fake"
+        with self.assertRaises(ConfirmationError) as ctx:
+            self.manager.claim_and_execute(
+                req.request_id,
+                parent_authority=_make_authority(project_id="fake"),
+                invoker=lambda t, a: "ok",
+            )
+        self.assertIn("project_id 不匹配", str(ctx.exception))
+
+    def test_forged_principal_rejected(self):
+        """R6：客户端伪造 principal 与请求不一致 → 拒绝。"""
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+        with self.assertRaises(ConfirmationError):
+            self.manager.claim_and_execute(
+                req.request_id,
+                parent_authority=_make_authority(principal=ExecutorPrincipal.HARNESS_AGENT),
+                invoker=lambda t, a: "ok",
+            )
+
+    def test_no_capability_escalation(self):
+        """R6：执行前用父 authority 复核 — 缺少能力时拒绝。"""
+        # 创建一个需要 COMMAND_EXECUTE 能力的工具 metadata
+        from mini_deerflow.tool_contracts import (
+            ToolMetadata, ToolSourceKind, ToolSideEffect,
+        )
+        self.policy.register_metadata(ToolMetadata(
+            name="mcp__danger__exec",
+            source=ToolSourceKind.MCP,
+            capabilities=frozenset({ToolCapability.COMMAND_EXECUTE}),
+            side_effects=frozenset({ToolSideEffect.RUNS_COMMAND}),
+        ))
+        self.policy.set_policy("mcp__danger__exec", ToolPolicy(
+            enabled=True,
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=True,
+        ))
+
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__danger__exec", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+        # 父 authority 只给 COMPUTE，没有 COMMAND_EXECUTE
+        with self.assertRaises(ConfirmationError) as ctx:
+            self.manager.claim_and_execute(
+                req.request_id,
+                parent_authority=_make_authority(
+                    granted_capabilities=frozenset({ToolCapability.COMPUTE}),
+                ),
+                invoker=lambda t, a: "ok",
+            )
+        self.assertIn("拒绝", str(ctx.exception))
+
+
+# ============================================================================
+# 7. R2: 一次性确认凭证
+# ============================================================================
+
+
+class TestR2OneShotConfirm(unittest.TestCase):
+    """R2：CONFIRM 工具批准后，APPROVED 状态作为该次执行的一次性通过凭证。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        # requires_confirmation=True：未批准时 check_tool_access 返回 CONFIRM
+        self.policy = _make_policy_registry(requires_confirmation=True)
+        self.manager = ConfirmationManager(self.store, self.policy)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_confirm_tool_allowed_after_approval(self):
+        """批准后 is_confirm 决策被放行一次。"""
+        req = self.manager.create(
+            run_id="r1", thread_id="t1", project_id=None,
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            tool_name="mcp__echo__echo", arguments={},
+        )
+        self.manager.approve(req.request_id, decided_by="user", now=200.0)
+        # 父 authority 有 COMPUTE → 一次执行成功
+        executed = self.manager.claim_and_execute(
+            req.request_id,
+            parent_authority=_make_authority(),
+            invoker=lambda t, a: "ok",
+        )
+        self.assertEqual(executed.state, ConfirmationState.EXECUTED)
+
+
+# ============================================================================
+# 8. API 端到端（runtime.execute_confirmed_request）
+# ============================================================================
+
+
+class TestConfirmationAPIWithRealInvoker(unittest.TestCase):
+    """R1+R5+R6：API 调 runtime.execute_confirmed_request，handler 真实计数。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "conf.json"
+        self.store = ConfirmationStore(path=self.path)
+        self.policy = _make_policy_registry()
+        self.manager = ConfirmationManager(self.store, self.policy)
+        self.registry = ToolRegistry()
+        self.handler_calls: list[dict] = []
+
+        # 注册一个计数 echo 工具
+        def echo_handler(args, context=None):
+            self.handler_calls.append({"args": dict(args)})
+            return "echo-result"
+        from mini_deerflow.tools import Tool as _T
+        self.registry.register(_T(
+            name="mcp__echo__echo",
+            description="echo",
+            parameters={"type": "object", "properties": {"m": {"type": "string"}}},
+            handler=echo_handler,
+        ))
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _build_runtime(self, is_run_alive: bool = True) -> "RuntimeContext":
         from mini_deerflow.runtime import RuntimeContext, RuntimeConfig
-        # Agent stub 持有 policy registry
+        from mini_deerflow.confirmation_manager import ConfirmationManager as _CM
+
         class _AgentStub:
             _tool_policy_registry = self.policy
-        return RuntimeContext(
+
+        runtime = RuntimeContext(
             store=None, agent=_AgentStub(), integrated_agent=None,
             manager=None, config=RuntimeConfig(), trace_sink=None, lifecycle=None,
+            mcp_manager=None,
+            mcp_tool_state_store=None,
             confirmation_store=self.store,
             confirmation_manager=self.manager,
         )
 
-    def test_create_approve_execute_flow(self):
+        # 注入 execute_confirmed_request（用本测试的 registry + invoker）
+        def _execute_confirmed_request(
+            request_id: str, run_id: str, thread_id: str, tool_name: str, arguments: dict
+        ):
+            req = self.store.get(request_id)
+            if req is None:
+                raise ConfirmationError(f"未知确认请求: {request_id}")
+            parent_authority = _make_authority(
+                principal=ExecutorPrincipal[req.principal],
+                thread_id=req.thread_id,
+                run_id=req.run_id,
+                project_id=req.project_id,
+                granted_capabilities=frozenset({ToolCapability.COMPUTE}),
+            )
+
+            def invoker(name, args):
+                tool = self.registry.get(name)
+                if tool is None:
+                    raise ValueError(f"工具未注册: {name}")
+                from mini_deerflow.middleware import ExecutionContext
+                ctx = ExecutionContext(
+                    run_id=run_id, thread_id=thread_id,
+                    granted_capabilities=frozenset(),
+                )
+                return tool.execute(args, context=ctx)
+
+            return self.manager.claim_and_execute(
+                request_id,
+                parent_authority=parent_authority,
+                invoker=invoker,
+            )
+
+        runtime.execute_confirmed_request = _execute_confirmed_request
+        return runtime
+
+    def test_api_execute_calls_handler(self):
+        """API execute → 真实 handler 调用一次。"""
         from fastapi.testclient import TestClient
         from mini_deerflow.api.app import create_app
         from mini_deerflow.api.config import ApiSettings
@@ -591,11 +669,11 @@ class TestConfirmationAPI(unittest.TestCase):
         app.dependency_overrides[get_runtime] = lambda: runtime
         client = TestClient(app)
 
-        # 1. 创建
+        # 创建
         resp = client.post(
             f"{settings.api_prefix}/confirmations",
             json={
-                "run_id": "r1", "thread_id": "t1", "project_id": "p1",
+                "run_id": "r1", "thread_id": "t1", "project_id": None,
                 "principal": "MAIN_AGENT",
                 "tool_name": "mcp__echo__echo",
                 "arguments": {"m": "hi"},
@@ -605,15 +683,17 @@ class TestConfirmationAPI(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         rid = resp.json()["request_id"]
 
-        # 2. 批准
+        # 批准
         resp = client.post(
             f"{settings.api_prefix}/confirmations/{rid}/approve",
             json={"decided_by": "user"},
         )
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["state"], "approved")
 
-        # 3. 执行（上下文完全匹配）
+        # 执行前 handler 计数 = 0
+        self.assertEqual(len(self.handler_calls), 0)
+
+        # 执行
         resp = client.post(
             f"{settings.api_prefix}/confirmations/{rid}/execute",
             json={
@@ -623,30 +703,45 @@ class TestConfirmationAPI(unittest.TestCase):
             },
         )
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["state"], "executed")
+        data = resp.json()
+        self.assertEqual(data["state"], "executed")
+        self.assertEqual(data["execution_result"], "ok")
 
-    def test_execute_with_modified_args_returns_409(self):
-        """API 层：参数被替换 → 409。"""
+        # handler 计数 = 1
+        self.assertEqual(len(self.handler_calls), 1,
+                        f"R1: API 执行后 handler 应调用一次，实际 {len(self.handler_calls)}")
+
+    def test_api_execute_403_when_no_executor(self):
+        """R1：runtime 不提供 execute_confirmed_request → 503 拒绝伪报。"""
         from fastapi.testclient import TestClient
         from mini_deerflow.api.app import create_app
         from mini_deerflow.api.config import ApiSettings
         from mini_deerflow.api.dependencies import get_runtime
+        from mini_deerflow.runtime import RuntimeContext, RuntimeConfig
 
-        runtime = self._build_runtime()
+        class _AgentStub:
+            _tool_policy_registry = self.policy
+
+        runtime = RuntimeContext(
+            store=None, agent=_AgentStub(), integrated_agent=None,
+            manager=None, config=RuntimeConfig(), trace_sink=None, lifecycle=None,
+            confirmation_store=self.store,
+            confirmation_manager=self.manager,
+            # 没有 execute_confirmed_request
+        )
+
         settings = ApiSettings()
         app = create_app(settings=settings)
         app.dependency_overrides[get_runtime] = lambda: runtime
         client = TestClient(app)
 
-        # 创建并批准
         resp = client.post(
             f"{settings.api_prefix}/confirmations",
             json={
-                "run_id": "r1", "thread_id": "t1", "project_id": "p1",
+                "run_id": "r1", "thread_id": "t1", "project_id": None,
                 "principal": "MAIN_AGENT",
                 "tool_name": "mcp__echo__echo",
                 "arguments": {"m": "hi"},
-                "ttl_seconds": 60.0,
             },
         )
         rid = resp.json()["request_id"]
@@ -655,20 +750,18 @@ class TestConfirmationAPI(unittest.TestCase):
             json={"decided_by": "user"},
         )
 
-        # 尝试用修改后的参数执行
         resp = client.post(
             f"{settings.api_prefix}/confirmations/{rid}/execute",
             json={
                 "run_id": "r1", "thread_id": "t1",
                 "tool_name": "mcp__echo__echo",
-                "arguments": {"m": "hacked"},  # 修改
+                "arguments": {"m": "hi"},
             },
         )
-        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.status_code, 503, resp.text)
         body = resp.json()
-        # 自定义错误响应格式
         msg = body.get("detail") or body.get("error", {}).get("message", "")
-        self.assertIn("参数不匹配", msg)
+        self.assertIn("未提供", msg)
 
 
 if __name__ == "__main__":

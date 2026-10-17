@@ -223,9 +223,17 @@ def execute_confirmation(
     body: ExecuteRequest = ...,
     runtime: RuntimeContext = Depends(get_runtime),
 ) -> dict:
-    manager, _ = _get_components(runtime)
+    """R1：必须提供真实执行器；runtime.execute_confirmed_request 走 ToolRegistry。
+    不在 API 路由内直接调用 tool.handler。
+    """
+    invoker = getattr(runtime, "execute_confirmed_request", None)
+    if invoker is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Runtime 未提供真实执行器（execute_confirmed_request）",
+        )
     try:
-        req = manager.execute(
+        req = invoker(
             request_id,
             run_id=body.run_id,
             thread_id=body.thread_id,
