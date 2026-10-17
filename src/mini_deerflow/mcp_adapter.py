@@ -23,11 +23,14 @@ mcp.types.Tool  ──adapt()──►  ToolSpec（给模型看）
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, TYPE_CHECKING
 
 from mini_deerflow.model_errors import ModelProtocolError
 from mini_deerflow.models import ToolSpec
 from mini_deerflow.tools import Tool
+
+if TYPE_CHECKING:
+    from mini_deerflow.tool_contracts import ToolMetadata
 
 # 工具命名空间前缀；模型与日志中可据此识别外部工具
 MCP_TOOL_PREFIX = "mcp__"

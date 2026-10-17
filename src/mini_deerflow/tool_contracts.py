@@ -639,6 +639,40 @@ def default_policy_for_sandbox() -> ToolPolicy:
     )
 
 
+# TOOL-03：MCP 工具默认元数据。capabilities 为 COMPUTE + SESSION_HISTORY_READ，
+# 区别于 sandbox_*（写沙箱/运行命令），是合理的外部 IO 抽象。
+MCP_TOOL_DEFAULT_CAPABILITIES = frozenset({
+    ToolCapability.COMPUTE,
+    ToolCapability.SESSION_HISTORY_READ,
+})
+
+
+def make_mcp_tool_metadata(name: str) -> ToolMetadata:
+    """构造一个 MCP 工具的默认 ToolMetadata。
+
+    外部 IO 类型（stdio → MCP server），side_effects = READS_NETWORK。
+    uncategorized=False（已分类）→ 不会因元数据缺失被默认拒绝。
+    """
+    return ToolMetadata(
+        name=name,
+        source=ToolSourceKind.MCP,
+        capabilities=MCP_TOOL_DEFAULT_CAPABILITIES,
+        side_effects=frozenset({ToolSideEffect.READS_NETWORK}),
+    )
+
+
+def default_policy_for_mcp_tool() -> ToolPolicy:
+    """MCP 工具默认策略：默认 disabled，由用户显式启用并按主体授权。
+
+    区别于 sandbox_* 的"主 Agent 默认 deny"——MCP 工具需要用户在
+    管理页中分别授权每个主体，不在代码里预设。
+    """
+    return ToolPolicy(
+        enabled=False,
+        allowed_principals=frozenset(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 策略注册表（用于 lookup）
 # ---------------------------------------------------------------------------
@@ -675,4 +709,6 @@ def default_policy_for(name: str) -> ToolPolicy | None:
         return default_policy_for_subagent()
     if name.startswith("sandbox_"):
         return default_policy_for_sandbox()
+    if name.startswith("mcp__"):
+        return default_policy_for_mcp_tool()
     return None
