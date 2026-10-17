@@ -738,10 +738,26 @@ def create_runtime(
             # start() 内部已自行清理事件循环桥与子进程，不留半开状态。
             mcp_manager.start(registry)
             mcp_started = True
-            # TOOL-03：MCP 工具元数据 + 持久化授权状态应用到策略注册表
+            # TOOL-03 R2：MCP 工具元数据 + 持久化授权状态应用到策略注册表
+            # 按 server 声明的可信分类（tool_capabilities / tool_side_effects）
+            # 传递到 make_mcp_tool_metadata，避免所有工具都被默认拒绝
             from mini_deerflow.tool_contracts import make_mcp_tool_metadata
+            # server_name -> config 索引
+            configs_by_name = {c.name: c for c in config.mcp_servers}
             for qname in mcp_manager.registered_names:
-                tool_policy_registry.register_metadata(make_mcp_tool_metadata(qname))
+                server_name, _ = mcp_manager._tools[qname]
+                server_config = configs_by_name.get(server_name)
+                if server_config is not None:
+                    declared_caps = server_config.tool_capabilities
+                    declared_sides = server_config.tool_side_effects
+                else:
+                    declared_caps = frozenset()
+                    declared_sides = frozenset()
+                tool_policy_registry.register_metadata(make_mcp_tool_metadata(
+                    qname,
+                    declared_capabilities=declared_caps,
+                    declared_side_effects=declared_sides,
+                ))
                 state = mcp_tool_state_store.get(qname)
                 from mini_deerflow.tool_authorization import ToolPolicy as _TP
                 tool_policy_registry.set_policy(

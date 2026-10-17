@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Mapping
@@ -122,19 +123,18 @@ class MCPToolStateStore:
         return self._states.get(qualified_name, MCPToolAuthState())
 
     def set_enabled(self, qualified_name: str, enabled: bool) -> MCPToolAuthState:
-        """设置启用状态。"""
+        """设置启用状态。TOOL-03 R1：先写候选到磁盘，成功后才更新内存。"""
         self._ensure_loaded()
         current = self._states.get(qualified_name, MCPToolAuthState())
         new_state = MCPToolAuthState(
             enabled=enabled,
             allowed_principals=current.allowed_principals,
         )
-        self._states[qualified_name] = new_state
-        self._save()
+        self._save_then_replace(qualified_name, new_state)
         return new_state
 
     def grant(self, qualified_name: str, principal: ExecutorPrincipal) -> MCPToolAuthState:
-        """为某个主体授权。"""
+        """为某个主体授权。TOOL-03 R1：先写候选到磁盘，成功后才更新内存。"""
         self._ensure_loaded()
         current = self._states.get(qualified_name, MCPToolAuthState())
         new_principals = current.allowed_principals | {principal}
@@ -142,12 +142,11 @@ class MCPToolStateStore:
             enabled=current.enabled,
             allowed_principals=new_principals,
         )
-        self._states[qualified_name] = new_state
-        self._save()
+        self._save_then_replace(qualified_name, new_state)
         return new_state
 
     def revoke(self, qualified_name: str, principal: ExecutorPrincipal) -> MCPToolAuthState:
-        """撤销某主体的授权。"""
+        """撤销某主体的授权。TOOL-03 R1：先写候选到磁盘，成功后才更新内存。"""
         self._ensure_loaded()
         current = self._states.get(qualified_name, MCPToolAuthState())
         new_principals = current.allowed_principals - {principal}
@@ -155,39 +154,47 @@ class MCPToolStateStore:
             enabled=current.enabled,
             allowed_principals=new_principals,
         )
+        self._save_then_replace(qualified_name, new_state)
+        return new_state
+
+    def _save_then_replace(self, qualified_name: str, new_state: MCPToolAuthState) -> None:
+        """R1：候选字典（包含新状态）写入临时文件，原子替换到正式路径，
+        成功后才更新内存中的 _states。
+
+        任一步失败（OSError 等）：内存不变，磁盘不变。
+        """
+        candidate = dict(self._states)
+        candidate[qualified_name] = new_state
+        # 1. 写入临时文件
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix="mcp-state-", suffix=".tmp", dir=self._path.parent
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"tools": {n: _state_to_dict(s) for n, s in candidate.items()}},
+                    f, ensure_ascii=False, indent=2,
+                )
+                f.flush()
+                os.fsync(f.fileno())
+            # 2. 原子替换到正式路径（rename 失败时 tmp 保留，磁盘不变）
+            os.replace(tmp, self._path)
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            raise
+        # 3. 落盘成功 → 更新内存
         self._states[qualified_name] = new_state
-        self._save()
         return new_state
 
     def all_states(self) -> dict[str, MCPToolAuthState]:
         """返回所有工具授权状态的快照。"""
         self._ensure_loaded()
         return dict(self._states)
-
-    def _save(self) -> None:
-        """原子写入：写临时文件 + os.replace。"""
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "tools": {
-                name: _state_to_dict(state)
-                for name, state in self._states.items()
-            }
-        }
-        # 原子写入：先写临时文件，再 rename
-        import tempfile
-        fd, tmp = tempfile.mkstemp(
-            prefix="mcp-state-", suffix=".tmp", dir=self._path.parent
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self._path)
-        except Exception:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
 
 
 __all__ = [

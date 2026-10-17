@@ -118,10 +118,14 @@ async def _session_task(
     try:
         # MCP 2.x: stdio_client 是 async generator，yield (read_stream, write_stream, process)
         async with stdio_client(params) as (read_stream, write_stream):
+            # R4：mcp 2.2.0+ 的 ClientSession 若把 timedelta 写入
+            # `_session_read_timeout_seconds`，initialize 内部 anyio.current_time() + self._budget
+            # 会以 float + timedelta 抛 TypeError。这里传 None（每次 send_request
+            # 显式传 read_timeout_seconds），规避 session 级预算的 buggy 算术。
             client = ClientSession(
                 read_stream,
                 write_stream,
-                read_timeout_seconds=timedelta(seconds=init_timeout),
+                read_timeout_seconds=None,
             )
             async with client:
                 # MCP 2.x: ClientSession 不会自动初始化，需要显式调用
@@ -160,6 +164,40 @@ async def _session_task(
 def _safe_error(exc: BaseException) -> str:
     """只保留异常类型名，避免把命令行、env 或供应商回显写进日志。"""
     return type(exc).__name__
+
+
+# TOOL-03 R5：失败分类。只返回受控枚举值，不暴露任意第三方文本。
+_FAILURE_KIND_STARTUP_TIMEOUT = "startup_timeout"
+_FAILURE_KIND_INIT_FAILED = "init_failed"
+_FAILURE_KIND_TRANSPORT = "transport_error"
+_FAILURE_KIND_PROTOCOL = "protocol_error"
+_FAILURE_KIND_OTHER = "startup_error"
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """根据异常类型返回受控的安全分类码。"""
+    etype = type(exc).__name__
+    if "Timeout" in etype:
+        return _FAILURE_KIND_STARTUP_TIMEOUT
+    if "Broken" in etype or "Connection" in etype or "Transport" in etype:
+        return _FAILURE_KIND_TRANSPORT
+    if "Protocol" in etype or "JSON" in etype or "RPC" in etype:
+        return _FAILURE_KIND_PROTOCOL
+    return _FAILURE_KIND_OTHER
+
+
+def _safe_failure_message(server_name: str, exc: BaseException) -> str:
+    """返回受控的固定安全描述，不含供应商异常 str(exc)。"""
+    kind = _classify_failure(exc)
+    if kind == _FAILURE_KIND_STARTUP_TIMEOUT:
+        return f"服务器 {server_name} 在启动超时内未就绪"
+    if kind == _FAILURE_KIND_INIT_FAILED:
+        return f"服务器 {server_name} 初始化失败"
+    if kind == _FAILURE_KIND_TRANSPORT:
+        return f"服务器 {server_name} 传输层错误"
+    if kind == _FAILURE_KIND_PROTOCOL:
+        return f"服务器 {server_name} 协议层错误"
+    return f"服务器 {server_name} 启动失败"
 
 
 class _Session:
@@ -268,13 +306,15 @@ class MCPClientManager:
                     _safe_error(exc),
                     exc_info=True,
                 )
-                # TOOL-03 R5：记录失败状态（脱敏）
+                # TOOL-03 R5：记录失败状态（脱敏：仅安全码 + 固定描述）
+                # 不返回任意第三方 str(exc)（供应商异常可能回显 env 凭据）。
+                safe_message = _safe_failure_message(config.name, exc)
                 self._server_states[config.name] = ServerState(
                     name=config.name,
                     status=ServerStatus.FAILED,
                     tool_count=0,
-                    failure_kind=type(exc).__name__,
-                    failure_message=str(exc)[:200],  # 限制长度
+                    failure_kind=_classify_failure(exc),
+                    failure_message=safe_message,
                 )
                 if config.required:
                     failed_required.append(config.name)
@@ -446,7 +486,9 @@ class MCPClientManager:
             coro = session.client.call_tool(
                 original_name,
                 dict(arguments),
-                read_timeout_seconds=timedelta(seconds=timeout),
+                # R4：mcp 2.2.0+ call_tool(read_timeout_seconds) 期望 float。
+                # 旧版 (1.27.x) 期望 timedelta；传 float 在两个版本都被接受。
+                read_timeout_seconds=float(timeout),
             )
             # 独立 timeout scope：只 cancel 这一个 tool call，不杀死 session
             result = portal.run(
