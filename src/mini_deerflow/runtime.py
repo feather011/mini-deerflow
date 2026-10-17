@@ -89,6 +89,8 @@ def _get_project_lock(project_id: str) -> Lock:
 
 if TYPE_CHECKING:
     from mini_deerflow.api.services.agent_runs import AgentRunService
+    from mini_deerflow.confirmation import ConfirmationStore
+    from mini_deerflow.confirmation_manager import ConfirmationManager
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -349,6 +351,8 @@ class RuntimeContext:
         file_service: "WorkspaceFileService | None" = None,
         mcp_manager: MCPClientManager | None = None,
         mcp_tool_state_store: "MCPToolStateStore | None" = None,
+        confirmation_store: "ConfirmationStore | None" = None,
+        confirmation_manager: "ConfirmationManager | None" = None,
         context_store: "ContextStore | None" = None,
         context_assembler: "ContextAssembler | None" = None,
         project_store: ProjectStore | None = None,
@@ -375,6 +379,9 @@ class RuntimeContext:
         self.mcp_manager = mcp_manager
         # TOOL-03：MCP 工具授权状态存储（启用状态 + 分主体授权）
         self.mcp_tool_state_store = mcp_tool_state_store
+        # TOOL-04：确认请求持久化存储 + 业务管理器
+        self.confirmation_store = confirmation_store
+        self.confirmation_manager = confirmation_manager
         # 24 Context Engineering（context_enabled=False 时两者皆为 None）
         self.context_store = context_store
         self.context_assembler = context_assembler

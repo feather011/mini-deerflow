@@ -38,6 +38,7 @@ from mini_deerflow.api.routes.files import router as files_router
 from mini_deerflow.api.routes.context_usage import router as context_usage_router
 from mini_deerflow.api.routes.projects import router as projects_router
 from mini_deerflow.api.routes.mcp import router as mcp_router
+from mini_deerflow.api.routes.confirmations import router as confirmations_router
 from mini_deerflow.api.schemas.errors import (
     ErrorCode,
     build_error_response,
@@ -291,6 +292,10 @@ def create_app(
     )
     app.include_router(
         mcp_router,
+        prefix=resolved_settings.api_prefix,
+    )
+    app.include_router(
+        confirmations_router,
         prefix=resolved_settings.api_prefix,
     )
 
