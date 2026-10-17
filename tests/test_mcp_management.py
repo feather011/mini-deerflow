@@ -135,12 +135,18 @@ class TestMCPToolStateStore(unittest.TestCase):
 class TestMCPToolMetadata(unittest.TestCase):
     """MCP 工具元数据 + 默认策略不与代码内权限冲突。"""
 
-    def test_mcp_tool_metadata_not_uncategorized(self):
-        """MCP 工具元数据已分类（uncategorized=False），不会被默认拒绝。"""
+    def test_mcp_tool_metadata_undeclared_is_uncategorized(self):
+        """R2 修复：未声明能力/副作用 → uncategorized → 默认拒绝。"""
         meta = make_mcp_tool_metadata("mcp__demo__echo")
+        self.assertTrue(meta.uncategorized)
+
+    def test_mcp_tool_metadata_with_declaration_categorized(self):
+        """R2 修复：声明能力后 → categorized，不被默认拒绝。"""
+        meta = make_mcp_tool_metadata(
+            "mcp__demo__echo",
+            declared_capabilities=frozenset({"COMPUTE"}),
+        )
         self.assertFalse(meta.uncategorized)
-        # 必需分类：有 source/capabilities/side_effects
-        self.assertTrue(hasattr(meta, "source"))
         self.assertGreater(len(meta.capabilities), 0)
 
     def test_default_policy_for_mcp_disabled(self):
@@ -190,7 +196,10 @@ class TestPolicyRegistration(unittest.TestCase):
     def test_default_state_denies_execution(self):
         """默认状态：handler 应被拒绝（验收点 4）。"""
         registry = ToolPolicyRegistry()
-        registry.register_metadata(make_mcp_tool_metadata("mcp__demo__echo"))
+        registry.register_metadata(make_mcp_tool_metadata(
+            "mcp__demo__echo",
+            declared_capabilities=frozenset({"COMPUTE"}),
+        ))
         registry.set_policy("mcp__demo__echo", ToolPolicy(
             enabled=False, allowed_principals=frozenset(),
         ))
@@ -200,7 +209,10 @@ class TestPolicyRegistration(unittest.TestCase):
     def test_enabled_unauthorized_principal_denies(self):
         """启用但未授权该主体：拒绝。"""
         registry = ToolPolicyRegistry()
-        registry.register_metadata(make_mcp_tool_metadata("mcp__demo__echo"))
+        registry.register_metadata(make_mcp_tool_metadata(
+            "mcp__demo__echo",
+            declared_capabilities=frozenset({"COMPUTE"}),
+        ))
         registry.set_policy("mcp__demo__echo", ToolPolicy(
             enabled=True,
             allowed_principals=frozenset({ExecutorPrincipal.HARNESS_AGENT}),
@@ -212,7 +224,10 @@ class TestPolicyRegistration(unittest.TestCase):
     def test_enabled_authorized_principal_allows(self):
         """启用且授权该主体：允许。"""
         registry = ToolPolicyRegistry()
-        registry.register_metadata(make_mcp_tool_metadata("mcp__demo__echo"))
+        registry.register_metadata(make_mcp_tool_metadata(
+            "mcp__demo__echo",
+            declared_capabilities=frozenset({"COMPUTE"}),
+        ))
         registry.set_policy("mcp__demo__echo", ToolPolicy(
             enabled=True,
             allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
@@ -224,7 +239,10 @@ class TestPolicyRegistration(unittest.TestCase):
     def test_three_principals_independently_authorized(self):
         """三个主体分别授权，独立生效（验收点 2）。"""
         registry = ToolPolicyRegistry()
-        registry.register_metadata(make_mcp_tool_metadata("mcp__demo__echo"))
+        registry.register_metadata(make_mcp_tool_metadata(
+            "mcp__demo__echo",
+            declared_capabilities=frozenset({"COMPUTE"}),
+        ))
         registry.set_policy("mcp__demo__echo", ToolPolicy(
             enabled=True,
             allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
@@ -284,7 +302,10 @@ class TestRuntimeRebuildPersistence(unittest.TestCase):
         # 2. 重新打开，构造新 registry 并应用状态
         store2 = MCPToolStateStore(path=self.state_path)
         registry = ToolPolicyRegistry()
-        registry.register_metadata(make_mcp_tool_metadata("mcp__demo__echo"))
+        registry.register_metadata(make_mcp_tool_metadata(
+            "mcp__demo__echo",
+            declared_capabilities=frozenset({"COMPUTE"}),
+        ))
         state = store2.get("mcp__demo__echo")
         registry.set_policy("mcp__demo__echo", ToolPolicy(
             enabled=state.enabled,
@@ -351,7 +372,8 @@ class TestMCPAPI(unittest.TestCase):
         app = create_app(settings=settings)
         app.dependency_overrides[get_runtime] = lambda: runtime
         client = TestClient(app)  # 不进入 lifespan
-        resp = client.get(f"{settings.api_prefix}/api/mcp/state-file")
+        # R3 修复：路由 prefix 改为 /mcp，不再重复 /api
+        resp = client.get(f"{settings.api_prefix}/mcp/state-file")
         self.assertEqual(resp.status_code, 200, f"Got {resp.status_code}: {resp.text}")
         data = resp.json()
         self.assertEqual(data["path"], str(self.state_path))

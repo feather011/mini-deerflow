@@ -94,15 +94,29 @@ class MCPToolAdapter:
         call_timeout: float,
         max_output_bytes: int,
         invoker: ToolInvoker,
+        # TOOL-03 R2：按 server 声明的可信分类
+        declared_capabilities: frozenset[str] = frozenset(),
+        declared_side_effects: frozenset[str] = frozenset(),
     ) -> None:
         self._server_name = server_name
         self._call_timeout = call_timeout
         self._max_output_bytes = max_output_bytes
         self._invoker = invoker
+        self._declared_capabilities = declared_capabilities
+        self._declared_side_effects = declared_side_effects
 
     @property
     def server_name(self) -> str:
         return self._server_name
+
+    def to_metadata(self, qualified_name: str) -> "ToolMetadata":
+        """为该服务器的工具构造默认 ToolMetadata（按声明分类）。"""
+        from mini_deerflow.tool_contracts import make_mcp_tool_metadata
+        return make_mcp_tool_metadata(
+            qualified_name,
+            declared_capabilities=self._declared_capabilities,
+            declared_side_effects=self._declared_side_effects,
+        )
 
     def to_spec(self, mcp_tool: Any) -> ToolSpec:
         """MCP Tool → ToolSpec（给模型的 provider-neutral 描述）。"""

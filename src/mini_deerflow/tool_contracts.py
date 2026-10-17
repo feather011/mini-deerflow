@@ -21,6 +21,12 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
+from mini_deerflow.mcp_errors import MCPError
+
+
+class MCPConfigError(MCPError):
+    """MCP 配置非法（包括工具分类声明未知枚举名）。"""
+
 # ---------------------------------------------------------------------------
 # ToolSource
 # ---------------------------------------------------------------------------
@@ -639,25 +645,52 @@ def default_policy_for_sandbox() -> ToolPolicy:
     )
 
 
-# TOOL-03：MCP 工具默认元数据。capabilities 为 COMPUTE + SESSION_HISTORY_READ，
-# 区别于 sandbox_*（写沙箱/运行命令），是合理的外部 IO 抽象。
-MCP_TOOL_DEFAULT_CAPABILITIES = frozenset({
-    ToolCapability.COMPUTE,
-    ToolCapability.SESSION_HISTORY_READ,
-})
+# TOOL-03 R2：MCP 工具元数据按可信配置分类
+# 字符串 → 枚举映射；未知字符串 → MCPToolStateError（避免默认分类导致过度权限）
+_TOOL_CAPABILITY_BY_NAME: dict[str, ToolCapability] = {c.name: c for c in ToolCapability}
+_TOOL_SIDE_EFFECT_BY_NAME: dict[str, ToolSideEffect] = {s.name: s for s in ToolSideEffect}
 
 
-def make_mcp_tool_metadata(name: str) -> ToolMetadata:
-    """构造一个 MCP 工具的默认 ToolMetadata。
+def make_mcp_tool_metadata(
+    name: str,
+    declared_capabilities: frozenset[str] = frozenset(),
+    declared_side_effects: frozenset[str] = frozenset(),
+) -> ToolMetadata:
+    """构造一个 MCP 工具的 ToolMetadata。
 
-    外部 IO 类型（stdio → MCP server），side_effects = READS_NETWORK。
-    uncategorized=False（已分类）→ 不会因元数据缺失被默认拒绝。
+    TOOL-03 R2：按可信配置分类。
+    - `declared_capabilities` / `declared_side_effects` 均为空 → uncategorized，
+      评估时默认拒绝（不要"无副作用 echo 默认通过"）。
+    - 任一非空 → 按声明构造元数据。
     """
+    if not declared_capabilities and not declared_side_effects:
+        # 未声明 → 分类不可信 → uncategorized=True 触发默认拒绝
+        return ToolMetadata(
+            name=name,
+            source=ToolSourceKind.MCP,
+            capabilities=frozenset(),
+            side_effects=frozenset(),
+            uncategorized=True,
+        )
+
+    try:
+        caps = frozenset(_TOOL_CAPABILITY_BY_NAME[c] for c in declared_capabilities)
+    except KeyError as exc:
+        raise MCPConfigError(
+            f"MCP 工具 {name} 声明未知 capability: {exc.args[0]!r}"
+        ) from None
+    try:
+        sides = frozenset(_TOOL_SIDE_EFFECT_BY_NAME[s] for s in declared_side_effects)
+    except KeyError as exc:
+        raise MCPConfigError(
+            f"MCP 工具 {name} 声明未知 side_effect: {exc.args[0]!r}"
+        ) from None
+
     return ToolMetadata(
         name=name,
         source=ToolSourceKind.MCP,
-        capabilities=MCP_TOOL_DEFAULT_CAPABILITIES,
-        side_effects=frozenset({ToolSideEffect.READS_NETWORK}),
+        capabilities=caps,
+        side_effects=sides,
     )
 
 

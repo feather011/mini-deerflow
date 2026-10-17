@@ -731,23 +731,34 @@ def create_runtime(
     # mcp_servers 为空（默认）时 start() 直接返回 0，不会创建任何子进程或线程。
     mcp_manager = MCPClientManager(config.mcp_servers)
     mcp_tool_state_store = MCPToolStateStore()
-    if config.mcp_servers:
-        # required 服务器失败会在这里 fail-closed 抛 MCPStartupError；
-        # start() 内部已自行清理事件循环桥与子进程，不留半开状态。
-        mcp_manager.start(registry)
-        # TOOL-03：MCP 工具元数据 + 持久化授权状态应用到策略注册表
-        from mini_deerflow.tool_contracts import make_mcp_tool_metadata
-        for qname in mcp_manager.registered_names:
-            tool_policy_registry.register_metadata(make_mcp_tool_metadata(qname))
-            state = mcp_tool_state_store.get(qname)
-            from mini_deerflow.tool_authorization import ToolPolicy as _TP
-            tool_policy_registry.set_policy(
-                qname,
-                _TP(
-                    enabled=state.enabled,
-                    allowed_principals=state.allowed_principals,
-                ),
-            )
+    mcp_started = False
+    try:
+        if config.mcp_servers:
+            # required 服务器失败会在这里 fail-closed 抛 MCPStartupError；
+            # start() 内部已自行清理事件循环桥与子进程，不留半开状态。
+            mcp_manager.start(registry)
+            mcp_started = True
+            # TOOL-03：MCP 工具元数据 + 持久化授权状态应用到策略注册表
+            from mini_deerflow.tool_contracts import make_mcp_tool_metadata
+            for qname in mcp_manager.registered_names:
+                tool_policy_registry.register_metadata(make_mcp_tool_metadata(qname))
+                state = mcp_tool_state_store.get(qname)
+                from mini_deerflow.tool_authorization import ToolPolicy as _TP
+                tool_policy_registry.set_policy(
+                    qname,
+                    _TP(
+                        enabled=state.enabled,
+                        allowed_principals=state.allowed_principals,
+                    ),
+                )
+    except BaseException:
+        # TOOL-03 R6：状态加载/应用失败时清理已启动的 MCP 资源，再原样抛
+        if mcp_started:
+            try:
+                mcp_manager.stop()
+            except Exception:
+                pass
+        raise
 
     # TOOL-02：策略注册表已在上面创建并注入 SubagentManager 和 Agent
     agent = Agent(

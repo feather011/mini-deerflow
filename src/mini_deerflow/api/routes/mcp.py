@@ -23,9 +23,10 @@ from pydantic import BaseModel, Field
 from mini_deerflow.api.dependencies import get_runtime
 from mini_deerflow.mcp_tool_state import MCPToolStateStore
 from mini_deerflow.runtime import RuntimeContext
+from mini_deerflow.tool_authorization import ToolPolicy, ToolPolicyRegistry
 from mini_deerflow.tool_contracts import ExecutorPrincipal
 
-router = APIRouter(prefix="/api/mcp", tags=["mcp"])
+router = APIRouter(prefix="/mcp", tags=["mcp"])
 
 
 def _get_state_store(runtime: RuntimeContext) -> MCPToolStateStore:
@@ -35,6 +36,41 @@ def _get_state_store(runtime: RuntimeContext) -> MCPToolStateStore:
         store = MCPToolStateStore()
         runtime.mcp_tool_state_store = store
     return store
+
+
+def _get_policy_registry(runtime: RuntimeContext) -> ToolPolicyRegistry | None:
+    """从 runtime 获取当前 ToolPolicyRegistry。None 表示 runtime 未持有。"""
+    # RuntimeContext 没有直接持有 tool_policy_registry；Agent 持有
+    agent = getattr(runtime, "agent", None) or getattr(runtime, "integrated_agent", None)
+    if agent is None:
+        return None
+    return getattr(agent, "_tool_policy_registry", None)
+
+
+def _sync_policy(
+    runtime: RuntimeContext,
+    qualified_name: str,
+    enabled: bool,
+    allowed_principals: frozenset,
+) -> None:
+    """TOOL-03 R1：把持久化状态同步到当前 Agent 策略注册表。
+
+    若 runtime 未持有 Agent 策略注册表（例如重启前），不抛错。
+    失败抛 HTTPException(500)。
+    """
+    registry = _get_policy_registry(runtime)
+    if registry is None:
+        return
+    try:
+        registry.set_policy(qualified_name, ToolPolicy(
+            enabled=enabled,
+            allowed_principals=allowed_principals,
+        ))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"策略同步失败: {type(e).__name__}: {e}",
+        )
 
 
 def _get_principal_or_400(value: str) -> ExecutorPrincipal:
@@ -52,8 +88,12 @@ class ServerInfo(BaseModel):
     """单个 MCP 服务器的运行信息。"""
 
     name: str
+    status: str  # not_started / running / failed / stopped
     running: bool
     tool_count: int
+    # TOOL-03 R5：失败原因（仅安全码/脱敏摘要）
+    failure_kind: str | None = None
+    failure_message: str | None = None
 
 
 class ServerListResponse(BaseModel):
@@ -95,24 +135,23 @@ class GrantRequest(BaseModel):
     summary="列出 MCP 服务器及运行状态",
 )
 def list_servers(runtime: RuntimeContext = Depends(get_runtime)) -> ServerListResponse:
+    """TOOL-03 R5：服务器状态来源是「配置」，启动失败/被禁用/被停止的服务器
+    仍在清单中。失败原因仅安全码/脱敏摘要。"""
     mcp = getattr(runtime, "mcp_manager", None)
     if mcp is None:
         return ServerListResponse(servers=[])
 
-    running = set(mcp.running_servers)
-    tool_map = mcp._tools  # (server, tool) -> qualified_name 反查
-    server_tool_count: dict[str, int] = {}
-    for server_name, _ in tool_map.values():
-        server_tool_count[server_name] = server_tool_count.get(server_name, 0) + 1
-
-    names = set(running) | set(server_tool_count)
+    states = mcp.list_server_states()
     infos = [
         ServerInfo(
-            name=n,
-            running=n in running,
-            tool_count=server_tool_count.get(n, 0),
+            name=st.name,
+            status=st.status.value,
+            running=st.status.value == "running",
+            tool_count=st.tool_count,
+            failure_kind=st.failure_kind,
+            failure_message=st.failure_message,
         )
-        for n in sorted(names)
+        for st in sorted(states, key=lambda s: s.name)
     ]
     return ServerListResponse(servers=infos)
 
@@ -160,9 +199,10 @@ def set_enabled(
     if mcp is None or name not in mcp._tools:
         raise HTTPException(status_code=404, detail=f"未知工具: {name}")
 
-    store.set_enabled(name, body.enabled)
+    state = store.set_enabled(name, body.enabled)
+    # TOOL-03 R1：同步到当前 Agent 策略
+    _sync_policy(runtime, name, state.enabled, state.allowed_principals)
     server_name, _ = mcp._tools[name]
-    state = store.get(name)
     return ToolAuthInfo(
         qualified_name=name,
         server_name=server_name,
@@ -187,9 +227,10 @@ def grant_principal(
         raise HTTPException(status_code=404, detail=f"未知工具: {name}")
     principal = _get_principal_or_400(body.principal)
 
-    store.grant(name, principal)
+    state = store.grant(name, principal)
+    # TOOL-03 R1：同步到当前 Agent 策略
+    _sync_policy(runtime, name, state.enabled, state.allowed_principals)
     server_name, _ = mcp._tools[name]
-    state = store.get(name)
     return ToolAuthInfo(
         qualified_name=name,
         server_name=server_name,
@@ -214,9 +255,10 @@ def revoke_principal(
         raise HTTPException(status_code=404, detail=f"未知工具: {name}")
     principal = _get_principal_or_400(body.principal)
 
-    store.revoke(name, principal)
+    state = store.revoke(name, principal)
+    # TOOL-03 R1：同步到当前 Agent 策略
+    _sync_policy(runtime, name, state.enabled, state.allowed_principals)
     server_name, _ = mcp._tools[name]
-    state = store.get(name)
     return ToolAuthInfo(
         qualified_name=name,
         server_name=server_name,

@@ -29,10 +29,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum
 from typing import Any, Mapping
 
 import anyio
+from anyio import BrokenResourceError
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
 try:
@@ -58,6 +61,24 @@ _TIMEOUT_BACKSTOP = 2.0
 
 class MCPStartupError(RuntimeError):
     """required MCP 服务器启动失败（fail-closed）。"""
+
+
+# TOOL-03 R5：服务器状态。failure_kind/failure_message 仅安全码/脱敏摘要，
+# 不含 env 或完整命令参数。
+class ServerStatus(Enum):
+    NOT_STARTED = "not_started"
+    RUNNING = "running"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class ServerState:
+    name: str
+    status: ServerStatus
+    tool_count: int
+    failure_kind: str | None
+    failure_message: str | None
 
 
 def build_child_env(whitelist: Mapping[str, str]) -> dict[str, str]:
@@ -167,6 +188,19 @@ class MCPClientManager:
         # qualified_name → (原始服务器名, 原始工具名)
         self._tools: dict[str, tuple[str, str]] = {}
         self._started = False
+        # TOOL-03 R5：服务器状态。key=server name, value=ServerState
+        # 状态来源是「配置」而非「已运行」，因此启动失败/被禁用/被停止的服务器
+        # 仍出现在清单中。
+        self._server_states: dict[str, "ServerState"] = {
+            cfg.name: ServerState(
+                name=cfg.name,
+                status=ServerStatus.NOT_STARTED,
+                tool_count=0,
+                failure_kind=None,
+                failure_message=None,
+            )
+            for cfg in self._configs
+        }
 
     # ---------------------------------------------------------------- 状态
 
@@ -186,6 +220,14 @@ class MCPClientManager:
     @property
     def running_servers(self) -> tuple[str, ...]:
         return tuple(sorted(self._sessions))
+
+    def list_server_states(self) -> tuple[ServerState, ...]:
+        """TOOL-03 R5：返回所有已配置服务器的状态。
+
+        状态来源是「配置」，因此启动失败/被禁用/被停止的服务器
+        仍出现在清单中。
+        """
+        return tuple(self._server_states.values())
 
     # ---------------------------------------------------------------- 启动
 
@@ -225,6 +267,14 @@ class MCPClientManager:
                     config.required,
                     _safe_error(exc),
                     exc_info=True,
+                )
+                # TOOL-03 R5：记录失败状态（脱敏）
+                self._server_states[config.name] = ServerState(
+                    name=config.name,
+                    status=ServerStatus.FAILED,
+                    tool_count=0,
+                    failure_kind=type(exc).__name__,
+                    failure_message=str(exc)[:200],  # 限制长度
                 )
                 if config.required:
                     failed_required.append(config.name)
@@ -305,6 +355,9 @@ class MCPClientManager:
             call_timeout=config.call_timeout,
             max_output_bytes=config.max_output_bytes,
             invoker=self._invoke,
+            # TOOL-03 R2：可信分类
+            declared_capabilities=config.tool_capabilities,
+            declared_side_effects=config.tool_side_effects,
         )
 
         existing = {tool.name for tool in registry.list_tools()}
@@ -325,6 +378,14 @@ class MCPClientManager:
 
         _LOGGER.info(
             "MCP 服务器已连接: server=%s tools=%d", config.name, registered
+        )
+        # TOOL-03 R5：标记运行状态
+        self._server_states[config.name] = ServerState(
+            name=config.name,
+            status=ServerStatus.RUNNING,
+            tool_count=registered,
+            failure_kind=None,
+            failure_message=None,
         )
         return registered
 
@@ -432,6 +493,15 @@ class MCPClientManager:
                     "MCP 服务器关闭失败: server=%s error=%s",
                     name,
                     _safe_error(exc),
+                )
+            # TOOL-03 R5：标记为已停止
+            if name in self._server_states:
+                self._server_states[name] = ServerState(
+                    name=name,
+                    status=ServerStatus.STOPPED,
+                    tool_count=0,
+                    failure_kind=None,
+                    failure_message=None,
                 )
 
         # 桥最后关：前面所有收尾都要跑在它上面
