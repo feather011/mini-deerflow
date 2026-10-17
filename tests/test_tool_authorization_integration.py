@@ -25,6 +25,7 @@ from mini_deerflow.tool_contracts import (
     CALCULATOR_METADATA,
     PROJECT_EXECUTE_METADATA,
     SANDBOX_WRITE_FILE_METADATA,
+    TASK_NOTE_METADATA,
     ToolCapability,
     ToolSourceKind,
     ToolSideEffect,
@@ -127,30 +128,40 @@ def test_confirm_tool_visible_to_model():
     """confirm 工具在可见列表中，模型可以看到。"""
     registry = ToolPolicyRegistry()
 
-    # project_execute 策略改为直接派发（requires_confirmation=False），
-    # 但 metadata 副作用 WRITES_PROJECT 仍触发 CONFIRM
+    # project_execute 策略 requires_confirmation=False + 特殊处理 → ALLOW
     metadata, policy = registry.get("project_execute")
     assert metadata is not None
     assert not metadata.uncategorized  # 未分类才会隐藏
-    # 策略直接派发，但 metadata 副作用导致 confirm
+    # project_execute 默认直接派发
     assert policy.requires_confirmation is False
-    assert metadata.requires_confirmation() is True
+    assert metadata.requires_confirmation() is True  # WRITES_PROJECT 副作用存在
+    # 但 evaluate_tool_access 中 project_execute 特殊处理 → ALLOW
+    authority = RunAuthority(
+        principal=ExecutorPrincipal.MAIN_AGENT,
+        thread_id="t1",
+        run_id="r1",
+        project_id="proj-1",
+        granted_capabilities=frozenset({ToolCapability.PROJECT_EXEC_DELEGATE}),
+    )
+    decision = evaluate_tool_access(metadata, policy, authority)
+    assert decision.kind == AccessDecisionKind.ALLOW  # 直接派发
 
 
 def test_confirm_tool_handler_not_executed():
-    """confirm 工具被调用时，handler 不执行（需用户确认）。"""
+    """显式 requires_confirmation=True 的策略触发 CONFIRM，handler 不执行。"""
+    from mini_deerflow.tool_contracts import ToolPolicy, ExecutorPrincipal
+
     registry = ToolPolicyRegistry()
 
     store = InMemoryThreadStore()
     store.create("t1")
-    # 项目会话才能通过第二层 allow list 检查，到达第三层 confirm 判定
     thread = store.get("t1")
-    thread.project_id = "proj-1"
+    thread.project_id = "proj-1"  # 项目会话
     store.save(thread)
 
     class FakeModel:
         def decide(self, messages, tools=None):
-            return ToolCall(name="project_execute", arguments={"task": "create file"})
+            return ToolCall(name="task_note", arguments={"content": "note"})
 
     executed = False
 
@@ -159,6 +170,14 @@ def test_confirm_tool_handler_not_executed():
         executed = True
         return '{"ok": true}'
 
+    # 注入显式确认策略
+    policy = ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    )
+    registry._policies["task_note"] = policy
+
     agent = Agent(
         model=FakeModel(),
         registry=ToolRegistry(),
@@ -166,24 +185,18 @@ def test_confirm_tool_handler_not_executed():
         tool_policy_registry=registry,
     )
     agent._registry.register(Tool(
-        name="project_execute",
-        description="执行",
+        name="task_note",
+        description="记笔记",
         parameters={"type": "object", "properties": {}},
         handler=my_handler,
     ))
 
-    # confirm 抛出 ToolAuthorizationError
-    # 注意：agent.run() 内部 get_authority(granted_capabilities=frozenset()) 硬编码空集，
-    # project_execute 需要 PROJECT_EXEC_DELEGATE，在 capability_missing 层就被 DENY 了。
-    # （confirm 判定需要调用方注入真实 granted_capabilities，这里测的是当前默认行为）
+    # 显式策略 requires_confirmation=True → CONFIRM → ToolAuthorizationError
     with pytest.raises(ToolAuthorizationError) as exc_info:
-        agent.run("t1", "创建文件")
+        agent.run("t1", "记个笔记")
 
-    # 当前行为：capability_missing → DENY（granted_capabilities 为空）
-    # 未来若 agent.run() 从 thread/context 传入真实 capabilities，这里应改为 CONFIRM
-    assert exc_info.value.decision.kind == AccessDecisionKind.DENY
-    assert exc_info.value.decision.reason_code == "capability_missing"
-    assert not executed, "handler 不应被执行"
+    assert exc_info.value.decision.kind == AccessDecisionKind.CONFIRM
+    assert not executed, "confirm 工具 handler 不应被执行"
 
 
 # ============================================================================
@@ -304,38 +317,47 @@ def test_normal_session_cannot_get_project_abilities():
 # ============================================================================
 
 def test_confirm_branch_reached_with_sufficient_capability():
-    """授予所需能力后，project_execute 策略触发 CONFIRM，handler 未执行。"""
+    """task_note 默认 ALLOW；显式策略 requires_confirmation=True 才触发 CONFIRM。"""
     registry = ToolPolicyRegistry()
-
-    # 直接用 check_tool_access 验证 CONFIRM 路径
-    # agent.run() 硬编码 granted_capabilities=frozenset()，
-    # 因此通过策略层直接测试（模拟真实授权场景）
     authority = RunAuthority(
         principal=ExecutorPrincipal.MAIN_AGENT,
         thread_id="t1",
         run_id="r1",
         project_id="proj-1",
-        granted_capabilities=frozenset({ToolCapability.PROJECT_EXEC_DELEGATE}),
+        granted_capabilities=frozenset({ToolCapability.SESSION_STATE_WRITE}),
     )
-    decision = check_tool_access(registry, "project_execute", authority)
-    assert decision.kind == AccessDecisionKind.CONFIRM
-    assert decision.reason_code == "requires_confirmation"
-    # reason 文本因副作用描述不同，具体文本以实际返回为准
-    assert "确认" in decision.reason
+    # 默认策略 → ALLOW
+    decision = check_tool_access(registry, "task_note", authority)
+    assert decision.kind == AccessDecisionKind.ALLOW
+
+    # 显式确认策略 → CONFIRM
+    policy = ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    )
+    registry._policies["task_note"] = policy
+    decision2 = check_tool_access(registry, "task_note", authority)
+    assert decision2.kind == AccessDecisionKind.CONFIRM
+    assert decision2.reason_code == "requires_confirmation"
 
 
 def test_confirm_handler_not_executed_via_evaluate():
-    """evaluate_tool_access 返回 CONFIRM 时，调用方必须阻止执行。"""
-    registry = ToolPolicyRegistry()
+    """evaluate_tool_access 对显式确认策略返回 CONFIRM，调用方必须阻止执行。"""
     authority = RunAuthority(
         principal=ExecutorPrincipal.MAIN_AGENT,
         thread_id="t1",
         run_id="r1",
         project_id="proj-1",
-        granted_capabilities=frozenset({ToolCapability.PROJECT_EXEC_DELEGATE}),
+        granted_capabilities=frozenset({ToolCapability.SESSION_STATE_WRITE}),
     )
-    metadata, policy = registry.get("project_execute")
-    decision = evaluate_tool_access(metadata, policy, authority)
+    # 显式确认策略
+    policy = ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    )
+    decision = evaluate_tool_access(TASK_NOTE_METADATA, policy, authority)
     assert decision.kind == AccessDecisionKind.CONFIRM
     # 调用方应抛 ToolAuthorizationError 阻止执行
     error = ToolAuthorizationError(decision)

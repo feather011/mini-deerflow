@@ -98,6 +98,8 @@ class RunStreamManager:
         self._executor = executor
         # 按 thread_id 存储取消令牌（一次只有一个 run）
         self._tokens: dict[str, CancellationToken] = {}
+        # R5 round 4：按 thread_id 记录当前 run_id，stop() 用以标记取消
+        self._run_ids: dict[str, str] = {}
 
     # ---------------------------------------------------------------- entry
 
@@ -132,6 +134,7 @@ class RunStreamManager:
         # 6. 创建取消令牌并注册
         token = CancellationToken()
         self._tokens[thread_id] = token
+        self._run_ids[thread_id] = run_id
 
         # 7. 提交阻塞任务（传入取消令牌）
         future = self._executor.submit(
@@ -212,6 +215,7 @@ class RunStreamManager:
         self._broker.publish_terminal(run_id, event)
         # 清理取消令牌
         self._tokens.pop(thread_id, None)
+        self._run_ids.pop(thread_id, None)
 
     # ---------------------------------------------------------------- stop
 
@@ -221,12 +225,24 @@ class RunStreamManager:
         找到对应 token 并 cancel()：Agent.run 每步检查 is_cancelled()，
         project_execute 透传给 HarnessRunner，子进程被回收。
 
+        TOOL-04 R5 round 4：除 cancel token 外，同时把 run_id 写入
+        runtime._cancelled_runs，作为 R6 父权限查找的同源标记。
+        该 run 之后任何 confirmations execute 调用都被 _is_run_alive 拒绝。
+
         Returns:
             True = 已找到并取消；False = 该 Thread 没有正在运行的 run。
         """
         token = self._tokens.get(thread_id)
         if token is None:
             return False
+        # R5 round 4：把 run 标记为已取消（防止任何挂起的 confirmation execute 复活）
+        runtime = getattr(self, "_runtime", None)
+        run_id = self._run_ids.get(thread_id)
+        if runtime is not None and run_id is not None:
+            try:
+                runtime._cancelled_runs.add(run_id)
+            except Exception:
+                pass
         token.cancel()
         return True
 
