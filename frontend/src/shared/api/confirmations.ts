@@ -3,6 +3,8 @@
  *
  * 浏览器侧不持有原始参数。展示用 arguments_display；执行走
  * execute-snapshot，服务端从 ConfirmationRequest.arguments 读原值。
+ *
+ * 路径遵循现有约定：所有路径必须含 /api 前缀（与 health.ts / threads.ts 等保持一致）。
  */
 import { apiGet, apiPost } from './client'
 import type {
@@ -12,7 +14,7 @@ import type {
   ExecuteSnapshotRequest,
 } from '../types/confirmations'
 
-const PREFIX = '/confirmations'
+const PREFIX = '/api/confirmations'
 
 export async function listConfirmations(params: {
   thread_id?: string
@@ -92,6 +94,6 @@ export async function executeConfirmation(
 /** TOOL-05 活跃 run 探针。 */
 export async function getActiveRun(thread_id: string): Promise<ActiveRunResponse> {
   return apiGet<ActiveRunResponse>(
-    `/threads/${encodeURIComponent(thread_id)}/active_run`,
+    `/api/threads/${encodeURIComponent(thread_id)}/active_run`,
   )
 }

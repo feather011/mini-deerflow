@@ -196,6 +196,68 @@ class TestNoSensitiveValueLeak(unittest.TestCase):
         # 详情响应有 arguments_display
         self.assertIn("arguments_display", detail.json())
 
+    def test_url_userinfo_fragment_and_auth_header_dont_leak(self):
+        """整段响应不含 URL userinfo/fragment/Authorization 字符串原值。"""
+        fixture_url_pw = "FIXTURE_URL_PASSWORD"
+        fixture_fragment_token = "FIXTURE_FRAGMENT"
+        fixture_header = "FIXTURE_HEADER"
+        resp = self.client.post(
+            f"{self.settings.api_prefix}/confirmations",
+            json={
+                "run_id": "r-1",
+                "thread_id": "t-1",
+                "project_id": None,
+                "principal": "MAIN_AGENT",
+                "tool_name": "mcp__echo__echo",
+                "arguments": {
+                    "url": f"https://reader:{fixture_url_pw}@example.invalid/path?token=FIXTURE_QUERY#access_token={fixture_fragment_token}",
+                    "headers": [
+                        f"Authorization: Bearer {fixture_header}",
+                    ],
+                },
+                "ttl_seconds": 60.0,
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body_text = resp.text
+        # URL userinfo 密码不能出现
+        self.assertNotIn(fixture_url_pw, body_text,
+                        f"URL userinfo 密码不应出现: {body_text}")
+        # fragment 中的 token 不能出现
+        self.assertNotIn(fixture_fragment_token, body_text,
+                        f"fragment token 不应出现: {body_text}")
+        # Authorization 头中的凭据不能出现
+        self.assertNotIn(fixture_header, body_text,
+                        f"Authorization 凭据不应出现: {body_text}")
+        # 应有脱敏占位
+        self.assertIn("••••••", body_text)
+
+    def test_approve_response_also_masks(self):
+        """批准响应复用 _to_info：也应脱敏。"""
+        resp = self.client.post(
+            f"{self.settings.api_prefix}/confirmations",
+            json={
+                "run_id": "r-1",
+                "thread_id": "t-1",
+                "project_id": None,
+                "principal": "MAIN_AGENT",
+                "tool_name": "mcp__echo__echo",
+                "arguments": {
+                    "url": "https://user:FIXTURE_URL_PASSWORD@ex.com/p?q=1",
+                },
+                "ttl_seconds": 60.0,
+            },
+        )
+        rid = resp.json()["request_id"]
+        # 批准响应也复用 _to_info
+        approve_resp = self.client.post(
+            f"{self.settings.api_prefix}/confirmations/{rid}/approve",
+            json={"decided_by": "user"},
+        )
+        self.assertEqual(approve_resp.status_code, 200)
+        self.assertNotIn("FIXTURE_URL_PASSWORD", approve_resp.text,
+                        f"批准响应不应含 URL 密码: {approve_resp.text}")
+
 
 # ---------------------------------------------------------------------------
 # 2. 批准并执行一次

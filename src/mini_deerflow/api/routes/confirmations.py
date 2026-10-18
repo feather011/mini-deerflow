@@ -46,14 +46,80 @@ router = APIRouter(prefix="/confirmations", tags=["confirmations"])
 # 脱敏（TOOL-05）
 # ---------------------------------------------------------------------------
 
-_SENSITIVE_KEY = re.compile(r"(api[_-]?key|token|secret|password|passwd|pwd|auth)", re.I)
+_SENSITIVE_KEY = re.compile(
+    r"(api[_-]?key|token|secret|password|passwd|pwd|auth|credential|cred|access[_-]?token)",
+    re.I,
+)
 _MAX_DEPTH = 8
 _MASK = "••••••"
 _PREFIX_TAIL = 4  # 长值保留前 4 后 4
 
+# 匹配 Authorization / Bearer / Basic 开头的凭据字符串（用于在自由文本中识别）
+# 整段吞到结构化分隔符（行末 / ,;\"'<>]）—— 保留前导 "Authorization: " 标签。
+# 凭据内允许空格以吞 "Bearer xxx" / "Basic xxx" 形式。
+_BEARER_PATTERN = re.compile(
+    r"(\b(?:Authorization|Bearer|Basic)\b\s*[:=]?\s*)([^\r\n,;\"'<>]+)",
+    re.I,
+)
+# URL 中 userinfo（user:password@）— netloc 形如 user:pass@host
+_URL_USERINFO_PATTERN = re.compile(r"^([^/@]+):([^@]+)@(.+)$")
+
+
+def _mask_url(value: str) -> str:
+    """URL 脱敏：userinfo/凭据、query、fragment 中凭据都掩。"""
+    try:
+        sp = urlsplit(value)
+    except ValueError:
+        return value
+    netloc = sp.netloc
+    if "@" in netloc:
+        m = _URL_USERINFO_PATTERN.match(netloc)
+        if m:
+            user = m.group(1)
+            host = m.group(3)
+            # user 保留前 2 字符，password 全掩
+            masked_user = user[:2] + "•••" if len(user) > 2 else "•••"
+            netloc = f"{masked_user}:{_MASK}@{host}"
+    new_query = sp.query
+    if new_query:
+        # query 中所有 key/value 用 • 掩（保留 = 与 & 结构），value 含凭据值
+        from urllib.parse import parse_qsl, urlencode
+        pairs = parse_qsl(new_query, keep_blank_values=True)
+        masked_pairs = []
+        for k, v in pairs:
+            if _SENSITIVE_KEY.search(k):
+                masked_pairs.append((k, _MASK))
+            else:
+                # 即使 key 看起来正常，value 太长也可能是 JWT；保留结构但
+                # 不主动判断 value，仅对 key 命中掩
+                masked_pairs.append((k, v))
+        new_query = urlencode(masked_pairs)
+    new_fragment = sp.fragment
+    if new_fragment and _SENSITIVE_KEY.search(new_fragment):
+        new_fragment = _MASK
+    elif new_fragment and "=" in new_fragment:
+        # fragment 中常见形式 access_token=... 也按 key 匹配
+        from urllib.parse import parse_qsl, urlencode as _ue
+        pairs = parse_qsl(new_fragment, keep_blank_values=True)
+        masked_pairs = []
+        for k, v in pairs:
+            if _SENSITIVE_KEY.search(k):
+                masked_pairs.append((k, _MASK))
+            else:
+                masked_pairs.append((k, v))
+        new_fragment = _ue(masked_pairs)
+    return urlunsplit((sp.scheme, netloc, sp.path, new_query, new_fragment))
+
+
+def _mask_bearer_string(value: str) -> str:
+    """识别 Authorization: Bearer xxx / Bearer xxx 形式，掩凭据部分。"""
+    def _sub(m: re.Match) -> str:
+        return f"{m.group(1)}{_MASK}"
+    return _BEARER_PATTERN.sub(_sub, value)
+
 
 def _mask_value(value: Any, *, depth: int = 0) -> Any:
-    """递归脱敏：键名匹配敏感 pattern → 全掩；URL 掩 query；其他原样。"""
+    """递归脱敏：键名匹配敏感 pattern → 全掩；URL 整体脱敏；Authorization/Bearer 字符串识别；其他原样。"""
     if depth > _MAX_DEPTH:
         return "..."
     if isinstance(value, dict):
@@ -65,10 +131,11 @@ def _mask_value(value: Any, *, depth: int = 0) -> Any:
         return [_mask_value(v, depth=depth + 1) for v in value]
     if isinstance(value, str):
         if "://" in value:
-            sp = urlsplit(value)
-            if sp.query:
-                return urlunsplit((sp.scheme, sp.netloc, sp.path, _MASK, sp.fragment))
-            return value
+            return _mask_url(value)
+        # 自由文本中的 Authorization / Bearer 形式
+        if _BEARER_PATTERN.search(value):
+            return _mask_bearer_string(value)
+        return value
         return value
     return value
 

@@ -217,15 +217,11 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
   const {
     byRunId,
     online: confirmOnline,
+    activeRunId: confirmActiveRunId,
+    inFlight: confirmInFlight,
     deny: confirmDeny,
     approveAndExecute: confirmApproveAndExecute,
   } = useConfirmations(thread.thread_id)
-  // 当前活跃 run：取 items 中任一未终态卡的 run_id（与 active_run 探针一致）
-  const hasActiveRun = Object.values(
-    Object.values(byRunId).flatMap((arr) => arr),
-  ).some(
-    (c) => c.state === 'pending' || c.state === 'approved',
-  )
 
   return (
     <SSEContext.Provider value={{ events, status: streamStatus }}>
@@ -240,8 +236,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
           {/* TOOL-05：确认卡紧邻消息流底部渲染（按 run_id 分组） */}
           <ConfirmationCardList
             byRunId={byRunId}
-            hasActiveRun={hasActiveRun}
+            activeRunId={confirmActiveRunId}
             online={confirmOnline}
+            inFlight={confirmInFlight}
             onDeny={(id) => {
               void confirmDeny(id)
             }}

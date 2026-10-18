@@ -1,26 +1,24 @@
 /**
- * TOOL-05 确认卡列表（按 run_id 分组）
- *
- * 渲染策略：
- * - 顶层按 run_id 分组
- * - 每组内按 requested_at 升序
- * - 终态（executed/denied/expired/cancelled）也展示（用户能查到结果）
+ * TOOL-05 ConfirmationCardList — round 2
+ * 按 run_id 分组；将真实 activeRunId 透传给每张卡。
  */
 import type { ConfirmationResponse } from '../../shared/types/confirmations'
 import { ConfirmationCard } from './ConfirmationCard'
 
 export interface ConfirmationCardListProps {
   byRunId: Record<string, ConfirmationResponse[]>
-  hasActiveRun: boolean
+  activeRunId: string | null
   online: boolean
+  inFlight: Set<string>
   onDeny: (id: string) => void
   onApproveAndExecute: (id: string) => void
 }
 
 export function ConfirmationCardList({
   byRunId,
-  hasActiveRun,
+  activeRunId,
   online,
+  inFlight,
   onDeny,
   onApproveAndExecute,
 }: ConfirmationCardListProps) {
@@ -37,8 +35,9 @@ export function ConfirmationCardList({
               <ConfirmationCard
                 key={c.request_id}
                 confirmation={c}
-                hasActiveRun={hasActiveRun}
+                activeRunId={activeRunId}
                 online={online}
+                inFlight={inFlight}
                 onDeny={onDeny}
                 onApproveAndExecute={onApproveAndExecute}
               />
