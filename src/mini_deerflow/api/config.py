@@ -82,6 +82,15 @@ class ApiSettings:
     harness_timeout_seconds: float = 600.0
     """单次 project_execute 任务的硬超时（秒），超时后强制终止进程树。"""
 
+    # ---- TOOL-06：网络只读工具 ----
+    web_read_timeout_s: float = 10.0
+    """web_read HTTP 总超时（秒）。"""
+    web_allow_loopback: bool = False
+    """放行 loopback 主机（127.0.0.1 / ::1）；CI 跑本地 fixture 时需显式置 True。
+    生产不应开启。"""
+    web_allowed_hosts: tuple[str, ...] = ()
+    """URL 主机白名单（精确匹配，不区分大小写）；不在白名单时按其它策略拒绝。"""
+
     def __post_init__(self) -> None:
         """从环境变量覆盖各字段。"""
         # 使用 object.__setattr__ 因为 frozen=True
@@ -130,6 +139,35 @@ class ApiSettings:
                 raise ValueError(
                     f"环境变量 MINI_DEERFLOW_HARNESS_TIMEOUT_SECONDS 必须为数字，当前值: {env_harness_timeout!r}"
                 ) from exc
+        # TOOL-06：网络只读
+        env_web_timeout = _get_env("WEB_READ_TIMEOUT_S", None)
+        if env_web_timeout is not None and env_web_timeout.strip():
+            try:
+                object.__setattr__(
+                    self, "web_read_timeout_s", float(env_web_timeout.strip())
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"环境变量 MINI_DEERFLOW_WEB_READ_TIMEOUT_S 必须为数字，当前值: {env_web_timeout!r}"
+                ) from exc
+        env_web_loopback = _get_env("WEB_ALLOW_LOOPBACK", None)
+        if env_web_loopback is not None and env_web_loopback.strip():
+            object.__setattr__(
+                self,
+                "web_allow_loopback",
+                env_web_loopback.lower() in ("true", "1", "yes"),
+            )
+        env_web_hosts = _get_env("WEB_ALLOWED_HOSTS", None)
+        if env_web_hosts is not None and env_web_hosts.strip():
+            seen: set[str] = set()
+            hosts: list[str] = []
+            for raw in env_web_hosts.split(","):
+                h = raw.strip().lower()
+                if not h or h in seen:
+                    continue
+                seen.add(h)
+                hosts.append(h)
+            object.__setattr__(self, "web_allowed_hosts", tuple(hosts))
         # 验证
         if self.max_upload_bytes < 0:
             raise ValueError(

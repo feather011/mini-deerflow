@@ -50,6 +50,7 @@ from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_co
 from mini_deerflow.thread_store import InMemoryThreadStore, SQLiteThreadStore
 from mini_deerflow.project_store import InMemoryProjectStore, SQLiteProjectStore
 from mini_deerflow.tools import create_default_registry
+from mini_deerflow.web_tools import HostPolicy as WebHostPolicy
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,6 +91,21 @@ def _build_project_store(settings: ApiSettings):
     return SQLiteProjectStore(settings.db_path)
 
 
+def build_web_host_policy(settings: ApiSettings) -> WebHostPolicy:
+    """根据 ApiSettings 构造 SSRF 防护策略。
+
+    - 默认拒绝 loopback / 私有网络 / IP 字面量
+    - 显式白名单（精确匹配，lowercase）
+    - `WEB_ALLOW_LOOPBACK=1` 时放行 loopback（仅 CI/测试用）
+    """
+    return WebHostPolicy(
+        allow_loopback=bool(settings.web_allow_loopback),
+        allow_private_networks=False,
+        allow_ip_literal=False,
+        allowed_hosts=frozenset(h.lower() for h in settings.web_allowed_hosts),
+    )
+
+
 def _default_runtime_factory(
     settings: ApiSettings | None = None,
 ) -> "RuntimeContext":
@@ -113,6 +129,9 @@ def _default_runtime_factory(
             harness_root=resolved.harness_root,
             harness_timeout_seconds=resolved.harness_timeout_seconds,
             disable_budget=True,
+            # TOOL-06：网络只读配置
+            web_read_timeout_s=resolved.web_read_timeout_s,
+            web_host_policy=build_web_host_policy(resolved),
             **load_context_config(),
         ),
         workspaces_root=ws_root,

@@ -76,6 +76,7 @@ from mini_deerflow.project_store import (
 from mini_deerflow.tools import ToolRegistry
 from mini_deerflow.tool_authorization import ToolPolicyRegistry
 from mini_deerflow.tool_contracts import RunAuthority
+from mini_deerflow.web_tools import HostPolicy, UnavailableWebSearchProvider, WebSearchProvider
 from mini_deerflow.confirmation import ConfirmationStore, ConfirmationError, ConfirmationRequest
 from mini_deerflow.confirmation_manager import ConfirmationManager
 
@@ -154,6 +155,15 @@ class RuntimeConfig:
     model_timeout_seconds: float = 0.0
     # 测试用：禁用 Budget 限制
     disable_budget: bool = False
+    # TOOL-06：网络只读工具
+    web_read_timeout_s: float = 10.0
+    """web_read 单次 HTTP 总超时（连接 + 读取）。"""
+    web_host_policy: HostPolicy = field(default_factory=HostPolicy)
+    """URL 主机策略；默认拒绝 loopback / 私有 / IP 字面量。"""
+    web_search_provider: WebSearchProvider = field(
+        default_factory=UnavailableWebSearchProvider
+    )
+    """搜索 Provider；默认 UnavailableWebSearchProvider（不可用）。"""
 
 
 # =============================================================================
@@ -964,6 +974,19 @@ def create_runtime(
             except Exception:
                 pass
         raise
+
+    # TOOL-06：网络只读工具（web_search / web_read）。
+    # 默认注册；搜索 Provider 默认为 UnavailableWebSearchProvider（恒返回不可用），
+    # 只有显式注入（fake / 真实 provider）才返回结果。SSRF 防护由 HostPolicy 默认开启。
+    from mini_deerflow.web_tools import WebToolConfig, create_web_tools
+    web_cfg = WebToolConfig(
+        timeout_s=config.web_read_timeout_s,
+        host_policy=config.web_host_policy,
+    )
+    web_provider = config.web_search_provider
+    web_tools = create_web_tools(web_cfg, provider=web_provider)
+    existing_web = {tool.name for tool in registry.list_tools()}
+    registry.register_many([t for t in web_tools if t.name not in existing_web])
 
     # TOOL-02：策略注册表已在上面创建并注入 SubagentManager 和 Agent
     agent = Agent(

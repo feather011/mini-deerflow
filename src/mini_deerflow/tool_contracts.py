@@ -580,6 +580,31 @@ SANDBOX_RUN_COMMAND_METADATA = ToolMetadata(
 )
 
 
+# TOOL-06：网络只读工具
+#
+# - `web_search` 与 `web_read` 共享 `NETWORK_READ` 能力。
+# - side_effects 标 `READS_NETWORK`（非项目操作，普通会话亦可调用）。
+# - 不授予 `EXTERNAL_SERVICE_READ`（那是给接入可控外部服务留的——搜索/读取是
+#   模型触发的不可信数据源，不能获得"调用外部服务"的更强信任）。
+# - requires_confirmation() 默认 True（READS_NETWORK 不在豁免集合），
+#   但默认策略（`default_policy_for_web`）会把它显式置 False：已启用且已授权
+#   的只读搜索/读取默认无需逐次确认。策略要求显式置位，避免「以为禁用确认」与
+#   「实际是元数据豁免」混在一起。
+WEB_SEARCH_METADATA = ToolMetadata(
+    name="web_search",
+    source=ToolSourceKind.LOCAL,
+    capabilities=frozenset({ToolCapability.NETWORK_READ}),
+    side_effects=frozenset({ToolSideEffect.READS_NETWORK}),
+)
+
+WEB_READ_METADATA = ToolMetadata(
+    name="web_read",
+    source=ToolSourceKind.LOCAL,
+    capabilities=frozenset({ToolCapability.NETWORK_READ}),
+    side_effects=frozenset({ToolSideEffect.READS_NETWORK}),
+)
+
+
 # ---------------------------------------------------------------------------
 # 内置默认策略构造
 # ---------------------------------------------------------------------------
@@ -645,6 +670,22 @@ def default_policy_for_sandbox() -> ToolPolicy:
     return ToolPolicy(
         enabled=False,
         allowed_principals=frozenset(),
+    )
+
+
+def default_policy_for_web() -> ToolPolicy:
+    """TOOL-06：网络只读工具默认策略。
+
+    - 默认启用（已启用的搜索/读取不需要每次确认）
+    - 主 Agent 可见（MINI_SUBAGENT 暂不直接做网络读取，避免子代理扩大外部依赖；
+      如需委派，由用户/策略显式授权）
+    - `requires_confirmation=False`：已授权的只读调用不弹确认；
+      若用户/策略希望强制逐次确认，把 `policy.requires_confirmation` 置 True 即可。
+    """
+    return ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=False,
     )
 
 
@@ -726,6 +767,9 @@ BUILTIN_TOOL_METADATA: dict[str, ToolMetadata] = {
     "sandbox_read_file": SANDBOX_READ_FILE_METADATA,
     "sandbox_write_file": SANDBOX_WRITE_FILE_METADATA,
     "sandbox_run_command": SANDBOX_RUN_COMMAND_METADATA,
+    # TOOL-06：网络只读工具
+    "web_search": WEB_SEARCH_METADATA,
+    "web_read": WEB_READ_METADATA,
 }
 
 
@@ -745,6 +789,8 @@ def default_policy_for(name: str) -> ToolPolicy | None:
         return default_policy_for_subagent()
     if name.startswith("sandbox_"):
         return default_policy_for_sandbox()
+    if name in ("web_search", "web_read"):
+        return default_policy_for_web()
     if name.startswith("mcp__"):
         return default_policy_for_mcp_tool()
     return None
