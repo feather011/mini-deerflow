@@ -100,6 +100,10 @@ class SubagentRunner:
     context_assembler: ContextAssembler | None = None
     # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
     tool_policy_registry: "ToolPolicyRegistry | None" = None
+    # TOOL-02：子任务从父 Agent 继承的已授予能力
+    parent_granted_capabilities: frozenset = field(default_factory=frozenset)
+    # TOOL-02：子任务继承父 Agent 的 project_id
+    parent_project_id: str | None = None
 
     def run(self) -> SubagentResult:
         """执行子任务并返回结果。"""
@@ -111,10 +115,15 @@ class SubagentRunner:
             if self.task.status == TaskStatus.QUEUED:
                 self.task.transition_to(TaskStatus.RUNNING)
 
-            # 创建独立 Thread
+            # 创建独立 Thread（继承父项目的 project_id）
             if self.store.exists(thread_id):
                 self.store.delete(thread_id)
             self.store.create(thread_id)
+            # TOOL-02（R2a-2）：子线程继承父项目的 project_id，使项目工具可访问
+            if self.parent_project_id is not None:
+                sub_thread = self.store.get(thread_id)
+                sub_thread.project_id = self.parent_project_id
+                self.store.save(sub_thread)
 
             started_at = time.monotonic()
             if self.task.started_at is not None:
@@ -148,6 +157,10 @@ class SubagentRunner:
                 run_id=self.run_id,
                 # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
                 tool_policy_registry=self.tool_policy_registry,
+                # TOOL-02：子任务从父 Agent 继承的已授予能力
+                parent_granted_capabilities=self.parent_granted_capabilities,
+                # TOOL-02：子任务继承父 Agent 的 project_id
+                parent_project_id=self.parent_project_id,
             )
 
             # 检查取消（在开始前）
@@ -280,6 +293,10 @@ class _BudgetAwareAgent:
         run_id: str = "",
         # TOOL-02：子代理策略注册表（与父共享），principal = MINI_SUBAGENT
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
+        # TOOL-02：子任务从父 Agent 继承的已授予能力
+        parent_granted_capabilities: frozenset = frozenset(),
+        # TOOL-02：子任务继承父 Agent 的 project_id（项目会话上下文）
+        parent_project_id: str | None = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -301,6 +318,10 @@ class _BudgetAwareAgent:
         self._last_assembled: "object | None" = None
         # TOOL-02：子代理与父共享策略注册表
         self._tool_policy_registry = tool_policy_registry
+        # TOOL-02：子任务从父 Agent 继承的已授予能力（由 subagent_submit handler 设置）
+        self._parent_granted_capabilities: frozenset = parent_granted_capabilities
+        # TOOL-02：子任务继承父 Agent 的 project_id
+        self._parent_project_id: str | None = parent_project_id
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
@@ -326,6 +347,24 @@ class _BudgetAwareAgent:
         # 本地工具、mcp__* 工具、子代理工具一视同仁——这里按名字过滤，
         # 不区分来源，因此三类工具同时受限。
         model_tools = filter_tool_specs(self._registry.tool_specs(), self._allowed)
+
+        # TOOL-02 第二层（R2b）：策略可见性过滤——DENY 工具隐藏，ALLOW/CONFIRM 可见
+        if self._tool_policy_registry is not None:
+            from mini_deerflow.tool_authorization import check_tool_access
+            authority = self._tool_policy_registry.get_authority(
+                thread_id=thread_id,
+                run_id=self._run_id,
+                project_id=self._parent_project_id,
+                granted_capabilities=self._parent_granted_capabilities,
+                principal=ExecutorPrincipal.MINI_SUBAGENT,
+            )
+            visible_names: set[str] = set()
+            for spec in model_tools:
+                decision = check_tool_access(self._tool_policy_registry, spec.name, authority)
+                if decision.is_denied:
+                    continue
+                visible_names.add(spec.name)
+            model_tools = [s for s in model_tools if s.name in visible_names]
 
         for step in range(1, self._max_steps + 1):
             # 取消检查
@@ -392,8 +431,8 @@ class _BudgetAwareAgent:
                     authority = self._tool_policy_registry.get_authority(
                         thread_id=thread_id,
                         run_id=self._run_id,
-                        project_id=None,
-                        granted_capabilities=frozenset(),  # 子代理由父授权决定
+                        project_id=self._parent_project_id,
+                        granted_capabilities=self._parent_granted_capabilities,  # 子代理由父授权决定
                         principal=ExecutorPrincipal.MINI_SUBAGENT,
                     )
                     auth_decision = check_tool_access(
@@ -403,7 +442,16 @@ class _BudgetAwareAgent:
                         from mini_deerflow.tool_authorization import ToolAuthorizationError
                         raise ToolAuthorizationError(auth_decision)
 
-                result = self._registry.execute(decision.name, decision.arguments)
+                # TOOL-02：构造执行上下文，包含父授权能力（供 subagent_submit handler 提取并传递）
+                from mini_deerflow.middleware import ExecutionContext
+                tool_ctx = ExecutionContext(
+                    thread_id=thread_id,
+                    run_id=self._run_id,
+                    granted_capabilities=self._parent_granted_capabilities,
+                    cancellation_token=self._token,
+                    budget=self._budget,
+                )
+                result = self._registry.execute(decision.name, decision.arguments, context=tool_ctx)
                 # 与主 Agent 一致：工具往返只留在 working_messages（本轮喂模型），
                 # **不写入 pending**——Thread 只提交 user 与最终 assistant，
                 # 避免落库一条没有配对 tool_use 的孤儿 tool_result。
@@ -438,6 +486,8 @@ class SubagentManager:
         shared_budget: SubagentBudget | None = None,
         context_assembler: ContextAssembler | None = None,
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
+        # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问和 project_id 反查）
+        thread_store: ThreadStore | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency 必须 >= 1")
@@ -459,6 +509,8 @@ class SubagentManager:
         self._context_assembler = context_assembler
         # TOOL-02：子代理持有与父相同的策略注册表，principal = MINI_SUBAGENT
         self._tool_policy_registry = tool_policy_registry
+        # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问）
+        self._store = thread_store
 
         self._lock = threading.Lock()
         self._tasks: dict[str, SubagentTask] = {}
@@ -487,6 +539,10 @@ class SubagentManager:
         model: Model | None = None,
         registry: ToolRegistry | None = None,
         context_policy: SubagentContextPolicy | None = None,
+        # TOOL-02：父 Agent 已授予子任务的能力集合
+        parent_granted_capabilities: frozenset = frozenset(),
+        # TOOL-02：父 Agent 的 project_id（继承项目会话上下文）
+        parent_project_id: str | None = None,
     ) -> SubagentTask:
         """提交一个子任务。
 
@@ -531,6 +587,10 @@ class SubagentManager:
             depth=depth,
             timeout_seconds=timeout_seconds or self._default_timeout,
             context_policy=context_policy,
+            # TOOL-02：父 Agent 已授予子任务的能力集合
+            parent_granted_capabilities=parent_granted_capabilities,
+            # TOOL-02：父 Agent 的 project_id
+            parent_project_id=parent_project_id,
         )
 
         token = CancellationToken()
@@ -587,11 +647,17 @@ class SubagentManager:
                 task=task_obj,
                 model=model or FakeModel(),
                 registry=registry or ToolRegistry(),
-                store=InMemoryThreadStore(),
+                store=self._store or InMemoryThreadStore(),
                 budget=effective_budget,
                 cancellation_token=token,
                 parent_run_id=task.parent_run_id,
                 context_assembler=self._context_assembler,
+                # TOOL-02：子代理与父共享策略注册表
+                tool_policy_registry=self._tool_policy_registry,
+                # TOOL-02：子任务从父 Agent 继承的已授予能力
+                parent_granted_capabilities=task.parent_granted_capabilities,
+                # TOOL-02：子任务继承父 Agent 的 project_id
+                parent_project_id=task.parent_project_id,
             )
 
             result = runner.run()
