@@ -240,15 +240,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
             activeRunId={confirmActiveRunId}
             online={confirmOnline}
             inFlight={confirmInFlight}
-            onDeny={(id) => {
-              void confirmDeny(id)
-            }}
-            onApproveAndExecute={(id) => {
-              void confirmApproveAndExecute(id)
-            }}
-            onVerify={(id) => {
-              void confirmVerify(id)
-            }}
+            onDeny={confirmDeny}
+            onApproveAndExecute={confirmApproveAndExecute}
+            onVerify={confirmVerify}
           />
         </div>
 

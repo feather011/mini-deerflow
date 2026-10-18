@@ -1,8 +1,9 @@
 /**
- * TOOL-05 ConfirmationCardList — round 2
+ * TOOL-05 ConfirmationCardList — round 4 (R4-3)
  * 按 run_id 分组；将真实 activeRunId 透传给每张卡。
  */
 import type { ConfirmationResponse } from '../../shared/types/confirmations'
+import type { OpOutcome } from './ConfirmationCard'
 import { ConfirmationCard } from './ConfirmationCard'
 
 export interface ConfirmationCardListProps {
@@ -10,9 +11,9 @@ export interface ConfirmationCardListProps {
   activeRunId: string | null
   online: boolean
   inFlight: Set<string>
-  onDeny: (id: string) => void
-  onApproveAndExecute: (id: string) => void
-  onVerify: (id: string) => void
+  onDeny: (id: string) => Promise<OpOutcome>
+  onApproveAndExecute: (id: string) => Promise<OpOutcome>
+  onVerify: (id: string) => Promise<unknown>
 }
 
 export function ConfirmationCardList({

@@ -13,7 +13,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { ConfirmationCard } from './ConfirmationCard'
+import { ConfirmationCard, type OpOutcome } from './ConfirmationCard'
 import type { ConfirmationResponse } from '../../shared/types/confirmations'
 
 const baseArgs = {
@@ -217,8 +217,8 @@ describe('ConfirmationCard', () => {
 
   it('双击同一按钮：仅发送一次（组件端即时守卫）', async () => {
     const user = userEvent.setup()
-    // 永不 resolve 的 promise：模拟请求进行中（ref 保持 true 直到 useEffect 清理）
-    const onApproveAndExecute = vi.fn(() => new Promise(() => {}))
+    // R6：显式 Promise<OpOutcome> 类型，与回调签名一致
+    const onApproveAndExecute = vi.fn((): Promise<OpOutcome> => new Promise(() => {}))
     render(
       <ConfirmationCard
         confirmation={makePending()}

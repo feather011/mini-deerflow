@@ -125,8 +125,9 @@ export function ConfirmationCard({
   const busy = inFlight.has(c.request_id) || localPending
   const inFlightThis = busy || opUnknown
   const releaseLocal = useCallback(() => {
+    // R4-1：同步清 UI state；ref 直接清（恢复按钮可点击）
     setLocalPending(false)
-    // ref 延迟清（由 useEffect 监听 business 变化触发），不依赖 macrotask 调度
+    localPendingRef.current = false
   }, [])
   /**
    * 提交守卫（R4）：
@@ -164,11 +165,15 @@ export function ConfirmationCard({
   )
   const handleApproveAndExecute = submitGuard(onApproveAndExecute)
   const handleDeny = submitGuard(onDeny)
-  const handleVerify = useCallback(() => {
-    // 核对是纯 GET：先释放本地锁定，再让父级拉最新状态
+  // R4-2：async，等待核对结果，不在结果前清除未知状态
+  const handleVerify = useCallback(async () => {
     releaseLocal()
-    setOpUnknown(false)
-    onVerify(c.request_id)
+    const res = await Promise.resolve(onVerify(c.request_id))
+    const kind = (res as { kind?: string } | undefined)?.kind
+    // 仅在核对确认未领取/终态时清除 unknown；unknown 时保持展示
+    if (kind === 'done' || kind === 'retryable') {
+      setOpUnknown(false)
+    }
   }, [releaseLocal, onVerify, c.request_id])
 
   // 后端状态离开待处理（父级回写）后，重置本地守卫，让卡片可再次操作
