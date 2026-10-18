@@ -1,23 +1,22 @@
 /**
- * useConfirmations — TOOL-05 round 2 修复
+ * useConfirmations — TOOL-05 round 3
  *
- * 设计：
- * - 轮询间隔 2s；仅在有 active run 时启动；切会话/卸载时停止
- * - 每次轮询或操作都用 generation 标签：旧 generation 的响应 setItems 会被丢弃
- *   防止慢响应在切线程后污染新线程
- * - fetch / approve / deny / execute 都用 AbortController，卸载/切线程时 abort
- * - 真实 activeRunId 从 getActiveRun 读出，传给卡片
- * - 卡片按 run_id 精确控制；不从缓存状态猜活性
- * - run 结束（activeRunId=null）也拉一次列表以核对终态，避免跳过结果恢复
- * - 断连不重放：fetch 错误保留旧数据 + 显示离线状态，**不**自动重发操作
+ * R3（旧响应污染）：
+ * - generationRef：切会话/卸载后旧响应（含错误路径）一律丢弃
+ * - fetchSeqRef：同世代内查询顺序保护——旧查询晚到不覆盖新结果
+ * - mergeClobber：executed 终态不被 pending/approved 回退
+ * - AbortController.signal 实际传到 fetch（查询）
+ *
+ * R4（断连恢复）：
+ * - 操作失败 → 先核对该 request（GET 无副作用，不重放）：
+ *   - 后端仍 pending/approved（未领取）→ kind='retryable'（卡片释放守卫，允许明确重试）
+ *   - 已 executed/终态 → kind='done'（如实展示）
+ *   - 核对也失败 → kind='unknown'（保持未知，禁用重放）
+ * - verify(id)：纯核对入口（无副作用）
  *
  * 返回：
- * - items: 本会话期间见过的所有 confirmation（按 request_id 索引）
- * - byRunId: 按 run_id 分组
- * - activeRunId: 真实活跃 run_id（可能 null）
- * - online: 轮询是否成功
- * - inFlight: 当前正在操作的 request_id 集合（防止重复点击）
- * - refresh / approve / deny / cancel / approveAndExecute
+ * - items / byRunId / activeRunId / online / inFlight
+ * - approve / deny / cancel / approveAndExecute / verify：均返回 { kind }
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
@@ -25,32 +24,53 @@ import {
   cancelConfirmation,
   denyConfirmation,
   executeSnapshot,
-  listConfirmations,
   getActiveRun,
+  getConfirmation,
+  listConfirmations,
 } from '../../shared/api/confirmations'
 import type { ConfirmationResponse } from '../../shared/types/confirmations'
 
 const POLL_INTERVAL_MS = 2000
+
+/** 操作结论：done=已确认；retryable=后端未领取可重试；unknown=结果未知 */
+export type OpKind = 'done' | 'retryable' | 'unknown'
+
+/**
+ * 合并守卫：executed 终态不被旧查询/回退状态覆盖（R3）。
+ * 其余组合后到覆盖（deny/cancel/expired 互转由后端状态机保证）。
+ */
+function mergeClobber(
+  prev: ConfirmationResponse | undefined,
+  incoming: ConfirmationResponse,
+): ConfirmationResponse {
+  if (prev && prev.state === 'executed' && incoming.state !== 'executed') {
+    return prev // 终态不回退
+  }
+  return incoming
+}
+
+function isAbortError(err: unknown): boolean {
+  return (err as { name?: string })?.name === 'AbortError'
+}
 
 export interface UseConfirmationsResult {
   /** 按 request_id 索引的所有 confirmation（含终态）。 */
   items: Record<string, ConfirmationResponse>
   /** 按 run_id 索引的 confirmation 列表。 */
   byRunId: Record<string, ConfirmationResponse[]>
-  /** 真实活跃 run_id（由 getActiveRun 读出）。null 表示无活跃或查询失败。 */
+  /** 真实活跃 run_id（由 getActiveRun 读出）。 */
   activeRunId: string | null
   /** 轮询是否成功。 */
   online: boolean
   /** 正在操作的 request_id 集合。 */
   inFlight: Set<string>
   refresh: () => Promise<void>
-  approve: (id: string) => Promise<ConfirmationResponse | null>
-  deny: (id: string) => Promise<ConfirmationResponse | null>
-  cancel: (id: string) => Promise<ConfirmationResponse | null>
-  approveAndExecute: (id: string) => Promise<{
-    approved: ConfirmationResponse | null
-    executed: ConfirmationResponse | null
-  }>
+  approve: (id: string) => Promise<{ kind: OpKind }>
+  deny: (id: string) => Promise<{ kind: OpKind }>
+  cancel: (id: string) => Promise<{ kind: OpKind }>
+  approveAndExecute: (id: string) => Promise<{ kind: OpKind }>
+  /** 纯核对（GET 无副作用）：拉最新状态并合并。 */
+  verify: (id: string) => Promise<{ kind: OpKind }>
 }
 
 export function useConfirmations(
@@ -67,68 +87,86 @@ export function useConfirmations(
   const threadIdRef = useRef<string | null>(threadId ?? null)
   threadIdRef.current = threadId ?? null
   const abortRef = useRef<AbortController | null>(null)
+  /** R3：同世代查询顺序——最新一次查询序号；旧序号响应不写入 */
+  const fetchSeqRef = useRef<number>(0)
 
-  // 切线程/卸载时调用：递增 generation 令旧响应 setState 失效 + abort 在途请求
+  // 切线程/卸载：递增世代 + abort 在途查询
   const stopAll = useCallback(() => {
     generationRef.current += 1
+    fetchSeqRef.current += 1 // 令在途查询的 seq 判定立即过期
     if (abortRef.current) {
       abortRef.current.abort()
       abortRef.current = null
     }
   }, [])
 
+  /** 带顺序与世代双保护的合并（单条） */
+  const mergeOne = useCallback(
+    (resp: ConfirmationResponse, gen: number) => {
+      if (gen !== generationRef.current) return // 旧世代：不写入
+      setItems((prev) => {
+        const next = { ...prev }
+        next[resp.request_id] = mergeClobber(prev[resp.request_id], resp)
+        return next
+      })
+    },
+    [],
+  )
+
   const fetchAndMerge = useCallback(async (): Promise<string | null> => {
     const tid = threadIdRef.current
     if (!tid) return null
     const myGen = generationRef.current
+    const seq = ++fetchSeqRef.current
     const controller = new AbortController()
     abortRef.current?.abort()
     abortRef.current = controller
-    try {
-      const probe = await getActiveRun(tid)
-      if (generationRef.current !== myGen) return null
-      const active = probe.run_id
-      setOnline(true)
-      setActiveRunId(active)
-      if (active === null) {
-        // 无活跃 run：也拉一次列表以核对已缓存记录的终态
-        // （覆盖"运行结束时已显示 pending 实际已 executed/cancelled"）
-        try {
-          const list = await listConfirmations({ thread_id: tid })
-          if (generationRef.current !== myGen) return null
-          setItems((prev) => {
-            const next = { ...prev }
-            for (const c of list) {
-              next[c.request_id] = c
-            }
-            return next
-          })
-        } catch {
-          setOnline(false)
-        }
-        return null
-      }
-      const list = await listConfirmations({ thread_id: tid, run_id: active })
-      if (generationRef.current !== myGen) return null
+    const sig = controller.signal
+    /** R3：世代 + 顺序双检查（含错误路径） */
+    const stale = (): boolean =>
+      generationRef.current !== myGen || seq !== fetchSeqRef.current
+    const mergeList = (
+      list: ConfirmationResponse[],
+      runFilter: string | null,
+    ): void => {
       setItems((prev) => {
         const next = { ...prev }
         for (const c of list) {
           // 仅接受当前 thread / run 的记录
-          if (c.thread_id === tid && c.run_id === active) {
-            next[c.request_id] = c
-          }
+          if (c.thread_id !== tid) continue
+          if (runFilter !== null && c.run_id !== runFilter) continue
+          next[c.request_id] = mergeClobber(prev[c.request_id], c)
         }
         return next
       })
+    }
+    try {
+      const probe = await getActiveRun(tid, sig)
+      if (stale()) return null
+      const active = probe.run_id
       setOnline(true)
+      setActiveRunId(active)
+      // run 结束（active=null）也拉列表核对终态；进行中按 run 过滤
+      try {
+        const list = await listConfirmations(
+          active === null
+            ? { thread_id: tid }
+            : { thread_id: tid, run_id: active },
+          sig,
+        )
+        if (stale()) return null
+        mergeList(list, active)
+      } catch (inner) {
+        if (isAbortError(inner) || stale()) return null
+        setOnline(false)
+      }
       return active
     } catch (err) {
-      // abort 静默忽略
-      if ((err as { name?: string })?.name === 'AbortError') return null
+      // R3：abort 静默；旧世代/旧序号错误不污染当前会话（setOnline 也要检查）
+      if (isAbortError(err) || stale()) return null
       setOnline(false)
       return null
     } finally {
-      // 释放 controller（仅当仍是自己的）
       if (abortRef.current === controller) {
         abortRef.current = null
       }
@@ -137,20 +175,16 @@ export function useConfirmations(
 
   useEffect(() => {
     if (!threadId) return
-    // 切线程：清空状态 + 停旧轮询 + 升 generation
     stopAll()
     setItems({})
     setActiveRunId(null)
     setOnline(true)
-    const myGen = ++generationRef.current
 
     void fetchAndMerge()
     const handle = setInterval(() => {
-      if (generationRef.current !== myGen) return
       void fetchAndMerge()
     }, POLL_INTERVAL_MS)
     return () => {
-      // 卸载：升 generation + abort
       stopAll()
       clearInterval(handle)
     }
@@ -160,25 +194,7 @@ export function useConfirmations(
     await fetchAndMerge()
   }, [fetchAndMerge])
 
-  /** 内部：把操作结果（含终态）合并到 items；带 generation 校验 */
-  /** R3：变更响应必须带发起时的世代号；旧世代（切会话/卸载后）丢弃，不写入新会话。 */
-  const mergeOne = useCallback(
-    (resp: ConfirmationResponse, gen: number) => {
-      if (gen !== generationRef.current) return // 过期世代：不写入
-      setItems((prev) => {
-        const next = { ...prev }
-        next[resp.request_id] = resp
-        return next
-      })
-    },
-    [],
-  )
-
-  /**
-   * 同步获取 in-flight 标记（返回 false 表示已在飞，调用方应立即放弃）。
-   * 关键：先写 ref 再 setState — setState 是异步批处理，同一 tick 内的第二次
-   * 点击读 ref 必须立刻看到第一次的结果，否则双击会重复发送（R4）。
-   */
+  /** 同 tick 可见的 in-flight 守卫（先写 ref 再 setState） */
   const tryAddInFlight = useCallback((id: string): boolean => {
     if (inFlightRef.current.has(id)) return false
     const next = new Set(inFlightRef.current)
@@ -195,102 +211,94 @@ export function useConfirmations(
     setInFlight(next)
   }, [])
 
+  /** R4：核对该 request（GET 无副作用），判定可重试/已确认/未知 */
+  const confirmFromServer = useCallback(
+    async (id: string, gen: number): Promise<OpKind> => {
+      try {
+        const latest = await getConfirmation(id)
+        if (gen !== generationRef.current) return 'unknown'
+        mergeOne(latest, gen)
+        if (
+          latest.state === 'pending' ||
+          (latest.state === 'approved' && latest.execution_result == null)
+        ) {
+          // 未领取 → 允许用户明确重试
+          return 'retryable'
+        }
+        // executed（含 claimed）/denied/cancelled/expired → 如实展示
+        return 'done'
+      } catch {
+        return 'unknown'
+      }
+    },
+    [mergeOne],
+  )
+
+  const verify = useCallback(
+    async (id: string): Promise<{ kind: OpKind }> => {
+      const gen = generationRef.current
+      return { kind: await confirmFromServer(id, gen) }
+    },
+    [confirmFromServer],
+  )
+
+  /** R4/R3 通用操作外壳：in-flight 守卫 + 世代捕获 + 失败核对 */
+  const runOperation = useCallback(
+    async (
+      id: string,
+      action: () => Promise<ConfirmationResponse>,
+      afterMerge?: (
+        resp: ConfirmationResponse,
+        gen: number,
+      ) => Promise<{ kind: OpKind }>,
+    ): Promise<{ kind: OpKind }> => {
+      if (!tryAddInFlight(id)) return { kind: 'unknown' }
+      const gen = generationRef.current
+      try {
+        const resp = await action()
+        mergeOne(resp, gen)
+        if (afterMerge) return await afterMerge(resp, gen)
+        await refresh()
+        return { kind: 'done' }
+      } catch {
+        // R3：错误路径世代检查——旧会话失败不把新会话标离线
+        if (gen === generationRef.current) setOnline(false)
+        // R4：先核对，不自动重放副作用
+        return { kind: await confirmFromServer(id, gen) }
+      } finally {
+        removeInFlight(id)
+      }
+    },
+    [mergeOne, refresh, confirmFromServer],
+  )
+
   const approve = useCallback(
-    async (id: string) => {
-      if (!tryAddInFlight(id)) return null
-      const gen = generationRef.current
-      try {
-        const resp = await approveConfirmation(id)
-        mergeOne(resp, gen)
-        await refresh()
-        return resp
-      } catch {
-        setOnline(false)
-        return null
-      } finally {
-        removeInFlight(id)
-      }
-    },
-    [tryAddInFlight, removeInFlight, mergeOne, refresh],
+    (id: string) => runOperation(id, () => approveConfirmation(id)),
+    [runOperation],
   )
-
   const deny = useCallback(
-    async (id: string) => {
-      if (!tryAddInFlight(id)) return null
-      const gen = generationRef.current
-      try {
-        const resp = await denyConfirmation(id)
-        mergeOne(resp, gen)
-        await refresh()
-        return resp
-      } catch {
-        setOnline(false)
-        return null
-      } finally {
-        removeInFlight(id)
-      }
-    },
-    [tryAddInFlight, removeInFlight, mergeOne, refresh],
+    (id: string) => runOperation(id, () => denyConfirmation(id)),
+    [runOperation],
   )
-
   const cancel = useCallback(
-    async (id: string) => {
-      if (!tryAddInFlight(id)) return null
-      const gen = generationRef.current
-      try {
-        const resp = await cancelConfirmation(id)
-        mergeOne(resp, gen)
-        await refresh()
-        return resp
-      } catch {
-        setOnline(false)
-        return null
-      } finally {
-        removeInFlight(id)
-      }
-    },
-    [tryAddInFlight, removeInFlight, mergeOne, refresh],
+    (id: string) => runOperation(id, () => cancelConfirmation(id)),
+    [runOperation],
   )
-
   const approveAndExecute = useCallback(
-    async (id: string): Promise<{
-      approved: ConfirmationResponse | null
-      executed: ConfirmationResponse | null
-    }> => {
-      if (!tryAddInFlight(id)) {
-        return { approved: null, executed: null }
-      }
-      const current = items[id]
-      if (!current) {
-        removeInFlight(id)
-        return { approved: null, executed: null }
-      }
-      const gen = generationRef.current
-      try {
+    (id: string) =>
+      runOperation(id, async () => {
         const approved = await approveConfirmation(id)
-        mergeOne(approved, gen)
+        mergeOne(approved, generationRef.current)
+        // 快照执行：服务端读参数原值
         const executed = await executeSnapshot(id, {
           run_id: approved.run_id,
           thread_id: approved.thread_id,
           tool_name: approved.tool_name,
           arguments_hash: approved.arguments_hash,
         })
-        mergeOne(executed, gen)
-        await refresh()
-        return { approved, executed }
-      } catch {
-        setOnline(false)
-        try {
-          await getActiveRun(threadIdRef.current ?? '')
-        } catch {
-          /* ignore */
-        }
-        return { approved: null, executed: null }
-      } finally {
-        removeInFlight(id)
-      }
-    },
-    [items, tryAddInFlight, removeInFlight, mergeOne, refresh],
+        return executed
+      }),
+    [runOperation, mergeOne],
   )
 
   const byRunId: Record<string, ConfirmationResponse[]> = {}
@@ -311,5 +319,6 @@ export function useConfirmations(
     deny,
     cancel,
     approveAndExecute,
+    verify,
   }
 }

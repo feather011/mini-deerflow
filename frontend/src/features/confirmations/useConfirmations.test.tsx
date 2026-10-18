@@ -273,11 +273,10 @@ describe('useConfirmations', () => {
     expect(firstStarted).toBe(true)
     expect(approveSpy.mock.calls.length).toBe(1)
 
-    // 立即触发第二次
+    // 立即触发第二次（inFlight 守卫直接返回 unknown）
     const p2 = result.current.approveAndExecute('cf-1')
     const result2 = await p2
-    expect(result2.approved).toBeNull()
-    expect(result2.executed).toBeNull()
+    expect(result2.kind).toBe('unknown')
     // approve 只被调一次（inFlight 守卫）
     expect(approveSpy.mock.calls.length).toBe(1)
   })

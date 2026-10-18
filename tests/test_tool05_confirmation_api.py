@@ -258,6 +258,91 @@ class TestNoSensitiveValueLeak(unittest.TestCase):
         self.assertNotIn("FIXTURE_URL_PASSWORD", approve_resp.text,
                         f"批准响应不应含 URL 密码: {approve_resp.text}")
 
+    def test_command_with_url_and_bearer_masked(self):
+        """R5 r3：命令文本含 URL + Authorization Bearer —— 凭据不得下发。"""
+        fixture_header = "FIXTURE_HEADER"
+        resp = self.client.post(
+            f"{self.settings.api_prefix}/confirmations",
+            json={
+                "run_id": "r-1", "thread_id": "t-1", "project_id": None,
+                "principal": "MAIN_AGENT", "tool_name": "mcp__echo__echo",
+                "arguments": {
+                    "command": f'curl -H "Authorization: Bearer {fixture_header}" https://example.invalid/path',
+                },
+                "ttl_seconds": 60.0,
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body_text = resp.text
+        self.assertNotIn(fixture_header, body_text,
+                        f"命令中的 Bearer 凭据不应出现: {body_text}")
+        # 详情响应同样
+        rid = resp.json()["request_id"]
+        detail = self.client.get(f"{self.settings.api_prefix}/confirmations/{rid}")
+        self.assertNotIn(fixture_header, detail.text)
+
+    def test_token_only_userinfo_masked(self):
+        """R5 r3：token-only userinfo（无密码）不得下发。"""
+        fixture_token = "FIXTURE_URL_PASSWORD"
+        resp = self.client.post(
+            f"{self.settings.api_prefix}/confirmations",
+            json={
+                "run_id": "r-1", "thread_id": "t-1", "project_id": None,
+                "principal": "MAIN_AGENT", "tool_name": "mcp__echo__echo",
+                "arguments": {
+                    "url": f"https://{fixture_token}@example.invalid/path",
+                },
+                "ttl_seconds": 60.0,
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn(fixture_token, resp.text,
+                        f"token-only userinfo 不应出现: {resp.text}")
+
+    def test_signature_query_masked(self):
+        """R5 r3：非敏感键名的 query 签名值（sig=）保守全掩。"""
+        fixture_sig = "FIXTURE_QUERY"
+        resp = self.client.post(
+            f"{self.settings.api_prefix}/confirmations",
+            json={
+                "run_id": "r-1", "thread_id": "t-1", "project_id": None,
+                "principal": "MAIN_AGENT", "tool_name": "mcp__echo__echo",
+                "arguments": {
+                    "url": f"https://example.invalid/path?sig={fixture_sig}&page=2",
+                },
+                "ttl_seconds": 60.0,
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn(fixture_sig, resp.text,
+                        f"query 签名值不应出现: {resp.text}")
+        # 结构保留（key 仍在，value 掩）
+        self.assertIn("sig=", resp.text)
+
+    def test_combined_command_url_token_only_sig(self):
+        """R5 r3：审查探针三组合（命令+URL / token-only / sig）一次断言。"""
+        fx_header = "FIXTURE_HEADER"
+        fx_userinfo = "FIXTURE_URL_PASSWORD"
+        fx_sig = "FIXTURE_QUERY"
+        fx_fragment = "FIXTURE_FRAGMENT"
+        resp = self.client.post(
+            f"{self.settings.api_prefix}/confirmations",
+            json={
+                "run_id": "r-1", "thread_id": "t-1", "project_id": None,
+                "principal": "MAIN_AGENT", "tool_name": "mcp__echo__echo",
+                "arguments": {
+                    "command": f'curl -H "Authorization: Bearer {fx_header}" https://example.invalid/path',
+                    "url": f"https://{fx_userinfo}@example.invalid/path?sig={fx_sig}#access_token={fx_fragment}",
+                },
+                "ttl_seconds": 60.0,
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        body_text = resp.text
+        for fx in (fx_header, fx_userinfo, fx_sig, fx_fragment):
+            self.assertNotIn(fx, body_text,
+                            f"临时标记 {fx} 不应出现在响应: {body_text}")
+
 
 # ---------------------------------------------------------------------------
 # 2. 批准并执行一次

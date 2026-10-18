@@ -16,6 +16,9 @@ import styles from './ConfirmationCard.module.css'
 
 export type OperationId = 'approve' | 'deny' | 'cancel' | 'execute'
 
+/** 操作回调返回值：hook 的 { kind } 结论或无返回 */
+export type OpOutcome = { kind: 'done' | 'retryable' | 'unknown' } | void
+
 export interface ConfirmationCardProps {
   confirmation: ConfirmationResponse
   /** 真实活跃 run_id；卡片按 run 精确控制。null 表示无活跃 run。 */
@@ -24,8 +27,10 @@ export interface ConfirmationCardProps {
   online: boolean
   /** 正在操作的 request_id 集合（用于按钮 disabled 与重复点击守卫）。 */
   inFlight: Set<string>
-  onDeny: (id: string) => void
-  onApproveAndExecute: (id: string) => void
+  onDeny: (id: string) => void | Promise<OpOutcome>
+  onApproveAndExecute: (id: string) => void | Promise<OpOutcome>
+  /** R4：结果未知后的核对入口（纯 GET 无副作用）。 */
+  onVerify: (id: string) => void | Promise<unknown>
 }
 
 const TERMINAL_STATES = new Set(['denied', 'cancelled', 'expired'])
@@ -89,6 +94,7 @@ export function ConfirmationCard({
   inFlight,
   onDeny,
   onApproveAndExecute,
+  onVerify,
 }: ConfirmationCardProps) {
   const [now, setNow] = useState(() => Date.now() / 1000)
   useEffect(() => {
@@ -113,24 +119,61 @@ export function ConfirmationCard({
   // 事件可能早于状态回写；本地 ref 在第一次点击的同步阶段即置位。
   const localPendingRef = useRef(false)
   const [localPending, setLocalPending] = useState(false)
-  const inFlightThis = inFlight.has(c.request_id) || localPending
+  /** R4：上次操作结果未知（网络失败且核对也失败）；保持锁定直到用户核对 */
+  const [opUnknown, setOpUnknown] = useState(false)
+  /** 操作进行中（含本地锁定）；与 opUnknown 分离展示 */
+  const busy = inFlight.has(c.request_id) || localPending
+  const inFlightThis = busy || opUnknown
+  const releaseLocal = useCallback(() => {
+    localPendingRef.current = false
+    setLocalPending(false)
+  }, [])
+  /**
+   * 提交守卫（R4）：
+   * - 同 tick 锁定（ref 立即置位），双击第二次被吞
+   * - hook 返回 kind：unknown → 保持锁定并展示核对入口；
+   *   done / retryable（后端确认仍未领取）→ 释放守卫，允许用户明确重试
+   */
   const submitGuard = useCallback(
-    (fn: (id: string) => void) => (id: string) => {
+    (fn: (id: string) => void | Promise<OpOutcome>) => (id: string) => {
       if (localPendingRef.current) return
       localPendingRef.current = true
       setLocalPending(true)
-      fn(id)
+      setOpUnknown(false)
+      try {
+        Promise.resolve(fn(id))
+          .then((res) => {
+            const kind = (res as { kind?: string } | undefined)?.kind
+            if (kind === 'unknown') {
+              setOpUnknown(true)
+              return
+            }
+            // 成功 / retryable：不立即 release；由 useEffect 监听 business 变化清理
+          })
+          .catch(() => {
+            setOpUnknown(true)
+          })
+      } catch {
+        setOpUnknown(true)
+      }
     },
-    [],
+    [releaseLocal],
   )
   const handleApproveAndExecute = submitGuard(onApproveAndExecute)
   const handleDeny = submitGuard(onDeny)
+  const handleVerify = useCallback(() => {
+    // 核对是纯 GET：先释放本地锁定，再让父级拉最新状态
+    releaseLocal()
+    setOpUnknown(false)
+    onVerify(c.request_id)
+  }, [releaseLocal, onVerify, c.request_id])
 
   // 后端状态离开待处理（父级回写）后，重置本地守卫，让卡片可再次操作
   useEffect(() => {
     if (business !== 'approved' && localPendingRef.current) {
       localPendingRef.current = false
       setLocalPending(false)
+      setOpUnknown(false)
     }
   }, [business])
 
@@ -154,6 +197,7 @@ export function ConfirmationCard({
       data-business={business}
       data-offline={(!online).toString()}
       data-inflight={inFlightThis.toString()}
+      data-opunknown={opUnknown.toString()}
       role="region"
       aria-label={`工具调用需批准：${c.tool_name}`}
     >
@@ -210,6 +254,20 @@ export function ConfirmationCard({
         </div>
       ) : null}
 
+      {/* R4：上次操作失败且核对也失败——保持锁定，用户可主动核对（纯 GET） */}
+      {opUnknown && !busy ? (
+        <div className={styles.actions} data-testid="op-unknown-block">
+          <span className={styles.expired}>上次操作结果未知（未确认送达）</span>
+          <button
+            className={styles.btn}
+            data-testid="verify-button"
+            onClick={handleVerify}
+          >
+            核对
+          </button>
+        </div>
+      ) : null}
+
       {isActionable && !runMatches ? (
         <div className={styles.meta}>
           <span>非当前活跃 run（{c.run_id}），按钮已禁用</span>
@@ -240,7 +298,7 @@ export function ConfirmationCard({
                 data-testid="approve-button"
                 data-inflight={buttonsDisabled.toString()}
                 onClick={() => handleApproveAndExecute(c.request_id)}
-              disabled={buttonsDisabled}
+                disabled={buttonsDisabled}
               >
                 批准并执行
               </button>
@@ -257,7 +315,7 @@ export function ConfirmationCard({
           )}
         </div>
       ) : null}
-      {inFlightThis ? (
+      {busy ? (
         <div className={styles.meta} data-testid="inflight-indicator">
           <span>操作中…</span>
         </div>

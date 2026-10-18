@@ -9,7 +9,8 @@
  *
  * 设计：
  * - 后端 200 才视为成功；失败显示错误且不更新本地状态
- * - inFlight：当前正在操作的 tool_name + principal 集合，按钮 disabled 防双击
+ * - inFlight：按 tool 序列化，同工具所有操作（enable/grant/revoke）互斥；
+ *   结果覆盖不会乱序（旧响应不会覆盖最新权限显示）
  * - 错误码：500/409 不允许乐观更新；操作失败不掩盖（不把 online 恢复当成成功）
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -160,7 +161,8 @@ export function MCPSettings() {
                 <span className={styles.principals}>
                   {MCP_PRINCIPALS.map((p) => {
                     const isGranted = granted.has(p)
-                    const flightKey = `${isGranted ? 'revoke' : 'grant'}:${t.qualified_name}:${p}`
+                    // R1：per-tool key，同工具所有操作序列化，防止旧响应覆盖最新权限
+                    const flightKey = t.qualified_name
                     return (
                       <span
                         key={p}

@@ -16,22 +16,34 @@ import type {
 
 const PREFIX = '/api/confirmations'
 
-export async function listConfirmations(params: {
-  thread_id?: string
-  run_id?: string
-  state?: string
-} = {}): Promise<ConfirmationResponse[]> {
+export async function listConfirmations(
+  params: {
+    thread_id?: string
+    run_id?: string
+    state?: string
+  } = {},
+  signal?: AbortSignal,
+): Promise<ConfirmationResponse[]> {
   const qs = new URLSearchParams()
   if (params.thread_id !== undefined) qs.set('thread_id', params.thread_id)
   if (params.run_id !== undefined) qs.set('run_id', params.run_id)
   if (params.state !== undefined) qs.set('state', params.state)
   const url = qs.toString() ? `${PREFIX}?${qs.toString()}` : PREFIX
-  const resp = await apiGet<ConfirmationListResponse>(url)
+  const resp = await apiGet<ConfirmationListResponse>(
+    url,
+    signal ? { signal } : {},
+  )
   return resp.confirmations
 }
 
-export async function getConfirmation(id: string): Promise<ConfirmationResponse> {
-  return apiGet<ConfirmationResponse>(`${PREFIX}/${encodeURIComponent(id)}`)
+export async function getConfirmation(
+  id: string,
+  signal?: AbortSignal,
+): Promise<ConfirmationResponse> {
+  return apiGet<ConfirmationResponse>(
+    `${PREFIX}/${encodeURIComponent(id)}`,
+    signal ? { signal } : {},
+  )
 }
 
 export async function approveConfirmation(
@@ -92,8 +104,12 @@ export async function executeConfirmation(
 }
 
 /** TOOL-05 活跃 run 探针。 */
-export async function getActiveRun(thread_id: string): Promise<ActiveRunResponse> {
+export async function getActiveRun(
+  thread_id: string,
+  signal?: AbortSignal,
+): Promise<ActiveRunResponse> {
   return apiGet<ActiveRunResponse>(
     `/api/threads/${encodeURIComponent(thread_id)}/active_run`,
+    signal ? { signal } : {},
   )
 }

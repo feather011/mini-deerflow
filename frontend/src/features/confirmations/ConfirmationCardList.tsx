@@ -12,6 +12,7 @@ export interface ConfirmationCardListProps {
   inFlight: Set<string>
   onDeny: (id: string) => void
   onApproveAndExecute: (id: string) => void
+  onVerify: (id: string) => void
 }
 
 export function ConfirmationCardList({
@@ -21,6 +22,7 @@ export function ConfirmationCardList({
   inFlight,
   onDeny,
   onApproveAndExecute,
+  onVerify,
 }: ConfirmationCardListProps) {
   const runIds = Object.keys(byRunId)
   if (runIds.length === 0) return null
@@ -40,6 +42,7 @@ export function ConfirmationCardList({
                 inFlight={inFlight}
                 onDeny={onDeny}
                 onApproveAndExecute={onApproveAndExecute}
+                onVerify={onVerify}
               />
             ))}
           </div>

@@ -221,6 +221,7 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
     inFlight: confirmInFlight,
     deny: confirmDeny,
     approveAndExecute: confirmApproveAndExecute,
+    verify: confirmVerify,
   } = useConfirmations(thread.thread_id)
 
   return (
@@ -244,6 +245,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
             }}
             onApproveAndExecute={(id) => {
               void confirmApproveAndExecute(id)
+            }}
+            onVerify={(id) => {
+              void confirmVerify(id)
             }}
           />
         </div>
