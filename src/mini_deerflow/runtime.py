@@ -1085,6 +1085,8 @@ def create_runtime(
         project_roots=project_roots,
         workspaces_root=workspaces_root,
     )
+    # TOOL-05：把 runtime 注入 ConfirmationManager，expire 路径能通知等待者
+    confirmation_manager._runtime = runtime
 
     # R1：runtime.execute_confirmed_request 真实从 ToolRegistry 调工具 handler。
     # R6 round 4：父 RunAuthority 严格取自 runtime._active_run_authorities[run_id]，

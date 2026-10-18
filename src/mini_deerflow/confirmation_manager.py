@@ -60,6 +60,7 @@ class ConfirmationManager:
         policy_registry: ToolPolicyRegistry,
         *,
         is_run_alive: Callable[[str, str], bool] | None = None,
+        runtime: Any = None,
     ) -> None:
         """
         Args:
@@ -67,6 +68,8 @@ class ConfirmationManager:
             policy_registry: 工具策略注册表
             is_run_alive: 可选回调，签名 (run_id, thread_id) -> bool。
                 用于 R5：在执行前确认 Run 仍存活；为 None 时默认放行（测试用）
+            runtime: TOOL-05 可选。注入后，expire/deny/cancel 时通过
+                runtime.signal_confirmation 通知等待者（仅在路由层 bind 时设置）。
         """
         self._store = store
         self._policy_registry = policy_registry
@@ -75,6 +78,8 @@ class ConfirmationManager:
         self._claim_lock = threading.Lock()
         # R6 父 authority 透传：execute 时由调用方提供
         # 持久化 request 已存 principal/project_id，但仅作"客户身份"记录
+        # TOOL-05：runtime 引用，用于过期/拒绝/取消时通知等待者
+        self._runtime = runtime
 
     # ---------------------------------------------------------------- 创建
 
@@ -179,11 +184,16 @@ class ConfirmationManager:
         return self._decide(request_id, ConfirmationState.CANCELLED, decided_by, current)
 
     def expire(self, request_id: str, now: float | None = None) -> ConfirmationRequest:
-        """标记过期（仅 PENDING 且 is_expired）。仍在锁内做条件更新。"""
+        """标记过期（仅 PENDING/APPROVED 且 is_expired）。
+
+        TOOL-05：路由层查询时调用，命中即通过 runtime.signal_confirmation
+        通知等待者；不修改已领取（EXECUTED）状态。
+        """
         current = now if now is not None else time.time()
         with self._claim_lock:
             req = self._require(request_id)
-            if req.state != ConfirmationState.PENDING:
+            # 不修改已领取/已终态
+            if req.state not in (ConfirmationState.PENDING, ConfirmationState.APPROVED):
                 return req
             if not req.is_expired(now=current):
                 return req
@@ -193,16 +203,38 @@ class ConfirmationManager:
                 decided_at=current,
             )
             self._store.update(new_req)
+            # TOOL-05：通知等待中的 Agent
+            self._notify_expired(new_req)
             return new_req
 
     def sweep_expired(self, now: float | None = None) -> int:
         count = 0
         current = now if now is not None else time.time()
         for req in self._store.all():
-            if req.state == ConfirmationState.PENDING and req.is_expired(now=current):
+            if req.state in (ConfirmationState.PENDING, ConfirmationState.APPROVED) and req.is_expired(now=current):
                 self.expire(req.request_id, now=current)
                 count += 1
         return count
+
+    def _notify_expired(self, req: ConfirmationRequest) -> None:
+        """TOOL-05：通过 runtime.signal_confirmation 通知等待者。
+
+        runtime 由 ConfirmationManager 构造时可选注入；未注入时跳过（测试场景）。
+        """
+        runtime = getattr(self, "_runtime", None)
+        if runtime is None:
+            return
+        signal = getattr(runtime, "signal_confirmation", None)
+        if not callable(signal):
+            return
+        try:
+            signal(
+                req.request_id,
+                outcome="expired",
+                error="confirmation ttl expired",
+            )
+        except Exception:
+            pass
 
     # ---------------------------------------------------------------- 执行
 
