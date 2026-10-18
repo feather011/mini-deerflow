@@ -1,0 +1,578 @@
+"""TOOL-02 E2E 行为测试（V1 真实链路版）。
+
+审查 V1 要求：
+- V1-project：真实子任务读取项目文件（submit→Manager→Runner→collect）
+- V1-visibility：注册待测工具，断言 DENY 隐藏、ALLOW/CONFIRM 可见
+"""
+
+import json
+import time
+import unittest
+from collections import deque
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from mini_deerflow.middleware import ExecutionContext
+from mini_deerflow.models import FinalAnswer, Message, ToolCall
+from mini_deerflow.project_store import InMemoryProjectStore
+from mini_deerflow.project_tools import create_project_read_tools
+from mini_deerflow.subagent_executor import (
+    SubagentBudget,
+    SubagentManager,
+)
+from mini_deerflow.subagent_tools import create_subagent_tools
+from mini_deerflow.thread_store import InMemoryThreadStore
+from mini_deerflow.tools import Tool, ToolRegistry
+from mini_deerflow.tool_authorization import (
+    ExecutorPrincipal,
+    ToolAuthorizationError,
+    ToolPolicy,
+    ToolPolicyRegistry,
+)
+from mini_deerflow.tool_contracts import (
+    AccessDecisionKind,
+    ToolCapability,
+)
+
+
+# ============================================================================
+# ScriptedModel: 按预设序列返回决策
+# ============================================================================
+
+
+class ScriptedModel:
+    """按预设序列返回决策。"""
+    def __init__(self, decisions):
+        self._queue = deque(decisions)
+        self.received = []
+        self.tool_results: list[str] = []
+
+    def decide(self, messages, tools=None):
+        self.received.append(list(messages))
+        # 捕获 tool 结果用于断言
+        for m in messages:
+            if isinstance(m, Message) and m.role == "tool" and m.content:
+                self.tool_results.append(m.content)
+        if not self._queue:
+            return FinalAnswer(content="done")
+        return self._queue.popleft()
+
+
+# ============================================================================
+# V1-visibility：可见性过滤 — 注册工具后断言 DENY 隐藏、ALLOW/CONFIRM 可见
+# ============================================================================
+
+
+class TestToolVisibilityViaAgent(unittest.TestCase):
+    """Agent.run 真实发给模型的 tool_specs 过滤。"""
+
+    def test_deny_tool_hidden_from_model(self):
+        """DENY 工具不在发给模型的 tool_specs 中。"""
+        registry = ToolPolicyRegistry()
+        tool_reg = ToolRegistry()
+
+        # 注册 sandbox_write_file（uncategorized → 默认 DENY）
+        def dummy_handler(args):
+            return '{"ok": true}'
+
+        tool_reg.register(Tool(
+            name="sandbox_write_file",
+            description="Write to sandbox",
+            parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+            handler=dummy_handler,
+        ))
+        # 注册一个正常工具（ALLOW）
+        tool_reg.register(Tool(
+            name="calculator",
+            description="Calculator",
+            parameters={"type": "object", "properties": {"expr": {"type": "string"}}},
+            handler=dummy_handler,
+        ))
+
+        captured_tools = []
+
+        class CaptureModel:
+            def decide(self, messages, tools=None):
+                captured_tools.extend(list(tools) if tools else [])
+                return FinalAnswer(content="done")
+
+        from mini_deerflow.agent import Agent
+        store = InMemoryThreadStore()
+        store.create("t1")
+
+        agent = Agent(
+            model=CaptureModel(),
+            registry=tool_reg,
+            store=store,
+            tool_policy_registry=registry,
+        )
+        agent.run("t1", "hello")
+
+        tool_names = [t.name for t in captured_tools]
+        # DENY 工具不应出现
+        self.assertNotIn("sandbox_write_file", tool_names,
+                        f"sandbox_write_file should be hidden. Got: {tool_names}")
+        # ALLOW 工具应出现
+        self.assertIn("calculator", tool_names,
+                     f"calculator should be visible. Got: {tool_names}")
+
+    def test_confirm_tool_visible_to_model(self):
+        """CONFIRM 工具发给模型（只是 handler 不执行）。"""
+        registry = ToolPolicyRegistry()
+        tool_reg = ToolRegistry()
+
+        # 注册 task_note 并设置 requires_confirmation=True 策略
+        def dummy_handler(args):
+            return '{"ok": true}'
+
+        tool_reg.register(Tool(
+            name="task_note",
+            description="记笔记",
+            parameters={"type": "object", "properties": {}},
+            handler=dummy_handler,
+        ))
+
+        policy = ToolPolicy(
+            enabled=True,
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=True,
+        )
+        registry._policies["task_note"] = policy
+
+        captured_tools = []
+
+        class CaptureModel:
+            def decide(self, messages, tools=None):
+                captured_tools.extend(list(tools) if tools else [])
+                return FinalAnswer(content="done")
+
+        from mini_deerflow.agent import Agent
+        store = InMemoryThreadStore()
+        store.create("t1")
+
+        agent = Agent(
+            model=CaptureModel(),
+            registry=tool_reg,
+            store=store,
+            tool_policy_registry=registry,
+        )
+        agent.run("t1", "hello")
+
+        tool_names = [t.name for t in captured_tools]
+        # CONFIRM 工具应该发给模型
+        self.assertIn("task_note", tool_names,
+                     f"task_note should be visible (CONFIRM). Got: {tool_names}")
+
+
+# ============================================================================
+# V1-project：真实子任务读取项目文件（submit→Manager→collect）
+# ============================================================================
+
+
+class TestSubagentProjectRead(unittest.TestCase):
+    """真实子任务读取项目文件链路测试。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.repo_path = Path(self.temp_dir.name)
+        f = self.repo_path / "test.txt"
+        f.write_text("hello from project\n", encoding="utf-8")
+
+        self.project_store = InMemoryProjectStore()
+        self.project_store.create(
+            project_id="proj-subagent-test",
+            name="Subagent Test",
+            workspace_path=self.repo_path,
+        )
+        self.thread_store = InMemoryThreadStore()
+        self.thread_store.create("parent-t")
+
+        # 设置父线程的项目上下文
+        parent_thread = self.thread_store.get("parent-t")
+        parent_thread.project_id = "proj-subagent-test"
+        self.thread_store.save(parent_thread)
+
+        # 创建工具注册表（含 project_read_file）
+        self.tool_reg = ToolRegistry()
+        read_tools = create_project_read_tools(
+            self.thread_store, self.project_store
+        )
+        self.tool_reg.register_many(read_tools)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_subagent_reads_project_file_via_submit_collect(self):
+        """通过 submit→Manager自动运行→collect 读取项目文件。
+
+        不在 ScriptedModel 硬编码预期内容；直接断言模型收到的真实 tool JSON。
+        """
+        # 脚本模型：调用 project_read_file，再返回 FinalAnswer（不预设内容）
+        scripted_model = ScriptedModel([
+            ToolCall(name="project_read_file", arguments={"path": "test.txt"}),
+            FinalAnswer(content="read complete"),
+        ])
+
+        manager = SubagentManager(
+            max_concurrency=1,
+            max_tasks_per_parent=10,
+            shared_budget=SubagentBudget(max_steps=10),
+            tool_policy_registry=ToolPolicyRegistry(),
+            thread_store=self.thread_store,
+        )
+
+        try:
+            # 提交任务（Manager 自动在后台线程运行 Runner）
+            task = manager.submit(
+                instruction="读取项目文件 test.txt 并返回内容",
+                parent_run_id="test-run",
+                parent_thread_id="parent-t",
+                depth=1,
+                model=scripted_model,
+                registry=self.tool_reg,
+                parent_granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
+                parent_project_id="proj-subagent-test",
+            )
+
+            # 通过 Manager collect 回收结果
+            result = manager.collect(task.task_id, timeout=30)
+
+            # 验证：任务成功
+            self.assertTrue(result.succeeded,
+                           f"Subagent should succeed. error={result.error_type}: {result.error_message}")
+
+            # 验证：模型收到的真实 tool JSON 包含 ok=true 和文件内容
+            self.assertGreater(len(scripted_model.tool_results), 0,
+                              f"Model should have received tool result. received={scripted_model.tool_results}")
+            tool_json = json.loads(scripted_model.tool_results[0])
+            self.assertTrue(tool_json.get("ok"),
+                           f"Tool result ok should be true. Got: {tool_json}")
+            self.assertIn("hello from project", tool_json.get("content", ""),
+                         f"Tool result content should include file text. Got: {tool_json}")
+
+            # 验证：模型确实调用了 project_read_file
+            tool_calls_made = [m.tool_name for m in scripted_model.received[1]
+                              if isinstance(m, Message) and m.tool_name]
+            self.assertIn("project_read_file", tool_calls_made,
+                         f"Model should call project_read_file. Got: {tool_calls_made}")
+        finally:
+            manager.shutdown()
+
+
+# ============================================================================
+# Test 2: submit handler 真实 run_id / thread_id 继承
+# ============================================================================
+
+
+class TestSubmitHandlerInheritance(unittest.TestCase):
+    """_SubmitHandler 从 ExecutionContext 继承 run_id 和 thread_id。"""
+
+    def test_handler_inherits_run_id_from_context(self):
+        """_SubmitHandler.submit 执行后，Task.parent_run_id 等于 context.run_id。"""
+        thread_store = InMemoryThreadStore()
+        thread_store.create("parent-t")
+
+        manager = SubagentManager(
+            max_concurrency=1,
+            max_tasks_per_parent=10,
+            shared_budget=SubagentBudget(max_steps=5),
+            tool_policy_registry=ToolPolicyRegistry(),
+            thread_store=thread_store,
+        )
+        sub_tools = create_subagent_tools(
+            manager=manager,
+            parent_run_id="unused-value",
+            parent_thread_id="unused-value",
+            thread_store=thread_store,
+        )
+        reg = ToolRegistry()
+        reg.register_many(sub_tools)
+        tool = reg.get("subagent_submit")
+        self.assertIsNotNone(tool)
+
+        # 构造 context，run_id = "context-run-123"
+        ctx = ExecutionContext(
+            thread_id="parent-t",
+            run_id="context-run-123",
+            granted_capabilities=frozenset(),
+        )
+
+        # 调用 submit handler
+        result_str = tool.execute(
+            {"instruction": "test"},
+            context=ctx,
+        )
+        result = json.loads(result_str)
+        self.assertTrue(result.get("ok"), f"submit failed: {result_str}")
+        task_id = result["task_id"]
+
+        # 验证 Manager 中的 Task
+        task = manager._tasks.get(task_id)
+        self.assertIsNotNone(task)
+        # 关键验证：parent_run_id 等于 context.run_id
+        self.assertEqual(task.parent_run_id, "context-run-123",
+                       f"parent_run_id should inherit from context. Got: {task.parent_run_id}")
+
+    def test_handler_inherits_thread_id_from_context(self):
+        """_SubmitHandler.submit 执行后，Task.parent_thread_id 等于 context.thread_id。"""
+        thread_store = InMemoryThreadStore()
+        thread_store.create("parent-t-456")
+
+        manager = SubagentManager(
+            max_concurrency=1,
+            max_tasks_per_parent=10,
+            shared_budget=SubagentBudget(max_steps=5),
+            tool_policy_registry=ToolPolicyRegistry(),
+            thread_store=thread_store,
+        )
+        sub_tools = create_subagent_tools(
+            manager=manager,
+            parent_run_id="unused",
+            parent_thread_id="unused",
+            thread_store=thread_store,
+        )
+        reg = ToolRegistry()
+        reg.register_many(sub_tools)
+        tool = reg.get("subagent_submit")
+
+        ctx = ExecutionContext(
+            thread_id="parent-t-456",
+            run_id="run-abc",
+            granted_capabilities=frozenset(),
+        )
+        result_str = tool.execute(
+            {"instruction": "test thread"},
+            context=ctx,
+        )
+        result = json.loads(result_str)
+        self.assertTrue(result.get("ok"))
+
+        task_id = result["task_id"]
+        task = manager._tasks.get(task_id)
+        self.assertEqual(task.parent_thread_id, "parent-t-456",
+                       f"parent_thread_id should inherit from context. Got: {task.parent_thread_id}")
+
+
+# ============================================================================
+# Test 3: 不同 run_id 通过同一 submit 工具独立提交（经 handler）
+# ============================================================================
+
+
+class TestSubmitViaToolIndependence(unittest.TestCase):
+    """不同 run_id 通过 submit 工具提交，相互独立。"""
+
+    def setUp(self):
+        self.thread_store = InMemoryThreadStore()
+        self.thread_store.create("default-thread")
+
+    def test_two_runs_submit_independently_via_tool(self):
+        """通过 submit 工具，不同 run_id 可各自提交任务。"""
+        manager = SubagentManager(
+            max_concurrency=2,
+            max_tasks_per_parent=2,
+            shared_budget=SubagentBudget(max_steps=5),
+            tool_policy_registry=ToolPolicyRegistry(),
+            thread_store=self.thread_store,
+        )
+        sub_tools = create_subagent_tools(
+            manager=manager,
+            parent_run_id="unused",
+            parent_thread_id="unused",
+            thread_store=self.thread_store,
+        )
+        reg = ToolRegistry()
+        reg.register_many(sub_tools)
+
+        task_ids_run1 = []
+        for _ in range(2):
+            ctx = ExecutionContext(
+                thread_id="default-thread",
+                run_id="run-1",
+                granted_capabilities=frozenset(),
+            )
+            tool = reg.get("subagent_submit")
+            result_str = tool.execute({"instruction": "task for run1"}, context=ctx)
+            result = json.loads(result_str)
+            self.assertTrue(result.get("ok"), f"submit failed: {result_str}")
+            task_ids_run1.append(result["task_id"])
+
+        task_ids_run2 = []
+        for _ in range(2):
+            ctx = ExecutionContext(
+                thread_id="default-thread",
+                run_id="run-2",
+                granted_capabilities=frozenset(),
+            )
+            tool = reg.get("subagent_submit")
+            result_str = tool.execute({"instruction": "task for run2"}, context=ctx)
+            result = json.loads(result_str)
+            self.assertTrue(result.get("ok"), f"submit failed: {result_str}")
+            task_ids_run2.append(result["task_id"])
+
+        self.assertEqual(len(task_ids_run1), 2)
+        self.assertEqual(len(task_ids_run2), 2)
+
+        # 所有 task ID 各不相同
+        all_ids = task_ids_run1 + task_ids_run2
+        self.assertEqual(len(all_ids), len(set(all_ids)))
+
+    def test_same_run_via_tool_respects_limit(self):
+        """同一 run_id 通过 submit 工具提交，达 max_tasks_per_parent 时抛异常。"""
+        manager = SubagentManager(
+            max_concurrency=2,
+            max_tasks_per_parent=2,
+            shared_budget=SubagentBudget(max_steps=5),
+            tool_policy_registry=ToolPolicyRegistry(),
+            thread_store=self.thread_store,
+        )
+        sub_tools = create_subagent_tools(
+            manager=manager,
+            parent_run_id="unused",
+            parent_thread_id="unused",
+            thread_store=self.thread_store,
+        )
+        reg = ToolRegistry()
+        reg.register_many(sub_tools)
+
+        ctx = ExecutionContext(
+            thread_id="default-thread",
+            run_id="shared-run",
+            granted_capabilities=frozenset(),
+        )
+        tool = reg.get("subagent_submit")
+
+        # 提交 2 个任务成功
+        for i in range(2):
+            result_str = tool.execute({"instruction": f"task {i}"}, context=ctx)
+            result = json.loads(result_str)
+            self.assertTrue(result.get("ok"), f"submit {i} failed: {result_str}")
+
+        # 第 3 个任务应被拒绝
+        result_str = tool.execute({"instruction": "task 3"}, context=ctx)
+        result = json.loads(result_str)
+        self.assertFalse(result.get("ok"), "3rd submit should fail")
+
+
+# ============================================================================
+# Test 4: 直接 project_read_file 通过 Tool.execute 成功
+# ============================================================================
+
+
+class TestProjectReadDirectExecute(unittest.TestCase):
+    """直接调用 Tool.execute 验证 project_read_file 功能正确。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.repo_path = Path(self.temp_dir.name)
+        f = self.repo_path / "test.txt"
+        f.write_text("file content here\nline two\n", encoding="utf-8")
+
+        self.project_store = InMemoryProjectStore()
+        self.project_store.create(
+            project_id="proj-direct",
+            name="Direct Test",
+            workspace_path=self.repo_path,
+        )
+        self.thread_store = InMemoryThreadStore()
+        self.thread_store.create("thread-direct")
+        thread = self.thread_store.get("thread-direct")
+        thread.project_id = "proj-direct"
+        self.thread_store.save(thread)
+
+        self.reg = ToolRegistry()
+        read_tools = create_project_read_tools(self.thread_store, self.project_store)
+        self.reg.register_many(read_tools)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_project_read_file_direct_execute_ok(self):
+        """project_read_file.execute 返回 ok=true 且包含文件内容。"""
+        tool = self.reg.get("project_read_file")
+        self.assertIsNotNone(tool)
+
+        ctx = ExecutionContext(
+            thread_id="thread-direct",
+            run_id="test-run",
+            granted_capabilities=frozenset(),
+        )
+        result_str = tool.execute({"path": "test.txt"}, context=ctx)
+        result = json.loads(result_str)
+
+        self.assertTrue(result.get("ok", False),
+                       f"project_read_file should succeed. Got: {result}")
+        self.assertIn("file content", result.get("content", ""),
+                      f"Content should include file text. Got: {result}")
+
+    def test_project_read_file_nonexistent_fails(self):
+        """读取不存在的文件返回错误。"""
+        tool = self.reg.get("project_read_file")
+        ctx = ExecutionContext(
+            thread_id="thread-direct",
+            run_id="test-run",
+            granted_capabilities=frozenset(),
+        )
+        result_str = tool.execute({"path": "nonexistent.txt"}, context=ctx)
+        result = json.loads(result_str)
+
+        self.assertFalse(result.get("ok", True),
+                         f"Should fail for nonexistent file. Got: {result}")
+
+
+# ============================================================================
+# Test 5: CONFIRM 工具 handler 不执行
+# ============================================================================
+
+
+class TestConfirmBlocksHandler(unittest.TestCase):
+    """CONFIRM 决策阻止 handler 执行。"""
+
+    def test_explicit_confirm_blocks_handler(self):
+        """显式 requires_confirmation=True 触发 CONFIRM，handler 不执行。"""
+        registry = ToolPolicyRegistry()
+        tool_reg = ToolRegistry()
+
+        executed = False
+
+        def note_handler(args):
+            nonlocal executed
+            executed = True
+            return '{"ok": true}'
+
+        tool_reg.register(Tool(
+            name="task_note",
+            description="记笔记",
+            parameters={"type": "object", "properties": {}},
+            handler=note_handler,
+        ))
+
+        policy = ToolPolicy(
+            enabled=True,
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=True,
+        )
+        registry._policies["task_note"] = policy
+
+        store = InMemoryThreadStore()
+        store.create("t1")
+
+        class FakeModel:
+            def decide(self, messages, tools=None):
+                return ToolCall(name="task_note", arguments={"content": "note"})
+
+        from mini_deerflow.agent import Agent
+        agent = Agent(
+            model=FakeModel(),
+            registry=tool_reg,
+            store=store,
+            tool_policy_registry=registry,
+        )
+
+        with self.assertRaises(ToolAuthorizationError) as ctx:
+            agent.run("t1", "记个笔记")
+        self.assertEqual(ctx.exception.decision.kind, AccessDecisionKind.CONFIRM)
+        self.assertFalse(executed)
+
+
+if __name__ == "__main__":
+    unittest.main()

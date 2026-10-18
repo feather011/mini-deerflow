@@ -21,6 +21,12 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
+from mini_deerflow.mcp_errors import MCPError
+
+
+class MCPConfigError(MCPError):
+    """MCP 配置非法（包括工具分类声明未知枚举名）。"""
+
 # ---------------------------------------------------------------------------
 # ToolSource
 # ---------------------------------------------------------------------------
@@ -143,12 +149,12 @@ class ToolMetadata:
         """是否有外部副作用（默认需要本次确认）。"""
         if self.uncategorized:
             return True
-        # READS_SESSION / READS_PROJECT / RUNS_COMMAND（受控委派路径）不算危险副作用
+        # 会话内部读写不算危险副作用；RUNS_COMMAND 由 evaluate_tool_access 中 project_execute 例外覆盖
         return bool(self.side_effects - {
             ToolSideEffect.NONE,
             ToolSideEffect.READS_SESSION,
+            ToolSideEffect.WRITES_SESSION,
             ToolSideEffect.READS_PROJECT,
-            ToolSideEffect.RUNS_COMMAND,
         })
 
 
@@ -234,6 +240,9 @@ class ToolAccessDecision:
 
     reason: str
     """简短说明（面向用户或日志）。"""
+
+    metadata: dict = field(default_factory=dict)
+    """扩展元数据（如 CONFIRM 时挂载的 pending request_id）。"""
 
     @classmethod
     def allow(cls, reason: str = "allowed") -> "ToolAccessDecision":
@@ -424,7 +433,12 @@ def evaluate_tool_access(
         )
 
     # 6. 已授权但需要确认（策略覆盖 > 元数据默认值）
-    if policy.requires_confirmation or metadata.requires_confirmation():
+    # project_execute 有受控 harness 执行路径，默认直接派发
+    needs_confirm = (policy.requires_confirmation
+                     or metadata.requires_confirmation())
+    if metadata.name == "project_execute" and not policy.requires_confirmation:
+        needs_confirm = False
+    if needs_confirm:
         return ToolAccessDecision.confirm(
             f"工具 {metadata.name} 有外部副作用，需要本次确认",
         )
@@ -526,7 +540,7 @@ PROJECT_GREP_METADATA = ToolMetadata(
     side_effects=frozenset({ToolSideEffect.READS_PROJECT}),
 )
 
-# project_execute（受控委派，有确认机制）
+# project_execute（受控委派，RUNS_COMMAND 覆盖执行语义）
 PROJECT_EXECUTE_METADATA = ToolMetadata(
     name="project_execute",
     source=ToolSourceKind.LOCAL,
@@ -634,6 +648,67 @@ def default_policy_for_sandbox() -> ToolPolicy:
     )
 
 
+# TOOL-03 R2：MCP 工具元数据按可信配置分类
+# 字符串 → 枚举映射；未知字符串 → MCPToolStateError（避免默认分类导致过度权限）
+_TOOL_CAPABILITY_BY_NAME: dict[str, ToolCapability] = {c.name: c for c in ToolCapability}
+_TOOL_SIDE_EFFECT_BY_NAME: dict[str, ToolSideEffect] = {s.name: s for s in ToolSideEffect}
+
+
+def make_mcp_tool_metadata(
+    name: str,
+    declared_capabilities: frozenset[str] = frozenset(),
+    declared_side_effects: frozenset[str] = frozenset(),
+) -> ToolMetadata:
+    """构造一个 MCP 工具的 ToolMetadata。
+
+    TOOL-03 R2：按可信配置分类。
+    - `declared_capabilities` / `declared_side_effects` 均为空 → uncategorized，
+      评估时默认拒绝（不要"无副作用 echo 默认通过"）。
+    - 任一非空 → 按声明构造元数据。
+    """
+    if not declared_capabilities and not declared_side_effects:
+        # 未声明 → 分类不可信 → uncategorized=True 触发默认拒绝
+        return ToolMetadata(
+            name=name,
+            source=ToolSourceKind.MCP,
+            capabilities=frozenset(),
+            side_effects=frozenset(),
+            uncategorized=True,
+        )
+
+    try:
+        caps = frozenset(_TOOL_CAPABILITY_BY_NAME[c] for c in declared_capabilities)
+    except KeyError as exc:
+        raise MCPConfigError(
+            f"MCP 工具 {name} 声明未知 capability: {exc.args[0]!r}"
+        ) from None
+    try:
+        sides = frozenset(_TOOL_SIDE_EFFECT_BY_NAME[s] for s in declared_side_effects)
+    except KeyError as exc:
+        raise MCPConfigError(
+            f"MCP 工具 {name} 声明未知 side_effect: {exc.args[0]!r}"
+        ) from None
+
+    return ToolMetadata(
+        name=name,
+        source=ToolSourceKind.MCP,
+        capabilities=caps,
+        side_effects=sides,
+    )
+
+
+def default_policy_for_mcp_tool() -> ToolPolicy:
+    """MCP 工具默认策略：默认 disabled，由用户显式启用并按主体授权。
+
+    区别于 sandbox_* 的"主 Agent 默认 deny"——MCP 工具需要用户在
+    管理页中分别授权每个主体，不在代码里预设。
+    """
+    return ToolPolicy(
+        enabled=False,
+        allowed_principals=frozenset(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 策略注册表（用于 lookup）
 # ---------------------------------------------------------------------------
@@ -670,4 +745,6 @@ def default_policy_for(name: str) -> ToolPolicy | None:
         return default_policy_for_subagent()
     if name.startswith("sandbox_"):
         return default_policy_for_sandbox()
+    if name.startswith("mcp__"):
+        return default_policy_for_mcp_tool()
     return None
