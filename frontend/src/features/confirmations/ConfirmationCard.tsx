@@ -125,8 +125,8 @@ export function ConfirmationCard({
   const busy = inFlight.has(c.request_id) || localPending
   const inFlightThis = busy || opUnknown
   const releaseLocal = useCallback(() => {
-    localPendingRef.current = false
     setLocalPending(false)
+    // ref 延迟清（由 useEffect 监听 business 变化触发），不依赖 macrotask 调度
   }, [])
   /**
    * 提交守卫（R4）：
@@ -146,12 +146,15 @@ export function ConfirmationCard({
             const kind = (res as { kind?: string } | undefined)?.kind
             if (kind === 'unknown') {
               setOpUnknown(true)
+              releaseLocal() // R4：释放 localPending，使核对按钮可见
               return
             }
-            // 成功 / retryable：不立即 release；由 useEffect 监听 business 变化清理
+            // done / retryable：释放本地守卫；数据由父级轮询刷新
+            releaseLocal()
           })
           .catch(() => {
             setOpUnknown(true)
+            releaseLocal()
           })
       } catch {
         setOpUnknown(true)

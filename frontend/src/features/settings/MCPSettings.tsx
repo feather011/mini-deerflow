@@ -150,10 +150,10 @@ export function MCPSettings() {
                     onClick={() =>
                       void applyOrError(
                         () => setMcpToolEnabled(t.qualified_name, !t.enabled),
-                        `enable:${t.qualified_name}`,
+                        t.qualified_name,
                       )
                     }
-                    disabled={inFlight.has(`enable:${t.qualified_name}`)}
+                    disabled={inFlight.has(t.qualified_name)}
                   >
                     {t.enabled ? '✓ 启用' : '✗ 停用'}
                   </button>

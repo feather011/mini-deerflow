@@ -286,18 +286,26 @@ export function useConfirmations(
   )
   const approveAndExecute = useCallback(
     (id: string) =>
-      runOperation(id, async () => {
-        const approved = await approveConfirmation(id)
-        mergeOne(approved, generationRef.current)
-        // 快照执行：服务端读参数原值
-        const executed = await executeSnapshot(id, {
-          run_id: approved.run_id,
-          thread_id: approved.thread_id,
-          tool_name: approved.tool_name,
-          arguments_hash: approved.arguments_hash,
-        })
-        return executed
-      }),
+      runOperation(
+        id,
+        async () => {
+          const approved = await approveConfirmation(id)
+          // 快照执行：服务端读参数原值
+          const executed = await executeSnapshot(id, {
+            run_id: approved.run_id,
+            thread_id: approved.thread_id,
+            tool_name: approved.tool_name,
+            arguments_hash: approved.arguments_hash,
+          })
+          return executed
+        },
+        // R3：mergeOne 用已捕获的 gen，不跨 await 读 generationRef
+        async (executed, gen) => {
+          // executed 包含 approved+executed 状态，合并即可
+          mergeOne(executed, gen)
+          return { kind: 'done' }
+        },
+      ),
     [runOperation, mergeOne],
   )
 

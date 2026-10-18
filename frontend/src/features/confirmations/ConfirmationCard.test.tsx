@@ -22,6 +22,7 @@ const baseArgs = {
   inFlight: new Set<string>(),
   onDeny: vi.fn(),
   onApproveAndExecute: vi.fn(),
+  onVerify: vi.fn(),
 }
 
 function makePending(over: Partial<ConfirmationResponse> = {}): ConfirmationResponse {
@@ -216,7 +217,8 @@ describe('ConfirmationCard', () => {
 
   it('双击同一按钮：仅发送一次（组件端即时守卫）', async () => {
     const user = userEvent.setup()
-    const onApproveAndExecute = vi.fn()
+    // 永不 resolve 的 promise：模拟请求进行中（ref 保持 true 直到 useEffect 清理）
+    const onApproveAndExecute = vi.fn(() => new Promise(() => {}))
     render(
       <ConfirmationCard
         confirmation={makePending()}
@@ -226,10 +228,11 @@ describe('ConfirmationCard', () => {
     )
     const btn = screen.getByTestId('approve-button')
     await user.click(btn)
+    // 第一次点击已发送，promise 未决，localPendingRef 仍为 true
     // 同一 tick 内再点一次：守卫 ref 已置位，第二次被吞
     await user.click(btn)
     expect(onApproveAndExecute).toHaveBeenCalledTimes(1)
-    // 提交中：出现"操作中"指示
+    // 提交中：出现"操作中"指示（localPending 仍为 true）
     expect(screen.getByTestId('inflight-indicator')).toBeInTheDocument()
   })
 })
