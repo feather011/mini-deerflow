@@ -1191,17 +1191,45 @@ def create_runtime(
                 return result_str
             return result_str
 
-        result_req = confirmation_manager.claim_and_execute(
-            request_id,
-            parent_authority=parent_authority,
-            invoker=_invoker,
-        )
+        result_req: ConfirmationRequest | None = None
+        try:
+            result_req = confirmation_manager.claim_and_execute(
+                request_id,
+                parent_authority=parent_authority,
+                invoker=_invoker,
+            )
+        except ConfirmationError as exc:
+            # R1 round 6：合法绑定（tool/run/thread/args/authority 均已通过）后
+            # 权限/有效期/Run 存活等复核失败 → 必须通知等待中的 Agent 释放资源。
+            # 与绑定校验失败（上面 1108-1144 段）区分：绑定错误不消费、不通知；
+            # 合法绑定后 claim 阶段失败，状态仍是 PENDING/APPROVED（未领取），
+            # 应向 waiter 回灌 failed 结果，让 Agent 继续或结束。
+            try:
+                failed_result = json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"confirmation_failed: {exc}",
+                        "unknown": True,
+                    },
+                    ensure_ascii=False,
+                )
+                runtime.signal_confirmation(
+                    request_id,
+                    outcome="failed",
+                    result=failed_result,
+                    error=str(exc),
+                )
+            except Exception:
+                # 信号失败不应影响主流程
+                pass
+            raise
 
         # R1 round 5：执行完成后唤醒 Agent 的等待
         # - 状态 EXECUTED + 无错误 → outcome="executed" + 工具结果
         # - 状态 EXECUTED + handler 抛错 → outcome="failed" + 真实错误信息
         # - 其他失败/拒绝 → outcome="failed" + 错误描述
         try:
+            assert result_req is not None
             err_field = getattr(result_req, "execution_result", None) or ""
             handler_threw = bool(captured_error)
             if result_req.state.value == "executed" and not handler_threw and not err_field.startswith("error"):

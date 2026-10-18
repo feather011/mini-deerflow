@@ -2250,5 +2250,266 @@ class TestR6ToolNameAndProjectCaps(unittest.TestCase):
             self.assertEqual(result_holder["result"].answer, "done")
 
 
+# ============================================================================
+# R1 round 6：合法请求被权限复核拒绝时，必须通知 waiter；保持 HTTP 拒绝语义 +
+# handler 零执行；错 run/thread/tool/args 的绑定错误仍不消费、不通知。
+# ============================================================================
+
+
+class TestR1ClaimRejectionNotifiesWaiter(unittest.TestCase):
+    """R1 round 6：批准后禁用/撤权 → 匹配 execute 被权限复核拒绝 → Agent 收到结果。"""
+
+    def setUp(self):
+        self.temp_dir = TemporaryDirectory()
+        self.handler_calls: list[dict] = []
+        self.runtime, self.store = _make_simple_runtime(
+            self.temp_dir.name, self.handler_calls,
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_disable_after_approve_rejects_and_wakes_agent(self):
+        """批准后禁用工具 → 合法匹配 execute → 409 + handler=0 + Agent 收到失败结果。"""
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+        from tests.test_confirmation_lifecycle import _ScriptedModel
+
+        real_run_id = "test-r6-disable"
+        token = CancellationToken()
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "x"}),
+            FinalAnswer(content="recovered"),
+        ]
+        self.runtime.agent._model = _ScriptedModel(decisions)
+        self.runtime.integrated_agent._agent._model = self.runtime.agent._model
+
+        result_holder: dict[str, Any] = {}
+        def run_in_thread():
+            try:
+                result = self.runtime.agent_run_service.run(
+                    "t-proj", "echo x",
+                    run_id=real_run_id, cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        # 等 pending
+        deadline = time.time() + 5.0
+        pending = None
+        while time.time() < deadline:
+            reqs = [r for r in self.runtime.confirmation_store.all()
+                    if r.run_id == real_run_id and r.state == ConfirmationState.PENDING]
+            if reqs:
+                pending = reqs[0]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(pending, "R1 round 6: pending 应出现")
+
+        # 批准
+        self.runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 10,
+        )
+
+        # 批准后禁用工具：通过共享 ToolPolicyRegistry
+        # helper 注册的策略允许 MAIN_AGENT，我们改为不允许（requires_confirmation=False 但允许空集）
+        # 用 enabled=False 来禁用
+        policy = self.runtime.agent._tool_policy_registry
+        policy.set_policy("mcp__echo__echo", ToolPolicy(
+            enabled=False,  # 禁用
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=False,
+        ))
+
+        # 合法匹配 execute：应被 409 拒绝
+        with self.assertRaises(ConfirmationError) as ctx:
+            self.runtime.execute_confirmed_request(
+                request_id=pending.request_id,
+                run_id=real_run_id,
+                thread_id="t-proj",
+                tool_name="mcp__echo__echo",
+                arguments=dict(pending.arguments),
+            )
+        err_msg = str(ctx.exception)
+        self.assertTrue(
+            "拒绝" in err_msg or "禁用" in err_msg or "denied" in err_msg.lower(),
+            f"R1 round 6: 拒绝应明确工具被拒绝/禁用，实际 {err_msg}",
+        )
+
+        # handler 零执行
+        self.assertEqual(len(self.handler_calls), 0,
+                       f"R1 round 6: 拒绝时 handler 不应被调用，实际 {len(self.handler_calls)}")
+
+        # 关键：Agent 收到失败结果并能继续
+        t.join(timeout=10)
+        self.assertNotIn("error", result_holder,
+                       f"R1 round 6: Agent 应能从工具拒绝中恢复，实际异常: {result_holder.get('error')}")
+        result = result_holder.get("result")
+        self.assertIsNotNone(result, "R1 round 6: Agent 应返回结果")
+        # Agent 收到失败结果后继续推进 → FinalAnswer
+        self.assertEqual(result.answer, "recovered",
+                       f"R1 round 6: Agent 收拒绝后应返回 FinalAnswer 'recovered'，实际 {result.answer!r}")
+
+    def test_binding_mismatch_does_not_wake_legitimate_waiter(self):
+        """错 tool_name 不消费、不通知 — 合法 wait 仍挂起。"""
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+        from tests.test_confirmation_lifecycle import _ScriptedModel
+
+        real_run_id = "test-r6-mismatch"
+        token = CancellationToken()
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "x"}),
+            FinalAnswer(content="ok"),
+        ]
+        self.runtime.agent._model = _ScriptedModel(decisions)
+        self.runtime.integrated_agent._agent._model = self.runtime.agent._model
+
+        result_holder: dict[str, Any] = {}
+        def run_in_thread():
+            try:
+                result = self.runtime.agent_run_service.run(
+                    "t-proj", "echo x",
+                    run_id=real_run_id, cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        # 等 pending
+        deadline = time.time() + 5.0
+        pending = None
+        while time.time() < deadline:
+            reqs = [r for r in self.runtime.confirmation_store.all()
+                    if r.run_id == real_run_id and r.state == ConfirmationState.PENDING]
+            if reqs:
+                pending = reqs[0]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(pending)
+
+        # 批准
+        self.runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 10,
+        )
+
+        # 错工具名：应被 409 拒绝
+        with self.assertRaises(ConfirmationError) as ctx:
+            self.runtime.execute_confirmed_request(
+                request_id=pending.request_id,
+                run_id=real_run_id,
+                thread_id="t-proj",
+                tool_name="WRONG_TOOL",  # 错工具
+                arguments=dict(pending.arguments),
+            )
+        self.assertIn("tool_name", str(ctx.exception).lower())
+
+        # 关键：批准仍保留 PENDING/APPROVED 状态 — 合法 wait 不被通知
+        req_after = self.runtime.confirmation_store.get(pending.request_id)
+        self.assertIsNotNone(req_after)
+        self.assertIn(req_after.state, (ConfirmationState.PENDING, ConfirmationState.APPROVED),
+                     f"R1 round 6: 错 tool 不应消费批准；状态应为 PENDING/APPROVED，实际 {req_after.state.value}")
+
+        # handler 未调用
+        self.assertEqual(len(self.handler_calls), 0,
+                       f"R1 round 6: 错 tool 不应触发 handler，实际 {len(self.handler_calls)}")
+
+        # 清理：用 cancel 释放 Agent
+        token.cancel()
+        t.join(timeout=3)
+
+    def test_disabled_tool_e2e_via_api(self):
+        """API 路径：批准后禁用工具 → API 409 + Agent 收到结果。"""
+        from fastapi.testclient import TestClient
+        from mini_deerflow.api.app import create_app
+        from mini_deerflow.api.config import ApiSettings
+        from mini_deerflow.api.dependencies import get_runtime
+        from mini_deerflow.middleware import CancellationToken
+        from mini_deerflow.models import FinalAnswer, ToolCall
+        from tests.test_confirmation_lifecycle import _ScriptedModel
+
+        real_run_id = "test-r6-api-disable"
+        token = CancellationToken()
+        decisions = [
+            ToolCall(id="c1", name="mcp__echo__echo", arguments={"m": "x"}),
+            FinalAnswer(content="api-recovered"),
+        ]
+        self.runtime.agent._model = _ScriptedModel(decisions)
+        self.runtime.integrated_agent._agent._model = self.runtime.agent._model
+
+        result_holder: dict[str, Any] = {}
+        def run_in_thread():
+            try:
+                result = self.runtime.agent_run_service.run(
+                    "t-proj", "echo x",
+                    run_id=real_run_id, cancellation_token=token,
+                )
+                result_holder["result"] = result
+            except Exception as e:
+                result_holder["error"] = e
+
+        t = threading.Thread(target=run_in_thread, daemon=True)
+        t.start()
+
+        deadline = time.time() + 5.0
+        pending = None
+        while time.time() < deadline:
+            reqs = [r for r in self.runtime.confirmation_store.all()
+                    if r.run_id == real_run_id and r.state == ConfirmationState.PENDING]
+            if reqs:
+                pending = reqs[0]
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(pending)
+
+        # 批准
+        self.runtime.confirmation_manager.approve(
+            pending.request_id, decided_by="tester", now=time.time() + 10,
+        )
+
+        # 禁用工具
+        policy = self.runtime.agent._tool_policy_registry
+        policy.set_policy("mcp__echo__echo", ToolPolicy(
+            enabled=False,
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=False,
+        ))
+
+        # API 路径 execute：应 409
+        settings = ApiSettings()
+        app = create_app(settings=settings)
+        app.dependency_overrides[get_runtime] = lambda: self.runtime
+        client = TestClient(app)
+        resp = client.post(
+            f"{settings.api_prefix}/confirmations/{pending.request_id}/execute",
+            json={
+                "run_id": real_run_id,
+                "thread_id": "t-proj",
+                "tool_name": "mcp__echo__echo",
+                "arguments": dict(pending.arguments),
+            },
+        )
+        self.assertEqual(resp.status_code, 409, resp.text)
+        # handler 零执行
+        self.assertEqual(len(self.handler_calls), 0,
+                       f"R1 round 6: API 拒绝时 handler 不应被调用，实际 {len(self.handler_calls)}")
+
+        # Agent 应能从拒绝中恢复
+        t.join(timeout=10)
+        self.assertNotIn("error", result_holder,
+                       f"R1 round 6: API 拒绝时 Agent 应能恢复，实际异常: {result_holder.get('error')}")
+        result = result_holder.get("result")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.answer, "api-recovered",
+                       f"R1 round 6: Agent 收 API 拒绝后应返回 FinalAnswer，实际 {result.answer!r}")
+
+
 if __name__ == "__main__":
     unittest.main()
