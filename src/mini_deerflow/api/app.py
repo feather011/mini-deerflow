@@ -50,7 +50,7 @@ from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_co
 from mini_deerflow.thread_store import InMemoryThreadStore, SQLiteThreadStore
 from mini_deerflow.project_store import InMemoryProjectStore, SQLiteProjectStore
 from mini_deerflow.tools import create_default_registry
-from mini_deerflow.web_tools import HostPolicy as WebHostPolicy
+from mini_deerflow.web_tools import HostPolicy as WebHostPolicy, build_web_search_provider_from_config
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -132,6 +132,11 @@ def _default_runtime_factory(
             # TOOL-06：网络只读配置
             web_read_timeout_s=resolved.web_read_timeout_s,
             web_host_policy=build_web_host_policy(resolved),
+            # R4：根据应用配置装配搜索 Provider
+            web_search_provider=build_web_search_provider_from_config(
+                kind=resolved.web_search_provider_kind,
+                fake_results=list(resolved.web_search_fake_results),
+            ),
             **load_context_config(),
         ),
         workspaces_root=ws_root,

@@ -243,6 +243,8 @@ class Agent:
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
                     ToolCapability.SESSION_STATE_WRITE,
+                    # TOOL-06：网络只读工具需要 NETWORK_READ
+                    ToolCapability.NETWORK_READ,
                 })
                 session_project_id: str | None = None
             else:
@@ -252,6 +254,8 @@ class Agent:
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
                     ToolCapability.SESSION_STATE_WRITE,
+                    # TOOL-06：项目会话同样可调用网络只读工具
+                    ToolCapability.NETWORK_READ,
                 })
                 session_project_id = thread.project_id
             visible_names: set[str] = set()
@@ -450,6 +454,8 @@ class Agent:
                                 ToolCapability.COMPUTE,
                                 ToolCapability.SESSION_HISTORY_READ,
                                 ToolCapability.SESSION_STATE_WRITE,
+                                # TOOL-06：网络只读
+                                ToolCapability.NETWORK_READ,
                             })
                         else:
                             # 项目会话：项目读写 + 普通会话基础能力
@@ -459,6 +465,8 @@ class Agent:
                                 ToolCapability.COMPUTE,
                                 ToolCapability.SESSION_HISTORY_READ,
                                 ToolCapability.SESSION_STATE_WRITE,
+                                # TOOL-06：网络只读
+                                ToolCapability.NETWORK_READ,
                             })
                         authority = self._tool_policy_registry.get_authority(
                             thread_id=thread_id,

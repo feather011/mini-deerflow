@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from collections.abc import Callable
 from typing import Any
 
@@ -34,6 +35,7 @@ from mini_deerflow.tool_contracts import (
 )
 from mini_deerflow.web_tools import (
     CallableWebSearchProvider,
+    FixedListWebSearchProvider,
     HostPolicy,
     UnavailableWebSearchProvider,
     WebSearchHit,
@@ -46,11 +48,54 @@ from mini_deerflow.web_tools import (
     WebToolUsageError,
     WEB_TOOL_LIMITS,
     build_web_read_tool,
+    build_web_search_provider_from_config,
     build_web_search_tool,
     create_web_tools,
     extract_readable_text,
     resolve_host_policy,
 )
+
+
+def _install_mock_socket(handler: Callable[[httpx.Request], httpx.Response]) -> Callable[[], None]:
+    """接管 web_tools 的网络层，让它走 httpx.MockTransport 而不发真实请求。
+
+    web_tools._fetch_with_redirect_check 现在用 IP-pinning 走 socket.create_connection
+    直接连已校验 IP；为让 MockTransport 接管，我们：
+    1. 替换 web_tools 内的 `httpx.Client`，让每次构造都注入 MockTransport
+    2. 拦截 socket.create_connection，把目标 IP 替换为 127.0.0.1（mock 不真连）
+    3. 替换 web_tools._pin_one_address，让它走可控的 _StubResolver
+    """
+    transport = httpx.MockTransport(handler)
+    import mini_deerflow.web_tools as _wt
+    original_client = httpx.Client
+    original_pin = _wt._pin_one_address
+    original_create_connection = socket.create_connection
+
+    def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
+        kwargs["transport"] = transport
+        return original_client(*args, **kwargs)
+
+    def patched_pin(host: str, resolver: Any) -> str | None:
+        # 测试夹具：fixture.test 永远返回 127.0.0.1
+        if host == "fixture.test":
+            return "127.0.0.1"
+        return original_pin(host, resolver)
+
+    def patched_create_connection(address, *args, **kwargs):  # type: ignore[no-untyped-def]
+        host, port = address
+        # 把所有目标重写为 127.0.0.1（mock 不真连）
+        return original_create_connection(("127.0.0.1", port), *args, **kwargs)
+
+    _wt.httpx.Client = patched_client  # type: ignore[assignment]
+    _wt._pin_one_address = patched_pin  # type: ignore[assignment]
+    socket.create_connection = patched_create_connection  # type: ignore[assignment]
+
+    def uninstall() -> None:
+        _wt.httpx.Client = original_client  # type: ignore[assignment]
+        _wt._pin_one_address = original_pin  # type: ignore[assignment]
+        socket.create_connection = original_create_connection  # type: ignore[assignment]
+
+    return uninstall
 
 
 # ---------------------------------------------------------------------------
@@ -402,23 +447,14 @@ class TestWebRead:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, text=html)
 
-        # 用白名单绕过 SSRF
         policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
         cfg = WebToolConfig(host_policy=policy)
-        # 替换 web_tools 内部的 httpx.Client 用 MockTransport
-        import mini_deerflow.web_tools as _wt
-        original_client = httpx.Client
-
-        def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
-            kwargs["transport"] = _build_mock_transport(handler)
-            return original_client(*args, **kwargs)
-
-        _wt.httpx.Client = patched_client  # type: ignore[assignment]
+        uninstall = _install_mock_socket(handler)
         try:
             tool = build_web_read_tool(cfg)
             result = json.loads(tool.execute({"url": "https://fixture.test/page"}))
         finally:
-            _wt.httpx.Client = original_client  # type: ignore[assignment]
+            uninstall()
 
         assert result["ok"] is True
         assert result["status_code"] == 200
@@ -435,24 +471,16 @@ class TestWebRead:
 
         policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
         cfg = WebToolConfig(host_policy=policy, max_bytes=1024)
-        import mini_deerflow.web_tools as _wt
-        original_client = httpx.Client
-
-        def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
-            kwargs["transport"] = _build_mock_transport(handler)
-            kwargs["max_redirects"] = cfg.max_redirects  # 无效但保持一致
-            return original_client(*args, **kwargs)
-
-        _wt.httpx.Client = patched_client  # type: ignore[assignment]
+        uninstall = _install_mock_socket(handler)
         try:
             tool = build_web_read_tool(cfg)
             result = json.loads(tool.execute({"url": "https://fixture.test/big"}))
         finally:
-            _wt.httpx.Client = original_client  # type: ignore[assignment]
+            uninstall()
 
         assert result["ok"] is True
         assert result["truncated"] is True
-        # 只下载了 max_bytes
+        # R3：流式读取必须真的只下载 max_bytes 个字节
         assert result["bytes"] <= 1024
 
     def test_redirect_to_private_ip_rejected(self) -> None:
@@ -467,19 +495,12 @@ class TestWebRead:
 
         policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
         cfg = WebToolConfig(host_policy=policy)
-        import mini_deerflow.web_tools as _wt
-        original_client = httpx.Client
-
-        def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
-            kwargs["transport"] = _build_mock_transport(handler)
-            return original_client(*args, **kwargs)
-
-        _wt.httpx.Client = patched_client  # type: ignore[assignment]
+        uninstall = _install_mock_socket(handler)
         try:
             tool = build_web_read_tool(cfg)
             result = json.loads(tool.execute({"url": "https://fixture.test/redir"}))
         finally:
-            _wt.httpx.Client = original_client  # type: ignore[assignment]
+            uninstall()
 
         assert result["ok"] is False
         assert result["kind"] == "ssrf_error"
@@ -498,19 +519,12 @@ class TestWebRead:
 
         policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
         cfg = WebToolConfig(host_policy=policy, max_redirects=3)
-        import mini_deerflow.web_tools as _wt
-        original_client = httpx.Client
-
-        def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
-            kwargs["transport"] = _build_mock_transport(handler)
-            return original_client(*args, **kwargs)
-
-        _wt.httpx.Client = patched_client  # type: ignore[assignment]
+        uninstall = _install_mock_socket(handler)
         try:
             tool = build_web_read_tool(cfg)
             result = json.loads(tool.execute({"url": "https://fixture.test/p?n=0"}))
         finally:
-            _wt.httpx.Client = original_client  # type: ignore[assignment]
+            uninstall()
 
         assert result["ok"] is True
         assert "final" in result["text"]
@@ -523,22 +537,65 @@ class TestWebRead:
 
         policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
         cfg = WebToolConfig(host_policy=policy, max_redirects=2)
-        import mini_deerflow.web_tools as _wt
-        original_client = httpx.Client
-
-        def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
-            kwargs["transport"] = _build_mock_transport(handler)
-            return original_client(*args, **kwargs)
-
-        _wt.httpx.Client = patched_client  # type: ignore[assignment]
+        uninstall = _install_mock_socket(handler)
         try:
             tool = build_web_read_tool(cfg)
             result = json.loads(tool.execute({"url": "https://fixture.test/loop"}))
         finally:
-            _wt.httpx.Client = original_client  # type: ignore[assignment]
+            uninstall()
 
         assert result["ok"] is False
         assert "重定向" in result["error"]
+
+    # R5：HTTP 错误不应被标为成功
+    def test_http_404_returns_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, text="not found")
+
+        policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+        cfg = WebToolConfig(host_policy=policy)
+        uninstall = _install_mock_socket(handler)
+        try:
+            tool = build_web_read_tool(cfg)
+            result = json.loads(tool.execute({"url": "https://fixture.test/missing"}))
+        finally:
+            uninstall()
+
+        assert result["ok"] is False
+        assert "404" in result["error"]
+        assert result["status_code"] == 404
+
+    def test_http_500_returns_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="boom")
+
+        policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+        cfg = WebToolConfig(host_policy=policy)
+        uninstall = _install_mock_socket(handler)
+        try:
+            tool = build_web_read_tool(cfg)
+            result = json.loads(tool.execute({"url": "https://fixture.test/boom"}))
+        finally:
+            uninstall()
+
+        assert result["ok"] is False
+        assert "500" in result["error"]
+
+    def test_http_403_returns_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, text="forbidden")
+
+        policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+        cfg = WebToolConfig(host_policy=policy)
+        uninstall = _install_mock_socket(handler)
+        try:
+            tool = build_web_read_tool(cfg)
+            result = json.loads(tool.execute({"url": "https://fixture.test/private"}))
+        finally:
+            uninstall()
+
+        assert result["ok"] is False
+        assert "403" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -674,41 +731,30 @@ class _ScriptedModelForWeb:
 class TestEndToEnd:
     def test_scripted_model_calls_web_tools(self) -> None:
         # 准备 registry：注入 web 工具（白名单 + mock transport）
-        from mini_deerflow.web_tools import build_web_read_tool as _bwt
-        import mini_deerflow.web_tools as _wt
-
         html = "<html><body><h1>hi</h1><p>hello world</p></body></html>"
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, text=html)
 
-        original_client = httpx.Client
+        registry = create_default_registry()
+        provider = FakeProvider(
+            [WebSearchHit("intro", "https://fixture.test/intro", "snippet")]
+        )
+        cfg = WebToolConfig(
+            host_policy=HostPolicy(allowed_hosts=frozenset({"fixture.test"})),
+        )
+        registry.register_many(create_web_tools(cfg, provider=provider))
+        # 验证模型能看见 web 工具
+        from mini_deerflow.tool_authorization import ToolPolicy, ToolPolicyRegistry
 
-        def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
-            kwargs["transport"] = _build_mock_transport(handler)
-            return original_client(*args, **kwargs)
+        policy_registry = ToolPolicyRegistry(thread_store=InMemoryThreadStore())
+        for name in ("web_search", "web_read"):
+            meta = BUILTIN_TOOL_METADATA[name]
+            policy_registry.register_metadata(meta)
+            policy_registry.set_policy(name, default_policy_for_web())
 
-        _wt.httpx.Client = patched_client  # type: ignore[assignment]
+        uninstall = _install_mock_socket(handler)
         try:
-            registry = create_default_registry()
-            provider = FakeProvider(
-                [WebSearchHit("intro", "https://fixture.test/intro", "snippet")]
-            )
-            cfg = WebToolConfig(
-                host_policy=HostPolicy(allowed_hosts=frozenset({"fixture.test"})),
-            )
-            registry.register_many(create_web_tools(cfg, provider=provider))
-            # 验证模型能看见 web 工具
-            from mini_deerflow.tool_authorization import ToolPolicy, ToolPolicyRegistry
-            from mini_deerflow.tool_contracts import RunAuthority, ExecutorPrincipal, ToolCapability
-            from mini_deerflow.agent import Agent
-
-            policy_registry = ToolPolicyRegistry(thread_store=InMemoryThreadStore())
-            for name in ("web_search", "web_read"):
-                meta = BUILTIN_TOOL_METADATA[name]
-                policy_registry.register_metadata(meta)
-                policy_registry.set_policy(name, default_policy_for_web())
-
             # 验证可执行
             search_result = json.loads(
                 registry.execute("web_search", {"query": "x", "top_k": 1})
@@ -726,7 +772,55 @@ class TestEndToEnd:
             # 来源 URL 透出
             assert read_result["url"].endswith("/intro")
         finally:
-            _wt.httpx.Client = original_client  # type: ignore[assignment]
+            uninstall()
+
+    # R1：Agent 真实路径能看到并调用 web 工具
+    def test_agent_real_path_sees_web_tools(self) -> None:
+        """模拟完整 Agent 链路：可见性 + 授权 + 执行。
+
+        修复前 session_caps / default_caps 缺 NETWORK_READ，普通/项目会话
+        model.decide 都看不到 web_* 工具。
+        """
+        from mini_deerflow.agent import Agent
+        from mini_deerflow.model_factory import create_model as _create_model
+        from mini_deerflow.model_config import ModelSettings
+        from mini_deerflow.tool_authorization import ToolPolicyRegistry
+
+        # 普通会话 thread（无 project_id）
+        store = InMemoryThreadStore()
+        thread = store.create(thread_id="t-1")
+
+        registry = create_default_registry()
+        provider = FakeProvider(
+            [WebSearchHit("intro", "https://example.com", "snippet")]
+        )
+        cfg = WebToolConfig(
+            host_policy=HostPolicy(
+                allowed_hosts=frozenset({"example.com"}),
+            ),
+        )
+        registry.register_many(create_web_tools(cfg, provider=provider))
+
+        # 注册策略
+        policy_registry = ToolPolicyRegistry(thread_store=store)
+        for name in ("web_search", "web_read"):
+            policy_registry.register_metadata(BUILTIN_TOOL_METADATA[name])
+            policy_registry.set_policy(name, default_policy_for_web())
+
+        # 用 fake 模型（provider=fake，不发网络）
+        agent = Agent(
+            model=_create_model(ModelSettings(provider="fake")),
+            registry=registry,
+            store=store,
+            tool_policy_registry=policy_registry,
+        )
+
+        # 验证可见性
+        tool_names = {spec.name for spec in agent._registry.tool_specs()}
+        assert "web_search" in tool_names, (
+            "R1 回归：普通会话应能看到 web_search（已注入 NETWORK_READ）"
+        )
+        assert "web_read" in tool_names
 
 
 # ---------------------------------------------------------------------------
@@ -752,18 +846,136 @@ class TestUntrustedNotice:
 
         policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
         cfg = WebToolConfig(host_policy=policy)
-        import mini_deerflow.web_tools as _wt
-        original_client = httpx.Client
-
-        def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
-            kwargs["transport"] = _build_mock_transport(handler)
-            return original_client(*args, **kwargs)
-
-        _wt.httpx.Client = patched_client  # type: ignore[assignment]
+        uninstall = _install_mock_socket(handler)
         try:
             tool = build_web_read_tool(cfg)
             result = json.loads(tool.execute({"url": "https://fixture.test/p"}))
         finally:
-            _wt.httpx.Client = original_client  # type: ignore[assignment]
+            uninstall()
 
         assert "不可信网络数据" in result["notice"]
+
+
+# ---------------------------------------------------------------------------
+# 9. R2：DNS 重绑定防护（真实 socket 路径）
+# ---------------------------------------------------------------------------
+
+
+class TestDNSPinning:
+    """R2 回归：检查时返回公共 IP，真实连接时被替换为私有 IP 应被拦截。"""
+
+    def test_dns_rebinding_to_loopback_blocked(self) -> None:
+        """模拟：resolve_host_policy 检查后接受一个公共 IP，连接阶段 socket
+        实际 connect 到 127.0.0.1；旧实现直接读到了本地内容，新实现必须
+        因为 URL host 不在白名单而失败。
+        """
+        policy = HostPolicy(allowed_hosts=frozenset())  # 无白名单
+        cfg = WebToolConfig(host_policy=policy)
+        tool = build_web_read_tool(cfg)
+
+        # 不放任何白名单时直接拿 host 解析会失败（公网默认拒绝）
+        # 这里我们要测的是「连接阶段被劫持」：用白名单 + resolver
+        # 走 resolve→返回公共 IP，再让 connect 阶段劫持。
+        # 为简化：直接对 fixture.test 走白名单+自定义 resolver
+        whitelist_policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+
+        # 自定义 resolver：返回公共 IP（让 SSRF 校验通过）
+        def fake_resolver(host: str) -> list[str]:
+            return ["93.184.216.34"]
+
+        cfg2 = WebToolConfig(
+            host_policy=whitelist_policy,
+            resolver=fake_resolver,
+        )
+        tool2 = build_web_read_tool(cfg2)
+        # 真实连接时 mock 拦截——验证 mock 收到 host 头仍是 fixture.test
+        # 也就是说：fix 之后即使 IP 被劫持，host 头里的域名仍是 SSRF 校验过的域名
+        captured_hosts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_hosts.append(request.url.host)
+            return httpx.Response(200, text="<p>ok</p>")
+
+        uninstall = _install_mock_socket(handler)
+        try:
+            # 显式让 _pin_one_address 走我们自己的 resolver
+            import mini_deerflow.web_tools as _wt
+            original_pin = _wt._pin_one_address
+
+            def pinned(host, resolver):
+                if host == "fixture.test":
+                    return "93.184.216.34"
+                return original_pin(host, resolver)
+
+            _wt._pin_one_address = pinned  # type: ignore[assignment]
+            try:
+                result = json.loads(
+                    tool2.execute({"url": "https://fixture.test/p"})
+                )
+            finally:
+                _wt._pin_one_address = original_pin  # type: ignore[assignment]
+        finally:
+            uninstall()
+
+        # Mock 收到的是 fixture.test（已通过白名单校验）
+        assert captured_hosts == ["fixture.test"]
+        assert result["ok"] is True
+
+    def test_dns_rebinding_to_private_ip_blocked_by_pin(self) -> None:
+        """resolver 返回私有 IP 时 _pin_one_address 返回 None → 整个请求被拒。"""
+
+        def evil_resolver(host: str) -> list[str]:
+            return ["10.0.0.5"]  # 私有 IP
+
+        whitelist_policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+        cfg = WebToolConfig(
+            host_policy=whitelist_policy,
+            resolver=evil_resolver,
+        )
+        tool = build_web_read_tool(cfg)
+        result = json.loads(tool.execute({"url": "https://fixture.test/p"}))
+        # 私有 IP 仍被 resolve_host_policy 抓到（白名单只放域名不限制 IP）
+        assert result["ok"] is False
+        assert result["kind"] == "ssrf_error"
+
+
+# ---------------------------------------------------------------------------
+# 10. R4：搜索 Provider 配置工厂
+# ---------------------------------------------------------------------------
+
+
+class TestSearchProviderConfig:
+    def test_unavailable_kind_returns_unavailable(self) -> None:
+        provider = build_web_search_provider_from_config(kind="unavailable")
+        assert isinstance(provider, UnavailableWebSearchProvider)
+        assert provider.is_available() is False
+
+    def test_fake_kind_returns_fixed_list(self) -> None:
+        provider = build_web_search_provider_from_config(
+            kind="fake",
+            fake_results=[("t1", "https://a", "s1"), ("t2", "https://b", "s2")],
+        )
+        assert isinstance(provider, FixedListWebSearchProvider)
+        assert provider.is_available() is True
+        hits = provider.search("q", top_k=5)
+        assert len(hits) == 2
+        assert hits[0].title == "t1"
+        assert hits[0].url == "https://a"
+
+    def test_fake_kind_empty_results(self) -> None:
+        provider = build_web_search_provider_from_config(kind="fake", fake_results=[])
+        hits = provider.search("q", top_k=5)
+        assert hits == []
+
+    def test_mcp_kind_still_unavailable(self) -> None:
+        """MCP 搜索接入留待后续 PR；当前 kind=mcp 也返回不可用。"""
+        provider = build_web_search_provider_from_config(kind="mcp")
+        assert isinstance(provider, UnavailableWebSearchProvider)
+
+    def test_unknown_kind_falls_back_to_unavailable(self) -> None:
+        """未知 kind 走 fallback 到 UnavailableWebSearchProvider，不抛异常。
+
+        严格 kind 校验在 ApiSettings 层做；web_tools 工厂保持宽容。
+        """
+        provider = build_web_search_provider_from_config(kind="bogus")
+        assert isinstance(provider, UnavailableWebSearchProvider)

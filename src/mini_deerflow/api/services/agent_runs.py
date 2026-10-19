@@ -237,12 +237,16 @@ class AgentRunService:
                         ToolCapability.SESSION_STATE_WRITE,
                         ToolCapability.PROJECT_READ,
                         ToolCapability.PROJECT_EXEC_DELEGATE,
+                        # TOOL-06：网络只读
+                        ToolCapability.NETWORK_READ,
                     })
                 else:
                     default_caps = frozenset({
                         ToolCapability.COMPUTE,
                         ToolCapability.SESSION_HISTORY_READ,
                         ToolCapability.SESSION_STATE_WRITE,
+                        # TOOL-06：网络只读
+                        ToolCapability.NETWORK_READ,
                     })
             except Exception:
                 default_caps = frozenset()

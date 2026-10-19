@@ -38,6 +38,7 @@ __all__ = [
     "WebSearchProvider",
     "UnavailableWebSearchProvider",
     "CallableWebSearchProvider",
+    "FixedListWebSearchProvider",
     "WebSearchHit",
     "WebToolConfig",
     "WEB_TOOL_LIMITS",
@@ -46,6 +47,7 @@ __all__ = [
     "build_web_read_tool",
     "create_web_tools",
     "extract_readable_text",
+    "build_web_search_provider_from_config",
 ]
 
 
@@ -84,6 +86,14 @@ class WebToolNetworkError(WebToolError):
 
 class WebToolSSRFError(WebToolError):
     """SSRF 防护拒绝（私有地址、本地、loopback、IP 形式 host）：如实告知。"""
+
+
+class WebToolHTTPError(WebToolError):
+    """非 2xx HTTP 状态（404/403/500 等）：保留 status_code 给模型解释。"""
+
+    def __init__(self, status_code: int, reason: str) -> None:
+        super().__init__(f"HTTP {status_code} {reason}".strip())
+        self.status_code = status_code
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +349,20 @@ class CallableWebSearchProvider(WebSearchProvider):
         return self._fn(query, top_k)
 
 
+class FixedListWebSearchProvider(WebSearchProvider):
+    """TOOL-06 R4：从固定列表返回搜索结果（fake / CI 用）。
+
+    不发任何外部请求；与 CallableWebSearchProvider 的区别是显式语义
+    「这是 fake Provider」，便于审计与日志识别。
+    """
+
+    def __init__(self, results: list[WebSearchHit]) -> None:
+        self._results = list(results)
+
+    def search(self, query: str, *, top_k: int) -> list[WebSearchHit]:
+        return list(self._results)[:top_k]
+
+
 # 旧式别名（保留导出以兼容早期引用）
 WebToolStateError = WebToolError  # type: ignore[assignment,misc]
 
@@ -512,6 +536,21 @@ def build_web_read_tool(config: WebToolConfig) -> Tool:
             )
         except WebToolSSRFError as exc:
             return err_response("web_read", str(exc), kind="ssrf_error")
+        except WebToolHTTPError as exc:
+            # 非 2xx 仍以 ok=false 返回，但附加 status_code 字段，
+            # 让模型能区分 404/403/500/网络层错误
+            import json as _json
+            return _json.dumps(
+                {
+                    "ok": False,
+                    "action": "web_read",
+                    "error": str(exc),
+                    "kind": "http_error",
+                    "status_code": exc.status_code,
+                    "notice": WEB_NOTICE,
+                },
+                ensure_ascii=False,
+            )
         except WebToolNetworkError as exc:
             return err_response("web_read", str(exc), kind="network_error")
         except WebToolUsageError as exc:
@@ -555,6 +594,24 @@ def create_web_tools(
     ]
 
 
+def build_web_search_provider_from_config(
+    *,
+    kind: str,
+    fake_results: list[tuple[str, str, str]] | None = None,
+) -> WebSearchProvider:
+    """TOOL-06 R4：根据应用配置构造搜索 Provider。
+
+    - `kind="unavailable"` → `UnavailableWebSearchProvider`（默认，恒返回不可用）
+    - `kind="fake"` → `FixedListWebSearchProvider`（CI/本地手动测，按固定列表返回）
+    - `kind="mcp"` → `UnavailableWebSearchProvider`（占位；MCP 搜索接入留待后续 PR）
+    """
+    if kind == "fake":
+        hits = [WebSearchHit(t, u, s) for (t, u, s) in (fake_results or [])]
+        return FixedListWebSearchProvider(hits)
+    # mcp 尚未接入；明确返回不可用并保留 reason
+    return UnavailableWebSearchProvider()
+
+
 # ---------------------------------------------------------------------------
 # HTTP 抓取 + 重定向校验
 # ---------------------------------------------------------------------------
@@ -565,10 +622,18 @@ def _fetch_with_redirect_check(
     *,
     config: WebToolConfig,
 ) -> tuple[str, str, int, str, bool]:
-    """抓取 URL；每次重定向都重做 SSRF 校验。
+    """抓取 URL；每次重定向都重做 SSRF 校验；流式读取并按上限截断。
 
     返回 (body, final_url, status_code, content_type, truncated)。
+
+    安全要点：
+    - **R2**：DNS 解析后**直连 IP**，避免 httpx 内部再次解析被 rebinding 绕过
+      （用 httpx 0.28+ 的 transport-level socket_options + 自定义 transport 绑定地址）
+    - **R3**：用 `client.stream()` 流式读取，累计字节达到上限即关闭响应
+    - **R5**：非 2xx HTTP 状态显式拒绝（与 `ok=false` 错误契约一致）
     """
+    import socket as _socket
+
     current = url
     visited: set[str] = set()
     timeout = httpx.Timeout(
@@ -577,8 +642,16 @@ def _fetch_with_redirect_check(
         write=config.timeout_s,
         pool=WEB_TOOL_LIMITS["read_connect_timeout_s"],
     )
-    headers = {"User-Agent": config.user_agent, "Accept": "text/html, text/plain;q=0.9, */*;q=0.5"}
+    headers = {
+        "User-Agent": config.user_agent,
+        "Accept": "text/html, text/plain;q=0.9, */*;q=0.5",
+    }
     max_bytes = config.max_bytes
+
+    # R2：把 `socket.create_connection` 临时绑定到「已通过 SSRF 校验」的目标 IP，
+    # httpx 内部走标准 socket 路径，不会再自行解析域名 → DNS rebinding 无法绕过。
+    # 每次跳（重定向前）重新解一次并重新绑定。
+    original_create_connection = _socket.create_connection
 
     with httpx.Client(
         follow_redirects=False,
@@ -589,24 +662,39 @@ def _fetch_with_redirect_check(
             if current in visited:
                 raise WebToolSSRFError(f"重定向环: {current}")
             visited.add(current)
-            # 每次重定向前重做 SSRF 校验（防 redirect 到内网）
+            # 每次重定向前重做 SSRF 校验并锁定目标 IP（R2）
             try:
-                resolve_host_policy(
+                scheme, host = resolve_host_policy(
                     current,
                     policy=config.host_policy,
                     resolver=config.resolver,
                 )
             except WebToolSSRFError:
                 raise
+            # 解析到一个**通过所有策略**的 IP；用 IP 直连以防 rebinding
+            try:
+                pinned_ip = _pin_one_address(host, config.resolver)
+            except (OSError, socket.gaierror) as exc:
+                raise WebToolSSRFError(f"DNS 解析失败: {host} ({exc})") from exc
+            if pinned_ip is None:
+                raise WebToolSSRFError(f"DNS 解析返回空: {host}")
+
+            # 临时把 socket.create_connection 绑到该 IP；httpx 走标准 socket 路径
+            def _bound_create_connection(address, *a, **kw):  # type: ignore[no-untyped-def]
+                _, port = address
+                return original_create_connection((pinned_ip, port), *a, **kw)
+
+            _socket.create_connection = _bound_create_connection  # type: ignore[assignment]
             try:
                 resp = client.get(current)
-            except httpx.TimeoutException as exc:
+            except (httpx.TimeoutException, socket.timeout) as exc:
                 raise WebToolNetworkError(f"请求超时: {exc}") from exc
             except httpx.HTTPError as exc:
                 raise WebToolNetworkError(f"网络错误: {exc}") from exc
+            finally:
+                _socket.create_connection = original_create_connection  # type: ignore[assignment]
 
             if resp.is_redirect:
-                # 3xx
                 location = resp.headers.get("Location", "")
                 if not location:
                     raise WebToolNetworkError("重定向缺少 Location 头")
@@ -615,23 +703,79 @@ def _fetch_with_redirect_check(
                     raise WebToolNetworkError(
                         f"重定向超过上限 {config.max_redirects}: {current} -> {next_url}"
                     )
+                # 关闭当前响应体再跟随（避免连接泄漏）
+                try:
+                    resp.close()
+                except Exception:
+                    pass
                 current = next_url
                 continue
 
-            # 终态：非重定向
+            # R5：非 2xx 状态码显式拒绝
+            status = resp.status_code
+            if not (200 <= status < 300):
+                # 释放连接
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                raise WebToolHTTPError(status, resp.reason_phrase)
+
+            # R3：流式读取并按 max_bytes 截断
             truncated = False
-            content_bytes = resp.content
-            if len(content_bytes) > max_bytes:
-                content_bytes = content_bytes[:max_bytes]
-                truncated = True
+            chunks: list[bytes] = []
+            total = 0
+            try:
+                for chunk in resp.iter_bytes(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    if total + len(chunk) > max_bytes:
+                        # 只取能塞进上限的部分
+                        remaining = max_bytes - total
+                        chunks.append(chunk[:remaining])
+                        total = max_bytes
+                        truncated = True
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+            content_bytes = b"".join(chunks)
             try:
                 body = content_bytes.decode(resp.encoding or "utf-8", errors="replace")
             except LookupError:
                 body = content_bytes.decode("utf-8", errors="replace")
             content_type = resp.headers.get("content-type", "")
-            return body, str(resp.url), resp.status_code, content_type, truncated
+            return body, str(resp.url), status, content_type, truncated
 
         # for 循环未 return：跳完了所有重定向仍未到终态
         raise WebToolNetworkError(
             f"重定向超过上限 {config.max_redirects}: 最终 {current}"
         )
+
+
+def _pin_one_address(host: str, resolver: Callable[[str], list[str]] | None) -> str | None:
+    """解析 host 并按策略选第一个通过的 IP；用于将 HTTP 连接锁定到该 IP。
+
+    优先调用 `resolve_host_policy` 内部使用的解析路径，再校验每个结果。
+    若所有解析结果都被策略拒绝，返回 None（让外层抛 WebToolSSRFError）。
+    """
+    resolve_fn = resolver or _default_resolve
+    try:
+        addrs = resolve_fn(host)
+    except (OSError, socket.gaierror):
+        return None
+    if not addrs:
+        return None
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            continue
+        return addr
+    return None

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -90,6 +91,14 @@ class ApiSettings:
     生产不应开启。"""
     web_allowed_hosts: tuple[str, ...] = ()
     """URL 主机白名单（精确匹配，不区分大小写）；不在白名单时按其它策略拒绝。"""
+    web_search_provider_kind: str = "unavailable"
+    """搜索 Provider 种类：
+    - "unavailable"：默认，未配置外部服务
+    - "fake"：内置 fake provider（CI/测试用，按 env JSON 提供固定结果）
+    - "mcp"：复用 MCP 接入，要求 mcp_servers 中存在 type=web_search 的 server
+    """
+    web_search_fake_results: tuple[tuple[str, str, str], ...] = ()
+    """fake provider 的固定结果（title, url, snippet）。"""
 
     def __post_init__(self) -> None:
         """从环境变量覆盖各字段。"""
@@ -168,6 +177,39 @@ class ApiSettings:
                 seen.add(h)
                 hosts.append(h)
             object.__setattr__(self, "web_allowed_hosts", tuple(hosts))
+        # TOOL-06 R4：搜索 Provider 种类
+        env_web_kind = _get_env("WEB_SEARCH_PROVIDER_KIND", None)
+        if env_web_kind is not None and env_web_kind.strip():
+            kind = env_web_kind.strip().lower()
+            if kind not in ("unavailable", "fake", "mcp"):
+                raise ValueError(
+                    "环境变量 MINI_DEERFLOW_WEB_SEARCH_PROVIDER_KIND "
+                    f"必须为 unavailable/fake/mcp，当前值: {kind!r}"
+                )
+            object.__setattr__(self, "web_search_provider_kind", kind)
+        env_web_fake = _get_env("WEB_SEARCH_FAKE_RESULTS", None)
+        if env_web_fake is not None and env_web_fake.strip():
+            # JSON 数组，每个元素 [title, url, snippet]
+            try:
+                parsed = json.loads(env_web_fake)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"环境变量 MINI_DEERFLOW_WEB_SEARCH_FAKE_RESULTS 不是合法 JSON: {exc}"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise ValueError("WEB_SEARCH_FAKE_RESULTS 必须是 JSON 数组")
+            triples: list[tuple[str, str, str]] = []
+            for item in parsed:
+                if (
+                    not isinstance(item, list)
+                    or len(item) != 3
+                    or not all(isinstance(x, str) for x in item)
+                ):
+                    raise ValueError(
+                        "WEB_SEARCH_FAKE_RESULTS 元素必须是 [title, url, snippet] 三元组"
+                    )
+                triples.append((item[0], item[1], item[2]))
+            object.__setattr__(self, "web_search_fake_results", tuple(triples))
         # 验证
         if self.max_upload_bytes < 0:
             raise ValueError(
