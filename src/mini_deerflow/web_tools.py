@@ -948,13 +948,19 @@ class _PinAddrTransport(httpx.BaseTransport):
             request_data += request.content
         _check_deadline()
         sock.settimeout(_bounded_timeout(timeout_s))
+        # R3-fix：发送和读取都在 try/finally 内，确保超时/异常时 socket 仍被关闭
         try:
             sock.sendall(request_data)
         except (socket.timeout, TimeoutError) as exc:
+            try:
+                sock.close()
+            except Exception:
+                pass
             raise WebToolNetworkError(f"发送请求超时: {exc}") from exc
 
         # 3. 读 HTTP 响应（直接用 sock.recv，不再用 makefile 缓冲）
         #    每次 recv 都受剩余总时间约束，max_bytes 精确控制总读量
+        # R3-fix：所有读取操作都在统一 try/finally 内，确保 socket 正确关闭
         def _recv_until_delim(delim: bytes = b"\r\n") -> bytes:
             """从 socket 接收直到遇到 delim（\r\n 或 \n），返回整行。"""
             buf = b""
@@ -968,8 +974,6 @@ class _PinAddrTransport(httpx.BaseTransport):
                 if buf.endswith(delim):
                     return buf
 
-        # 从这里开始统一用 try/finally 确保 socket 被正确关闭
-        # （覆盖发送/状态行/headers/body 所有阶段）
         try:
             _check_deadline()
             status_line = _recv_until_delim()
@@ -1106,7 +1110,11 @@ class _PinAddrTransport(httpx.BaseTransport):
 
         body = b"".join(chunks)
         _check_deadline()
-        if content_length is None and eof_reached and total < max_bytes:
+        # R3-fix：有 Content-Length 但提前 EOF → 服务器异常断开，标记 truncated
+        if eof_reached and content_length is not None and total < content_length:
+            truncated = True
+        elif content_length is None and eof_reached and total < max_bytes:
+            # 无 Content-Length + 自然 EOF：内容完整，未超限
             truncated = False
         header_dict.append(("X-Transport-Truncated", "1" if truncated else "0"))
         stream = httpx.ByteStream(body)
@@ -1116,6 +1124,7 @@ class _PinAddrTransport(httpx.BaseTransport):
             stream=stream,
             request=request,
         )
+
     def close(self) -> None:
         return None
 

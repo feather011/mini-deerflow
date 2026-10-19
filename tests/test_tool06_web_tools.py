@@ -1804,6 +1804,14 @@ class _Tool06HTTPHandler:
                             time.sleep(0.15)
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         pass
+                elif path == "/premature":
+                    # 有 Content-Length 但提前 EOF：服务器声明 100 字节，只发 5 字节就关闭
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", "100")  # 声称 100 字节
+                    self.end_headers()
+                    self.wfile.write(b"hello")  # 只发 5 字节
+                    self.close_connection = True
                 else:
                     self.send_response(404)
                     self.send_header("Content-Length", "0")
@@ -1977,3 +1985,59 @@ class TestRealTransportR3:
         assert result["kind"] == "network_error", result
         # 验证立即退出（不超过配置的 0.05s + 连接开销）
         assert elapsed < 0.5, f"socket 未及时关闭，耗时 {elapsed:.3f}s"
+
+    def test_content_length_but_early_eof_truncated(self, local_http_server) -> None:
+        """R3-fix：有 Content-Length 但服务器提前 EOF → 标记 truncated=True。"""
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(timeout_s=5.0, max_bytes=1024)
+        result = json.loads(tool.execute({"url": f"{base_url}/premature"}))
+        assert result["ok"] is True, result
+        # 声称 100 字节，只收到 5 字节就 EOF → truncated 必须为 True
+        assert result["truncated"] is True, f"提前 EOF 必须标 truncated，实际: {result}"
+        assert result["bytes"] == 5, f"期望 5，实际 {result['bytes']}"
+        assert result["text"] == "hello", f"期望 'hello'，实际 {result['text']!r}"
+
+    def test_send_timeout_socket_closed(self) -> None:
+        """R3-fix：发送请求超时时，socket 必须被主动关闭。"""
+        import socket
+        from mini_deerflow.web_tools import _PinAddrTransport, WebToolNetworkError
+
+        # 用 mock socket 模拟发送超时
+        class _TimeoutSocket:
+            def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM):
+                self.family = family
+                self.type = type
+                self.closed = False
+                self.timeout_val = None
+            def settimeout(self, val):
+                self.timeout_val = val
+            def sendall(self, data):
+                raise socket.timeout("timed out")
+            def recv(self, n):
+                raise socket.timeout("timed out")
+            def close(self):
+                self.closed = True
+            def gettimeout(self):
+                return self.timeout_val
+
+        sock = _TimeoutSocket()
+
+        def _mock_connect(addr, timeout=None):
+            return sock
+
+        # 注入 mock：让 create_connection 返回我们的超时 socket
+        import mini_deerflow.web_tools as wt
+        orig_connect = wt.socket.create_connection
+        try:
+            wt.socket.create_connection = lambda addr, timeout=None: sock
+            transport = _PinAddrTransport("127.0.0.1", max_bytes=1024, deadline_monotonic=None)
+            req = httpx.Request("GET", "http://example.com/path")
+            try:
+                transport.handle_request(req)
+                assert False, "应抛 WebToolNetworkError"
+            except WebToolNetworkError:
+                pass  # 期望的异常
+            # R3-fix：socket 必须在异常路径中被关闭
+            assert sock.closed, "发送超时时 socket 必须被关闭"
+        finally:
+            wt.socket.create_connection = orig_connect
