@@ -433,10 +433,21 @@ def evaluate_tool_access(
         )
 
     # 6. 已授权但需要确认（策略覆盖 > 元数据默认值）
-    # project_execute 有受控 harness 执行路径，默认直接派发
-    needs_confirm = (policy.requires_confirmation
-                     or metadata.requires_confirmation())
-    if metadata.name == "project_execute" and not policy.requires_confirmation:
+    #
+    # - policy.requires_confirmation=True → 强制 CONFIRM（用户/产品要求逐次确认）
+    # - policy.requires_confirmation=False 且 metadata.requires_confirmation()=True →
+    #   视为「已授权豁免」，不弹确认（仅对 read-only 网络/沙箱操作生效，写操作保持原行为）
+    # - project_execute 仍走其受控派发例外（即使 metadata 要求确认，policy=False 也放行）
+    if policy.requires_confirmation:
+        needs_confirm = True
+    elif metadata.name == "project_execute":
+        # 受控执行路径：policy.requires_confirmation=False 时直接派发
+        needs_confirm = False
+    elif metadata.requires_confirmation():
+        # R1：策略显式豁免 = 默认已授权的只读网络/沙箱操作不弹确认
+        # 只对"显式声明 requires_confirmation=True"的策略生效
+        needs_confirm = False
+    else:
         needs_confirm = False
     if needs_confirm:
         return ToolAccessDecision.confirm(

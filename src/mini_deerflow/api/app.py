@@ -133,9 +133,15 @@ def _default_runtime_factory(
             web_read_timeout_s=resolved.web_read_timeout_s,
             web_host_policy=build_web_host_policy(resolved),
             # R4：根据应用配置装配搜索 Provider
+            # MCP 模式下 executor 留 None：当前应用启动时尚未持有 MCPManager；
+            # 运行期可由 Agent 通过 Registry 调 mcp__<server>__<tool>。
+            # web_search MCP 模式（"可用 + executor 已注入"）需用户在 MCP server
+            # 配置中显式启用并暴露 search 工具，再由 MCPSearchAdapter 调用。
             web_search_provider=build_web_search_provider_from_config(
                 kind=resolved.web_search_provider_kind,
                 fake_results=list(resolved.web_search_fake_results),
+                mcp_executor=None,
+                mcp_tool_name=resolved.web_search_mcp_tool,
             ),
             **load_context_config(),
         ),

@@ -23,6 +23,7 @@ import ipaddress
 import json
 import re
 import socket
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +40,7 @@ __all__ = [
     "UnavailableWebSearchProvider",
     "CallableWebSearchProvider",
     "FixedListWebSearchProvider",
+    "MCPSearchAdapter",
     "WebSearchHit",
     "WebToolConfig",
     "WEB_TOOL_LIMITS",
@@ -363,6 +365,71 @@ class FixedListWebSearchProvider(WebSearchProvider):
         return list(self._results)[:top_k]
 
 
+class MCPSearchAdapter(WebSearchProvider):
+    """TOOL-06 R4：把 MCP 工具调用适配为 WebSearchProvider。
+
+    适用于已通过 MCP 接入的搜索服务器（本地 stdio）。调用方传入一个执行器
+    `tool_executor`，形如 `(tool_name, arguments) -> dict`。MCPManager 的
+    `registered_names` 与 `invoke_tool` 可直接对接。
+    """
+
+    def __init__(
+        self,
+        tool_executor: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        *,
+        tool_name: str = "search",
+        hits_path: tuple[str, ...] = ("hits", "results", "data"),
+        title_keys: tuple[str, ...] = ("title", "name"),
+        url_keys: tuple[str, ...] = ("url", "link", "href"),
+        snippet_keys: tuple[str, ...] = ("snippet", "description", "summary"),
+    ) -> None:
+        self._tool_name = tool_name
+        self._executor = tool_executor
+        self._hits_path = hits_path
+        self._title_keys = title_keys
+        self._url_keys = url_keys
+        self._snippet_keys = snippet_keys
+
+    def is_available(self) -> bool:
+        return self._executor is not None
+
+    def search(self, query: str, *, top_k: int) -> list[WebSearchHit]:
+        if self._executor is None:
+            raise WebToolError("MCP 搜索 Provider 未配置 executor")
+        raw = self._executor(self._tool_name, {"query": query, "top_k": top_k})
+        # 适配常见返回形态：{"hits": [...]}, {"results": [...]}, {"data": [...]}
+        hits_raw: list[Any] = []
+        for key in self._hits_path:
+            if isinstance(raw, dict) and key in raw:
+                value = raw[key]
+                if isinstance(value, list):
+                    hits_raw = value
+                    break
+        if not hits_raw and isinstance(raw, list):
+            hits_raw = raw
+        if not hits_raw:
+            return []
+        out: list[WebSearchHit] = []
+        for item in hits_raw[:top_k]:
+            if not isinstance(item, dict):
+                continue
+            title = self._first_str(item, self._title_keys)
+            url = self._first_str(item, self._url_keys)
+            snippet = self._first_str(item, self._snippet_keys)
+            if not title or not url:
+                continue
+            out.append(WebSearchHit(title=title, url=url, snippet=snippet or ""))
+        return out
+
+    @staticmethod
+    def _first_str(d: dict[str, Any], keys: tuple[str, ...]) -> str:
+        for k in keys:
+            v = d.get(k)
+            if isinstance(v, str) and v:
+                return v
+        return ""
+
+
 # 旧式别名（保留导出以兼容早期引用）
 WebToolStateError = WebToolError  # type: ignore[assignment,misc]
 
@@ -598,23 +665,254 @@ def build_web_search_provider_from_config(
     *,
     kind: str,
     fake_results: list[tuple[str, str, str]] | None = None,
+    mcp_executor: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    mcp_tool_name: str = "search",
 ) -> WebSearchProvider:
     """TOOL-06 R4：根据应用配置构造搜索 Provider。
 
     - `kind="unavailable"` → `UnavailableWebSearchProvider`（默认，恒返回不可用）
     - `kind="fake"` → `FixedListWebSearchProvider`（CI/本地手动测，按固定列表返回）
-    - `kind="mcp"` → `UnavailableWebSearchProvider`（占位；MCP 搜索接入留待后续 PR）
+    - `kind="mcp"` + 已注入 executor → `MCPSearchAdapter`（真实转发到 MCP 工具）
+    - `kind="mcp"` 但 executor 不可用 → 降级为 `UnavailableWebSearchProvider`
     """
     if kind == "fake":
         hits = [WebSearchHit(t, u, s) for (t, u, s) in (fake_results or [])]
         return FixedListWebSearchProvider(hits)
-    # mcp 尚未接入；明确返回不可用并保留 reason
+    if kind == "mcp":
+        if mcp_executor is None:
+            return UnavailableWebSearchProvider()
+        return MCPSearchAdapter(tool_executor=mcp_executor, tool_name=mcp_tool_name)
+    # 未知 kind / 默认：fallback 到 unavailable（不抛异常，宽松）
     return UnavailableWebSearchProvider()
 
 
 # ---------------------------------------------------------------------------
 # HTTP 抓取 + 重定向校验
 # ---------------------------------------------------------------------------
+
+
+def _make_pinned_transport(pinned_ip: str, max_bytes: int) -> httpx.BaseTransport:
+    """构造把目标 IP 强制绑到 `pinned_ip` 的 transport（仅本实例，进程全局不受影响）。"""
+    return _PinAddrTransport(pinned_ip, max_bytes)
+
+
+class _PinAddrTransport(httpx.BaseTransport):
+    """httpx.BaseTransport 子类，把 socket 连接到 `pinned_ip`，SNI/Host 头仍用原域名。
+
+    httpx 0.28 的 HTTPTransport 不公开 socket connect 拦截；我们用 stdlib
+    `socket + makefile` 实现单次请求：直接连 IP，按 R3 流式读取，body 累计到
+    `max_bytes` 立即停止读 socket 并关闭连接。
+
+    影响范围：仅本 httpx.Client 实例；不修改进程全局 `socket.create_connection`。
+    """
+
+    def __init__(self, pinned_ip: str, max_bytes: int) -> None:
+        self._pinned_ip = pinned_ip
+        self._max_bytes = max_bytes
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        """实现 R3 流式读取：socket 边读边累计，max_bytes 内实时关闭。
+
+        - 用 socket.makefile() 按行读 HTTP 头
+        - 读 body 时按 chunk_size 累计，到达 max_bytes 立即停止读 socket 并关闭
+        - 返回 httpx.Response + ByteStream（流）让调用方按需消费
+        """
+        from urllib.parse import urlparse as _urlparse
+
+        parsed = _urlparse(str(request.url))
+        if parsed.scheme not in ("http", "https"):
+            raise httpx.UnsupportedProtocol(
+                f"Unsupported protocol: {parsed.scheme!r}"
+            )
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        timeout_obj = request.extensions.get("timeout")
+        timeout_s = 10.0
+        if timeout_obj is not None:
+            try:
+                timeout_s = float(getattr(timeout_obj, "read", None) or 10.0)
+            except (TypeError, ValueError):
+                pass
+
+        # 1. TCP 连接（绑到 pinned IP）
+        raw_sock = socket.create_connection(
+            (self._pinned_ip, port), timeout=timeout_s
+        )
+        sock: socket.socket
+        if parsed.scheme == "https":
+            import ssl
+
+            ctx = ssl.create_default_context()
+            sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+        else:
+            sock = raw_sock
+
+        # 2. 发送请求
+        try:
+            headers_list: list[tuple[str, str]] = [
+                (k, v) for (k, v) in request.headers.raw if k.lower() != "host"
+            ]
+            headers_list.append(("Host", host))
+            header_lines = [
+                f"{request.method} {path} HTTP/1.1",
+            ]
+            for k, v in headers_list:
+                header_lines.append(f"{k}: {v}")
+            header_lines.append("Connection: close")
+            header_lines.append("")
+            header_lines.append("")
+            request_data = "\r\n".join(header_lines).encode("ascii")
+            if request.content:
+                request_data += request.content
+            sock.sendall(request_data)
+
+            # 3. 读 HTTP 响应头（按行）
+            sock.settimeout(timeout_s)
+            fp = sock.makefile("rb")
+            status_line = fp.readline()
+            if not status_line:
+                raise httpx.RemoteProtocolError("响应为空", request=request)
+            try:
+                # HTTP/1.1 200 OK
+                _, status_str, _ = status_line.split(b" ", 2)
+                status_code = int(status_str)
+            except (ValueError, IndexError) as exc:
+                raise httpx.RemoteProtocolError(
+                    f"无法解析状态行: {status_line!r}", request=request
+                ) from exc
+
+            # 读 headers
+            header_dict: list[tuple[str, str]] = []
+            content_length: int | None = None
+            transfer_encoding_chunked = False
+            while True:
+                line = fp.readline()
+                if not line or line in (b"\r\n", b"\n", b""):
+                    break
+                try:
+                    name, _, value = line.decode("latin-1").partition(":")
+                except UnicodeDecodeError:
+                    continue
+                name = name.strip()
+                value = value.strip()
+                if name.lower() == "content-length":
+                    try:
+                        content_length = int(value)
+                    except ValueError:
+                        content_length = None
+                elif name.lower() == "transfer-encoding" and "chunked" in value.lower():
+                    transfer_encoding_chunked = True
+                header_dict.append((name, value))
+
+            # 4. R3：流式读 body——按 chunk 累计，max_bytes 内实时截断
+            max_bytes = self._max_bytes
+            truncated = False
+            chunks: list[bytes] = []
+            total = 0
+
+            def _read_more() -> None:
+                """从 socket 读 chunk 并累计到 chunks。"""
+                nonlocal total, truncated
+                if transfer_encoding_chunked:
+                    # 读 chunked 编码：<size>\r\n<data>\r\n
+                    while True:
+                        size_line = fp.readline()
+                        if not size_line:
+                            return
+                        try:
+                            size = int(size_line.strip(), 16)
+                        except ValueError:
+                            return
+                        if size == 0:
+                            fp.readline()  # 末尾 \r\n
+                            return
+                        # 读 size 字节
+                        remaining = size
+                        while remaining > 0:
+                            buf = fp.read(remaining)
+                            if not buf:
+                                return
+                            if total + len(buf) > max_bytes:
+                                space = max_bytes - total
+                                if space > 0:
+                                    chunks.append(buf[:space])
+                                    total += space
+                                truncated = True
+                                # 多余的丢给下一个 readline 解析（让 server 看到关闭）
+                                return
+                            chunks.append(buf)
+                            total += len(buf)
+                            remaining -= len(buf)
+                        fp.readline()  # chunk 后的 \r\n
+                        if truncated:
+                            return
+                else:
+                    # 不带 transfer-encoding：按 content-length 或读到 EOF
+                    if content_length is not None:
+                        to_read = content_length
+                    else:
+                        to_read = max_bytes + 1
+                    while total < max_bytes:
+                        want = min(8192, max_bytes - total, to_read)
+                        if want <= 0:
+                            break
+                        buf = fp.read(want)
+                        if not buf:
+                            break
+                        if total + len(buf) > max_bytes:
+                            space = max_bytes - total
+                            chunks.append(buf[:space])
+                            total += space
+                            truncated = True
+                            break
+                        chunks.append(buf)
+                        total += len(buf)
+                        if content_length is not None:
+                            to_read -= len(buf)
+                            if to_read <= 0:
+                                break
+
+            try:
+                _read_more()
+            finally:
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+            body = b"".join(chunks)
+            # 让上层知道是否截断：通过响应头加自定义字段
+            header_dict.append(("X-Transport-Truncated", "1" if truncated else "0"))
+            stream = httpx.ByteStream(body)
+            return httpx.Response(
+                status_code=status_code,
+                headers=header_dict,
+                stream=stream,
+                request=request,
+            )
+        except (httpx.HTTPError,):
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
+
+    def close(self) -> None:
+        return None
 
 
 def _fetch_with_redirect_check(
@@ -627,83 +925,76 @@ def _fetch_with_redirect_check(
     返回 (body, final_url, status_code, content_type, truncated)。
 
     安全要点：
-    - **R2**：DNS 解析后**直连 IP**，避免 httpx 内部再次解析被 rebinding 绕过
-      （用 httpx 0.28+ 的 transport-level socket_options + 自定义 transport 绑定地址）
-    - **R3**：用 `client.stream()` 流式读取，累计字节达到上限即关闭响应
+    - **R2**：用 `_PinAddrTransport` 强制单次 Client 直连到「已通过 SSRF 校验」的 IP。
+      不修改进程全局 `socket.create_connection`；httpx.Client 与 transport 1:1 绑定。
+    - **R3**：用 stdlib http.client 一边读流一边累计字节，达到上限即关闭连接
     - **R5**：非 2xx HTTP 状态显式拒绝（与 `ok=false` 错误契约一致）
     """
-    import socket as _socket
-
     current = url
     visited: set[str] = set()
-    timeout = httpx.Timeout(
-        connect=WEB_TOOL_LIMITS["read_connect_timeout_s"],
-        read=config.timeout_s,
-        write=config.timeout_s,
-        pool=WEB_TOOL_LIMITS["read_connect_timeout_s"],
-    )
+    timeout_total_s = config.timeout_s + WEB_TOOL_LIMITS["read_connect_timeout_s"]
+    deadline = time.monotonic() + timeout_total_s
     headers = {
         "User-Agent": config.user_agent,
         "Accept": "text/html, text/plain;q=0.9, */*;q=0.5",
     }
     max_bytes = config.max_bytes
 
-    # R2：把 `socket.create_connection` 临时绑定到「已通过 SSRF 校验」的目标 IP，
-    # httpx 内部走标准 socket 路径，不会再自行解析域名 → DNS rebinding 无法绕过。
-    # 每次跳（重定向前）重新解一次并重新绑定。
-    original_create_connection = _socket.create_connection
+    for hop in range(config.max_redirects + 1):
+        if current in visited:
+            raise WebToolSSRFError(f"重定向环: {current}")
+        visited.add(current)
+        # 每次重定向前重做 SSRF 校验并锁定目标 IP
+        try:
+            scheme, host = resolve_host_policy(
+                current,
+                policy=config.host_policy,
+                resolver=config.resolver,
+            )
+        except WebToolSSRFError:
+            raise
+        # 解析到一个**通过所有策略**的 IP
+        try:
+            pinned_ip = _pin_one_address(host, config.resolver, config.host_policy)
+        except (OSError, socket.gaierror) as exc:
+            raise WebToolSSRFError(f"DNS 解析失败: {host} ({exc})") from exc
+        if pinned_ip is None:
+            raise WebToolSSRFError(f"DNS 解析返回空: {host}")
 
-    with httpx.Client(
-        follow_redirects=False,
-        timeout=timeout,
-        headers=headers,
-    ) as client:
-        for hop in range(config.max_redirects + 1):
-            if current in visited:
-                raise WebToolSSRFError(f"重定向环: {current}")
-            visited.add(current)
-            # 每次重定向前重做 SSRF 校验并锁定目标 IP（R2）
-            try:
-                scheme, host = resolve_host_policy(
-                    current,
-                    policy=config.host_policy,
-                    resolver=config.resolver,
-                )
-            except WebToolSSRFError:
-                raise
-            # 解析到一个**通过所有策略**的 IP；用 IP 直连以防 rebinding
-            try:
-                pinned_ip = _pin_one_address(host, config.resolver)
-            except (OSError, socket.gaierror) as exc:
-                raise WebToolSSRFError(f"DNS 解析失败: {host} ({exc})") from exc
-            if pinned_ip is None:
-                raise WebToolSSRFError(f"DNS 解析返回空: {host}")
+        # R2：构造 pinned transport（不污染全局 socket）；max_bytes 由 transport 内部流式截断
+        transport = _make_pinned_transport(pinned_ip, max_bytes)
 
-            # 临时把 socket.create_connection 绑到该 IP；httpx 走标准 socket 路径
-            def _bound_create_connection(address, *a, **kw):  # type: ignore[no-untyped-def]
-                _, port = address
-                return original_create_connection((pinned_ip, port), *a, **kw)
-
-            _socket.create_connection = _bound_create_connection  # type: ignore[assignment]
+        # 剩余时间作为本次 http timeout
+        remaining = max(0.5, deadline - time.monotonic())
+        per_timeout = httpx.Timeout(
+            connect=min(WEB_TOOL_LIMITS["read_connect_timeout_s"], remaining),
+            read=remaining,
+            write=remaining,
+            pool=remaining,
+        )
+        with httpx.Client(
+            transport=transport,
+            follow_redirects=False,
+            timeout=per_timeout,
+            headers=headers,
+        ) as client:
             try:
                 resp = client.get(current)
             except (httpx.TimeoutException, socket.timeout) as exc:
                 raise WebToolNetworkError(f"请求超时: {exc}") from exc
             except httpx.HTTPError as exc:
                 raise WebToolNetworkError(f"网络错误: {exc}") from exc
-            finally:
-                _socket.create_connection = original_create_connection  # type: ignore[assignment]
 
-            if resp.is_redirect:
+            if 300 <= resp.status_code < 400:
                 location = resp.headers.get("Location", "")
                 if not location:
                     raise WebToolNetworkError("重定向缺少 Location 头")
                 next_url = urljoin(current, location)
                 if hop >= config.max_redirects:
                     raise WebToolNetworkError(
-                        f"重定向超过上限 {config.max_redirects}: {current} -> {next_url}"
+                        f"重定向超过上限 {config.max_redirects}: "
+                        f"{current} -> {next_url}"
                     )
-                # 关闭当前响应体再跟随（避免连接泄漏）
                 try:
                     resp.close()
                 except Exception:
@@ -711,58 +1002,51 @@ def _fetch_with_redirect_check(
                 current = next_url
                 continue
 
-            # R5：非 2xx 状态码显式拒绝
             status = resp.status_code
             if not (200 <= status < 300):
-                # 释放连接
+                # R5：非 2xx 状态码
+                reason = resp.headers.get("X-Reason", "") or resp.reason_phrase
                 try:
                     resp.close()
                 except Exception:
                     pass
-                raise WebToolHTTPError(status, resp.reason_phrase)
+                raise WebToolHTTPError(status, reason)
 
-            # R3：流式读取并按 max_bytes 截断
-            truncated = False
-            chunks: list[bytes] = []
-            total = 0
-            try:
-                for chunk in resp.iter_bytes(chunk_size=8192):
-                    if not chunk:
-                        continue
-                    if total + len(chunk) > max_bytes:
-                        # 只取能塞进上限的部分
-                        remaining = max_bytes - total
-                        chunks.append(chunk[:remaining])
-                        total = max_bytes
-                        truncated = True
-                        break
-                    chunks.append(chunk)
-                    total += len(chunk)
-            finally:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-            content_bytes = b"".join(chunks)
-            try:
-                body = content_bytes.decode(resp.encoding or "utf-8", errors="replace")
-            except LookupError:
-                body = content_bytes.decode("utf-8", errors="replace")
+            # R3：transport 已按 max_bytes 流式截断；这里读 body
+            # 但若 transport 未截断（如重定向的 3xx body），这里兜底再截一次
+            body_bytes = resp.content
+            truncated = resp.headers.get("X-Transport-Truncated") == "1"
+            if len(body_bytes) > max_bytes:
+                body_bytes = body_bytes[:max_bytes]
+                truncated = True
             content_type = resp.headers.get("content-type", "")
-            return body, str(resp.url), status, content_type, truncated
+            try:
+                encoding = resp.encoding or "utf-8"
+                body_str = body_bytes.decode(encoding, errors="replace")
+            except LookupError:
+                body_str = body_bytes.decode("utf-8", errors="replace")
+            return body_str, str(resp.url), status, content_type, truncated
 
-        # for 循环未 return：跳完了所有重定向仍未到终态
-        raise WebToolNetworkError(
-            f"重定向超过上限 {config.max_redirects}: 最终 {current}"
-        )
+    # 跳完所有重定向仍未到终态
+    raise WebToolNetworkError(
+        f"重定向超过上限 {config.max_redirects}: 最终 {current}"
+    )
 
 
-def _pin_one_address(host: str, resolver: Callable[[str], list[str]] | None) -> str | None:
+def _pin_one_address(
+    host: str,
+    resolver: Callable[[str], list[str]] | None,
+    policy: HostPolicy | None = None,
+) -> str | None:
     """解析 host 并按策略选第一个通过的 IP；用于将 HTTP 连接锁定到该 IP。
 
     优先调用 `resolve_host_policy` 内部使用的解析路径，再校验每个结果。
     若所有解析结果都被策略拒绝，返回 None（让外层抛 WebToolSSRFError）。
+
+    `policy` 留作未来扩展；当前以 host 策略里的 `allow_loopback` 决定是否放行
+    私网/loopback。
     """
+    allow_loopback = bool(policy and policy.allow_loopback)
     resolve_fn = resolver or _default_resolve
     try:
         addrs = resolve_fn(host)
@@ -775,7 +1059,16 @@ def _pin_one_address(host: str, resolver: Callable[[str], list[str]] | None) -> 
             ip = ipaddress.ip_address(addr)
         except ValueError:
             continue
-        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            if allow_loopback and ip.is_loopback:
+                return addr
             continue
         return addr
     return None

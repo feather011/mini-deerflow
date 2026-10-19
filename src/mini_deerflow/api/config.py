@@ -99,6 +99,11 @@ class ApiSettings:
     """
     web_search_fake_results: tuple[tuple[str, str, str], ...] = ()
     """fake provider 的固定结果（title, url, snippet）。"""
+    web_search_mcp_server: str | None = None
+    """MCP 搜索服务器名（mcp_servers 中的 server.name）。设置后，kind=mcp 走 MCP 工具。
+    格式：mcp__<server>__<tool> 形式的工具会被适配为搜索 Provider。"""
+    web_search_mcp_tool: str = "search"
+    """MCP 搜索工具名（默认 search）；模型通过 mcp__<server>__<tool> 暴露。"""
 
     def __post_init__(self) -> None:
         """从环境变量覆盖各字段。"""
@@ -210,6 +215,12 @@ class ApiSettings:
                     )
                 triples.append((item[0], item[1], item[2]))
             object.__setattr__(self, "web_search_fake_results", tuple(triples))
+        env_web_mcp_server = _get_env("WEB_SEARCH_MCP_SERVER", None)
+        if env_web_mcp_server is not None and env_web_mcp_server.strip():
+            object.__setattr__(self, "web_search_mcp_server", env_web_mcp_server.strip())
+        env_web_mcp_tool = _get_env("WEB_SEARCH_MCP_TOOL", None)
+        if env_web_mcp_tool is not None and env_web_mcp_tool.strip():
+            object.__setattr__(self, "web_search_mcp_tool", env_web_mcp_tool.strip())
         # 验证
         if self.max_upload_bytes < 0:
             raise ValueError(

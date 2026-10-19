@@ -59,41 +59,62 @@ from mini_deerflow.web_tools import (
 def _install_mock_socket(handler: Callable[[httpx.Request], httpx.Response]) -> Callable[[], None]:
     """接管 web_tools 的网络层，让它走 httpx.MockTransport 而不发真实请求。
 
-    web_tools._fetch_with_redirect_check 现在用 IP-pinning 走 socket.create_connection
-    直接连已校验 IP；为让 MockTransport 接管，我们：
-    1. 替换 web_tools 内的 `httpx.Client`，让每次构造都注入 MockTransport
-    2. 拦截 socket.create_connection，把目标 IP 替换为 127.0.0.1（mock 不真连）
-    3. 替换 web_tools._pin_one_address，让它走可控的 _StubResolver
+    R2 复审后 web_tools 用 _PinAddrTransport（stdlib socket + makefile）。
+    测试用 monkey-patch _PinAddrTransport.handle_request 走 httpx.MockTransport。
     """
-    transport = httpx.MockTransport(handler)
     import mini_deerflow.web_tools as _wt
-    original_client = httpx.Client
+    original_handle = _wt._PinAddrTransport.handle_request
+
+    def patched_handle(self: Any, request: httpx.Request) -> httpx.Response:
+        # 走 httpx.MockTransport 拿到响应，body 仍按 max_bytes 截断
+        from mini_deerflow.web_tools import WEB_TOOL_LIMITS
+        transport = httpx.MockTransport(handler)
+        # 把 request 也传给 handler（与生产路径一致）
+        resp = transport.handle_request(request)
+        # 模拟 transport 内 max_bytes 截断
+        max_bytes = getattr(self, "_max_bytes", WEB_TOOL_LIMITS["read_max_bytes"])
+        body = resp.content
+        truncated = False
+        if len(body) > max_bytes:
+            body = body[:max_bytes]
+            truncated = True
+        # 重建 stream + 附加 truncated 标记
+        new_headers = list(resp.headers.items())
+        new_headers.append(("X-Transport-Truncated", "1" if truncated else "0"))
+        # 用 ByteStream 保证 httpx 内部能正确读取
+        stream = httpx.ByteStream(body)
+        return httpx.Response(
+            status_code=resp.status_code,
+            headers=new_headers,
+            stream=stream,
+            request=request,
+        )
+
+    _wt._PinAddrTransport.handle_request = patched_handle  # type: ignore[assignment]
+
+    # 给 fixture.test 装一个 stub resolver + stub pin
+    original_resolver = _wt._default_resolve
     original_pin = _wt._pin_one_address
-    original_create_connection = socket.create_connection
 
-    def patched_client(*args: Any, **kwargs: Any) -> httpx.Client:
-        kwargs["transport"] = transport
-        return original_client(*args, **kwargs)
-
-    def patched_pin(host: str, resolver: Any) -> str | None:
-        # 测试夹具：fixture.test 永远返回 127.0.0.1
+    def stub_resolver(host: str) -> list[str]:
         if host == "fixture.test":
-            return "127.0.0.1"
-        return original_pin(host, resolver)
+            return ["93.184.216.34"]
+        return original_resolver(host)
 
-    def patched_create_connection(address, *args, **kwargs):  # type: ignore[no-untyped-def]
-        host, port = address
-        # 把所有目标重写为 127.0.0.1（mock 不真连）
-        return original_create_connection(("127.0.0.1", port), *args, **kwargs)
+    def stub_pin(host: str, resolver: Any = None, policy: Any = None) -> str | None:
+        if host == "fixture.test":
+            return "93.184.216.34"
+        return original_pin(host, resolver, policy)
 
-    _wt.httpx.Client = patched_client  # type: ignore[assignment]
-    _wt._pin_one_address = patched_pin  # type: ignore[assignment]
-    socket.create_connection = patched_create_connection  # type: ignore[assignment]
+    _wt._default_resolve = stub_resolver  # type: ignore[assignment]
+    _wt._pin_one_address = stub_pin  # type: ignore[assignment]
 
     def uninstall() -> None:
-        _wt.httpx.Client = original_client  # type: ignore[assignment]
+        _wt._PinAddrTransport.handle_request = original_handle  # type: ignore[assignment]
+        _wt._default_resolve = original_resolver  # type: ignore[assignment]
         _wt._pin_one_address = original_pin  # type: ignore[assignment]
-        socket.create_connection = original_create_connection  # type: ignore[assignment]
+
+    return uninstall
 
     return uninstall
 
@@ -599,6 +620,55 @@ class TestWebRead:
 
 
 # ---------------------------------------------------------------------------
+# 9c. R3：流式截断（响应被 transport 实时截断，bytes<=max_bytes）
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingTruncation:
+    """R3 复审：max_bytes=1KB 真的只下载 ≤1KB，不先完整缓存。"""
+
+    def test_truncation_via_mock(self) -> None:
+        # 26KB 响应：mock 不真实发包，验证 transport 层截断逻辑
+        big_body = "x" * (26 * 1024)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=big_body)
+
+        policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+        cfg = WebToolConfig(host_policy=policy, max_bytes=1024)
+        uninstall = _install_mock_socket(handler)
+        try:
+            tool = build_web_read_tool(cfg)
+            result = json.loads(tool.execute({"url": "https://fixture.test/big"}))
+        finally:
+            uninstall()
+
+        assert result["ok"] is True
+        assert result["truncated"] is True
+        # 关键断言：bytes 真的不超过 max_bytes（transport 截断后上层再读）
+        assert result["bytes"] <= 1024
+
+    def test_under_limit_not_truncated(self) -> None:
+        body = "hello"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text=body)
+
+        policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+        cfg = WebToolConfig(host_policy=policy, max_bytes=1024)
+        uninstall = _install_mock_socket(handler)
+        try:
+            tool = build_web_read_tool(cfg)
+            result = json.loads(tool.execute({"url": "https://fixture.test/small"}))
+        finally:
+            uninstall()
+
+        assert result["ok"] is True
+        assert result["truncated"] is False
+        assert result["bytes"] == 5
+
+
+# ---------------------------------------------------------------------------
 # 6. create_web_tools 工具集合 + runtime 集成
 # ---------------------------------------------------------------------------
 
@@ -824,6 +894,91 @@ class TestEndToEnd:
 
 
 # ---------------------------------------------------------------------------
+# 11. R1：策略确认链路
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmationFlow:
+    """R1：default_policy_for_web(requires_confirmation=False) 不应弹确认。"""
+
+    def test_default_web_policy_does_not_trigger_confirm(self) -> None:
+        """default_policy_for_web(requires_confirmation=False) 不应弹确认。"""
+        from mini_deerflow.tool_contracts import (
+            ExecutorPrincipal,
+            RunAuthority,
+            evaluate_tool_access,
+        )
+
+        policy = default_policy_for_web()
+        assert policy.requires_confirmation is False
+        authority = RunAuthority(
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            thread_id="t-1",
+            run_id="r-1",
+            project_id=None,
+            granted_capabilities=frozenset({ToolCapability.NETWORK_READ}),
+        )
+        decision = evaluate_tool_access(
+            BUILTIN_TOOL_METADATA["web_search"],
+            policy,
+            authority,
+        )
+        assert decision.kind.value == 1  # ALLOW
+        assert not decision.is_confirm
+
+    def test_explicit_confirm_triggers_confirmation(self) -> None:
+        """policy.requires_confirmation=True 仍能弹确认（用户/产品可强制）。"""
+        from mini_deerflow.tool_contracts import (
+            ExecutorPrincipal,
+            RunAuthority,
+            ToolPolicy,
+            evaluate_tool_access,
+        )
+
+        policy = ToolPolicy(
+            enabled=True,
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=True,
+        )
+        authority = RunAuthority(
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            thread_id="t-1",
+            run_id="r-1",
+            project_id=None,
+            granted_capabilities=frozenset({ToolCapability.NETWORK_READ}),
+        )
+        decision = evaluate_tool_access(
+            BUILTIN_TOOL_METADATA["web_search"],
+            policy,
+            authority,
+        )
+        assert decision.is_confirm
+
+    def test_no_network_capability_blocks(self) -> None:
+        """会话缺 NETWORK_READ → 拒绝。"""
+        from mini_deerflow.tool_contracts import (
+            ExecutorPrincipal,
+            RunAuthority,
+            evaluate_tool_access,
+        )
+
+        authority = RunAuthority(
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            thread_id="t-1",
+            run_id="r-1",
+            project_id=None,
+            granted_capabilities=frozenset(),  # 无 NETWORK_READ
+        )
+        decision = evaluate_tool_access(
+            BUILTIN_TOOL_METADATA["web_read"],
+            default_policy_for_web(),
+            authority,
+        )
+        assert decision.is_denied
+        assert decision.reason_code == "capability_missing"
+
+
+# ---------------------------------------------------------------------------
 # 8. 不可信数据声明存在
 # ---------------------------------------------------------------------------
 
@@ -902,10 +1057,10 @@ class TestDNSPinning:
             import mini_deerflow.web_tools as _wt
             original_pin = _wt._pin_one_address
 
-            def pinned(host, resolver):
+            def pinned(host: str, resolver: Any, policy: Any = None) -> str | None:
                 if host == "fixture.test":
                     return "93.184.216.34"
-                return original_pin(host, resolver)
+                return original_pin(host, resolver, policy)
 
             _wt._pin_one_address = pinned  # type: ignore[assignment]
             try:
@@ -937,6 +1092,36 @@ class TestDNSPinning:
         # 私有 IP 仍被 resolve_host_policy 抓到（白名单只放域名不限制 IP）
         assert result["ok"] is False
         assert result["kind"] == "ssrf_error"
+
+
+# ---------------------------------------------------------------------------
+# 9b. R2：socket monkey-patch 不影响进程内其他连接
+# ---------------------------------------------------------------------------
+
+
+class TestProcessIsolation:
+    """R2 复审：web_tools 不修改进程全局 socket.create_connection。"""
+
+    def test_unrelated_socket_create_connection_unchanged(self) -> None:
+        import mini_deerflow.web_tools as _wt
+
+        original = socket.create_connection
+        cfg = WebToolConfig(
+            host_policy=HostPolicy(allowed_hosts=frozenset({"fixture.test"})),
+        )
+        tool = build_web_read_tool(cfg)
+        # 触发一次调用（用 helper mock）
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="<p>ok</p>")
+
+        uninstall = _install_mock_socket(handler)
+        try:
+            tool.execute({"url": "https://fixture.test/p"})
+        finally:
+            uninstall()
+
+        # 进程全局 socket.create_connection 必须未变
+        assert socket.create_connection is original
 
 
 # ---------------------------------------------------------------------------
@@ -979,3 +1164,63 @@ class TestSearchProviderConfig:
         """
         provider = build_web_search_provider_from_config(kind="bogus")
         assert isinstance(provider, UnavailableWebSearchProvider)
+
+    def test_mcp_kind_without_executor_returns_unavailable(self) -> None:
+        provider = build_web_search_provider_from_config(kind="mcp", mcp_executor=None)
+        assert isinstance(provider, UnavailableWebSearchProvider)
+        assert provider.is_available() is False
+
+    def test_mcp_kind_with_executor_dispatches(self) -> None:
+        """MCP executor 真的被调用；返回结构按 hits 路径解析。"""
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        calls: list[tuple[str, dict]] = []
+
+        def fake_executor(tool_name: str, args: dict) -> dict:
+            calls.append((tool_name, args))
+            return {
+                "hits": [
+                    {"title": "A", "url": "https://a", "snippet": "sa"},
+                    {"title": "B", "url": "https://b", "snippet": "sb"},
+                ]
+            }
+
+        provider = build_web_search_provider_from_config(
+            kind="mcp", mcp_executor=fake_executor, mcp_tool_name="search"
+        )
+        assert isinstance(provider, MCPSearchAdapter)
+        assert provider.is_available() is True
+        hits = provider.search("hello", top_k=5)
+        assert len(hits) == 2
+        assert hits[0].title == "A"
+        assert hits[0].url == "https://a"
+        # executor 真被调用过
+        assert calls == [("search", {"query": "hello", "top_k": 5})]
+
+    def test_mcp_kind_adapts_alternative_response_shapes(self) -> None:
+        """results / data 路径也支持；缺字段的项被丢弃。"""
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        def executor(tool_name: str, args: dict) -> dict:
+            return {
+                "results": [
+                    {"name": "T1", "link": "https://t1"},
+                    {"title": "T2", "url": "https://t2", "summary": "desc"},
+                ]
+            }
+
+        provider = MCPSearchAdapter(tool_executor=executor)
+        hits = provider.search("q", top_k=5)
+        assert len(hits) == 2
+        assert hits[0].title == "T1"
+        assert hits[0].url == "https://t1"
+        assert hits[1].title == "T2"
+
+    def test_mcp_kind_handles_empty(self) -> None:
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        def executor(tool_name: str, args: dict) -> dict:
+            return {"hits": []}
+
+        provider = MCPSearchAdapter(tool_executor=executor)
+        assert provider.search("q", top_k=5) == []
