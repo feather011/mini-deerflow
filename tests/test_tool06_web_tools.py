@@ -1735,6 +1735,34 @@ class _Tool06HTTPHandler:
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                elif path == "/hellomsg":
+                    # 无 Content-Length + Connection:close：正常关闭定界正文
+                    body = b"hello world"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    # 不发送 Content-Length，靠连接关闭定界
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.close_connection = True
+                elif path == "/chunks":
+                    # Transfer-Encoding: chunked，两块（其中 \r\n 分次发送）
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    # 第一块：5 字节 "AAAAA"
+                    self.wfile.write(b"5\r\nAAAAA\r\n")
+                    self.wfile.flush()
+                    # 分次发送第二块：长度+CRLF 分开，确保 _recv_until_delim 能正确识别行边界
+                    self.wfile.write(b"5\r")
+                    self.wfile.flush()
+                    time.sleep(0.01)
+                    self.wfile.write(b"\nBBBBB\r\n")
+                    self.wfile.flush()
+                    # 终结块
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                    self.close_connection = True
                 elif path == "/big":
                     total = 8 * 1024 * 1024
                     self.send_response(200)
@@ -1916,3 +1944,36 @@ class TestRealTransportR3:
         # R3 根因：_probe_ahead 里 _bounded_timeout(0.5) 在剩余 >0.5s 时仍阻塞 0.5s，
         # 4 个 chunk 各漏 0.5s → ~2s；修复后应 <0.8s
         assert elapsed < 0.8, f"探测泄漏总超时，实际耗时 {elapsed:.3f}s"
+
+    def test_no_length_close_delimited_returns_content(self, local_http_server) -> None:
+        """无 Content-Length，靠 Connection:close 定界的正文必须完整返回。"""
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(timeout_s=5.0, max_bytes=1024)
+        result = json.loads(tool.execute({"url": f"{base_url}/hellomsg"}))
+        assert result["ok"] is True, result
+        assert result["bytes"] == 11, f"期望 11，实际 {result['bytes']}"
+        assert result["text"] == "hello world", f"期望 'hello world'，实际 {result['text']!r}"
+        assert result["truncated"] is False, result
+
+    def test_chunked_multiple_chunks_exact_content(self, local_http_server) -> None:
+        """chunked 编码多个 chunk 必须精确返回，不越过分帧边界。"""
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(timeout_s=5.0, max_bytes=1024)
+        result = json.loads(tool.execute({"url": f"{base_url}/chunks"}))
+        assert result["ok"] is True, result
+        # 第一块 5 字节（"AAAAA"）+ 第二块 5 字节（"BBBBB"，分次发送）
+        assert result["bytes"] == 10, f"期望 10，实际 {result['bytes']}"
+        assert result["text"] == "AAAAABBBBB", f"期望 'AAAAABBBBB'，实际 {result['text']!r}"
+        assert result["truncated"] is False, result
+
+    def test_header_timeout_socket_closed(self, local_http_server) -> None:
+        """响应头超时时 socket 必须主动关闭，不能等 GC。"""
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(timeout_s=0.05)
+        started = time.monotonic()
+        result = json.loads(tool.execute({"url": f"{base_url}/delay"}))
+        elapsed = time.monotonic() - started
+        assert result["ok"] is False, result
+        assert result["kind"] == "network_error", result
+        # 验证立即退出（不超过配置的 0.05s + 连接开销）
+        assert elapsed < 0.5, f"socket 未及时关闭，耗时 {elapsed:.3f}s"

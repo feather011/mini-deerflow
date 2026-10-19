@@ -963,138 +963,140 @@ class _PinAddrTransport(httpx.BaseTransport):
                 sock.settimeout(_bounded_timeout(timeout_s))
                 b = sock.recv(1)
                 if not b:
-                    return buf  # EOF
+                    return buf  # EOF：返回已收到的数据，不丢弃
                 buf += b
                 if buf.endswith(delim):
                     return buf
 
-        _check_deadline()
-        status_line = _recv_until_delim()
-        if not status_line:
-            raise httpx.RemoteProtocolError("响应为空", request=request)
+        # 从这里开始统一用 try/finally 确保 socket 被正确关闭
+        # （覆盖发送/状态行/headers/body 所有阶段）
         try:
-            _, status_str, _ = status_line.split(b" ", 2)
-            status_code = int(status_str)
-        except (ValueError, IndexError) as exc:
-            raise httpx.RemoteProtocolError(
-                f"无法解析状态行: {status_line!r}", request=request
-            ) from exc
-
-        # 读 headers
-        header_dict: list[tuple[str, str]] = []
-        content_length: int | None = None
-        transfer_encoding_chunked = False
-        while True:
-            line = _recv_until_delim()
-            if not line or line in (b"\r\n", b"\n", b""):
-                break
+            _check_deadline()
+            status_line = _recv_until_delim()
+            if not status_line:
+                raise httpx.RemoteProtocolError("响应为空", request=request)
             try:
-                name, _, value = line.decode("latin-1").partition(":")
-            except UnicodeDecodeError:
-                continue
-            name = name.strip()
-            value = value.strip()
-            if name.lower() == "content-length":
+                _, status_str, _ = status_line.split(b" ", 2)
+                status_code = int(status_str)
+            except (ValueError, IndexError) as exc:
+                raise httpx.RemoteProtocolError(
+                    f"无法解析状态行: {status_line!r}", request=request
+                ) from exc
+
+            # 读 headers
+            header_dict: list[tuple[str, str]] = []
+            content_length: int | None = None
+            transfer_encoding_chunked = False
+            while True:
+                line = _recv_until_delim()
+                if not line or line in (b"\r\n", b"\n", b""):
+                    break
                 try:
-                    content_length = int(value)
-                except ValueError:
-                    content_length = None
-            elif name.lower() == "transfer-encoding" and "chunked" in value.lower():
-                transfer_encoding_chunked = True
-            header_dict.append((name, value))
-
-        # 4. R3：流式读 body——每次 recv 受剩余总时间 + max_bytes 双重约束
-        max_bytes = self._max_bytes
-        truncated = False  # 必须在此（函数定义之前），供 nonlocal 解析
-        chunks: list[bytes] = []
-        total = 0
-        eof_reached = False
-
-        def _recv_some(space: int) -> bytes | None:
-            """从 socket 读最多 space 字节；超限或 EOF 返回 None。
-
-            读量同时受 space 和 max_bytes 双重约束，防止吞掉多余数据。
-            """
-            nonlocal eof_reached
-            if space <= 0:
-                return None
-            buf = b""
-            while len(buf) < space:
-                remaining_budget = max_bytes - total - len(buf)
-                if remaining_budget <= 0:
-                    return buf if buf else None
-                recv_size = min(space - len(buf), remaining_budget, 8192)
-                _check_deadline()
-                sock.settimeout(_bounded_timeout(timeout_s))
-                try:
-                    chunk = sock.recv(recv_size)
-                except socket.timeout:
-                    return buf if buf else None
-                if not chunk:
-                    eof_reached = True
-                    return None
-                buf += chunk
-            return buf
-
-        def _read_more() -> None:
-            """从 socket 读 body 并累计到 chunks。"""
-            nonlocal total, truncated, eof_reached
-            if transfer_encoding_chunked:
-                while True:
-                    if total >= max_bytes:
-                        truncated = True
-                        return
-                    size_line = _recv_until_delim()
-                    if not size_line:
-                        return
+                    name, _, value = line.decode("latin-1").partition(":")
+                except UnicodeDecodeError:
+                    continue
+                name = name.strip()
+                value = value.strip()
+                if name.lower() == "content-length":
                     try:
-                        size = int(size_line.strip(), 16)
+                        content_length = int(value)
                     except ValueError:
-                        return
-                    if size == 0:
-                        _recv_until_delim()
-                        return
-                    while size > 0:
+                        content_length = None
+                elif name.lower() == "transfer-encoding" and "chunked" in value.lower():
+                    transfer_encoding_chunked = True
+                header_dict.append((name, value))
+
+            # 4. 流式读 body
+            max_bytes = self._max_bytes
+            truncated = False
+            chunks: list[bytes] = []
+            total = 0
+            eof_reached = False
+
+            def _recv_exact(n: int) -> bytes | None:
+                """从 socket 精确读 n 字节（EOF 或超限返回 None）。"""
+                nonlocal eof_reached
+                if n <= 0:
+                    return None
+                buf = b""
+                while len(buf) < n:
+                    if total + len(buf) >= max_bytes:
+                        return buf if buf else None
+                    _check_deadline()
+                    sock.settimeout(_bounded_timeout(timeout_s))
+                    try:
+                        chunk = sock.recv(min(n - len(buf), max_bytes - total - len(buf), 8192))
+                    except socket.timeout:
+                        return buf if buf else None
+                    if not chunk:
+                        eof_reached = True
+                        return buf if buf else None
+                    buf += chunk
+                return buf
+
+            def _read_more() -> None:
+                """从 socket 读 body 并累计到 chunks。"""
+                nonlocal total, truncated, eof_reached
+                if transfer_encoding_chunked:
+                    # chunked 编码：<size>\r\n<data>\r\n...
+                    while True:
                         if total >= max_bytes:
                             truncated = True
                             return
+                        size_line = _recv_until_delim()
+                        if not size_line:
+                            return
+                        try:
+                            size = int(size_line.strip(), 16)
+                        except ValueError:
+                            return
+                        if size == 0:
+                            _recv_until_delim()  # 末尾 \r\n
+                            return
+                        # 读当前 chunk 的 size 字节，严格限制在 chunk 边界内
+                        chunk_remaining = size
+                        while chunk_remaining > 0:
+                            if total >= max_bytes:
+                                truncated = True
+                                return
+                            # 不能超 chunk 边界也不能超 max_bytes
+                            want = min(chunk_remaining, max_bytes - total, 8192)
+                            buf = _recv_exact(want)
+                            if buf is None or not buf:
+                                if buf is None:
+                                    eof_reached = True
+                                return
+                            chunks.append(buf)
+                            total += len(buf)
+                            chunk_remaining -= len(buf)
+                        _recv_until_delim()  # chunk 后的 \r\n
+                else:
+                    # 非 chunked：按 content-length 或读到 EOF
+                    to_read = content_length
+                    if content_length is not None and content_length > max_bytes:
+                        truncated = True
+                    while True:
+                        if total >= max_bytes:
+                            if content_length is None:
+                                truncated = True
+                            return
+                        _check_deadline()
                         space = max_bytes - total
-                        buf = _recv_some(space)
+                        want = 8192 if to_read is None else min(8192, space, to_read)
+                        if want <= 0:
+                            return
+                        buf = _recv_exact(want)
                         if buf is None or not buf:
                             if buf is None:
                                 eof_reached = True
                             return
                         chunks.append(buf)
                         total += len(buf)
-                        size -= len(buf)
-                    _recv_until_delim()
-            else:
-                to_read = content_length
-                if content_length is not None and content_length > max_bytes:
-                    truncated = True
-                while True:
-                    if total >= max_bytes:
-                        if content_length is None:
-                            truncated = True
-                        return
-                    _check_deadline()
-                    space = max_bytes - total
-                    want = 8192 if to_read is None else min(8192, space, to_read)
-                    if want <= 0:
-                        return
-                    buf = _recv_some(want)
-                    if buf is None or not buf:
-                        if buf is None:
-                            eof_reached = True
-                        return
-                    chunks.append(buf)
-                    total += len(buf)
-                    if to_read is not None:
-                        to_read -= len(buf)
-                        if to_read <= 0:
-                            return
+                        if to_read is not None:
+                            to_read -= len(buf)
+                            if to_read <= 0:
+                                return
 
-        try:
             _read_more()
         finally:
             try:
