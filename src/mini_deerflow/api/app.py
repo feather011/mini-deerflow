@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
@@ -50,7 +51,11 @@ from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_co
 from mini_deerflow.thread_store import InMemoryThreadStore, SQLiteThreadStore
 from mini_deerflow.project_store import InMemoryProjectStore, SQLiteProjectStore
 from mini_deerflow.tools import create_default_registry
-from mini_deerflow.web_tools import HostPolicy as WebHostPolicy, build_web_search_provider_from_config
+from mini_deerflow.web_tools import (
+    HostPolicy as WebHostPolicy,
+    WebToolConfig,
+    build_web_search_provider_from_config,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -116,7 +121,7 @@ def _default_runtime_factory(
     # 阶段既不读配置也不创建客户端，更不发网络请求。
     resolved = settings or ApiSettings()
     ws_root = resolved.workspaces_root
-    return create_runtime(
+    runtime = create_runtime(
         store=_build_store(resolved),
         project_store=_build_project_store(resolved),
         registry=create_default_registry(),
@@ -132,11 +137,7 @@ def _default_runtime_factory(
             # TOOL-06：网络只读配置
             web_read_timeout_s=resolved.web_read_timeout_s,
             web_host_policy=build_web_host_policy(resolved),
-            # R4：根据应用配置装配搜索 Provider
-            # MCP 模式下 executor 留 None：当前应用启动时尚未持有 MCPManager；
-            # 运行期可由 Agent 通过 Registry 调 mcp__<server>__<tool>。
-            # web_search MCP 模式（"可用 + executor 已注入"）需用户在 MCP server
-            # 配置中显式启用并暴露 search 工具，再由 MCPSearchAdapter 调用。
+            # R4：先用 unavailable 启动；MCP 启动后再二次注入真实 executor
             web_search_provider=build_web_search_provider_from_config(
                 kind=resolved.web_search_provider_kind,
                 fake_results=list(resolved.web_search_fake_results),
@@ -147,6 +148,53 @@ def _default_runtime_factory(
         ),
         workspaces_root=ws_root,
     )
+
+    # R4：MCP 启动后二次注入真实搜索 Provider
+    # kind=mcp + web_search_mcp_server 已配置 + MCPManager 已就绪 →
+    # 把 mcp_manager._invoke 包装成 mcp_executor 注入到 web_search_provider
+    if (
+        resolved.web_search_provider_kind == "mcp"
+        and resolved.web_search_mcp_server
+        and getattr(runtime, "mcp_manager", None) is not None
+    ):
+        server_name = resolved.web_search_mcp_server
+        tool_name = resolved.web_search_mcp_tool
+        mcp_manager = runtime.mcp_manager
+        # 验证该 server 已注册并暴露目标工具
+        qualified = f"mcp__{server_name}__{tool_name}"
+        if qualified in mcp_manager.registered_names:
+            def _mcp_executor(_tool: str, args: dict) -> dict:
+                return mcp_manager._invoke(qualified, args)
+            new_provider = build_web_search_provider_from_config(
+                kind="mcp",
+                mcp_executor=_mcp_executor,
+                mcp_tool_name=tool_name,
+            )
+            # 替换 config 上的 provider；并重建 web_search 工具以使用新 provider
+            runtime.config = replace(
+                runtime.config, web_search_provider=new_provider
+            )
+            from mini_deerflow.web_tools import create_web_tools
+            # 找到 Agent 持有的 registry（私有属性）
+            agent = runtime.integrated_agent._agent
+            agent_registry = getattr(agent, "_registry", None)
+            if agent_registry is not None:
+                try:
+                    agent_registry.unregister("web_search")
+                except Exception:
+                    pass
+                new_tools = create_web_tools(
+                    WebToolConfig(
+                        timeout_s=runtime.config.web_read_timeout_s,
+                        host_policy=runtime.config.web_host_policy,
+                    ),
+                    provider=new_provider,
+                )
+                agent_registry.register_many(
+                    [t for t in new_tools if t.name == "web_search"]
+                )
+
+    return runtime
 
 
 def _settings_runtime_factory(settings: ApiSettings) -> "RuntimeContext":

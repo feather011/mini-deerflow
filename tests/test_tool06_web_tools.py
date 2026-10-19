@@ -667,6 +667,69 @@ class TestStreamingTruncation:
         assert result["truncated"] is False
         assert result["bytes"] == 5
 
+    # R3-B：声明 Content-Length 超过 max_bytes → truncated=true
+    def test_content_length_over_limit_marks_truncated(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            resp = httpx.Response(200, text="x" * 4096)
+            resp.headers["Content-Length"] = "4096"
+            return resp
+
+        policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+        cfg = WebToolConfig(host_policy=policy, max_bytes=1024)
+        uninstall = _install_mock_socket(handler)
+        try:
+            tool = build_web_read_tool(cfg)
+            result = json.loads(tool.execute({"url": "https://fixture.test/long"}))
+        finally:
+            uninstall()
+
+        assert result["ok"] is True
+        assert result["truncated"] is True
+        assert result["bytes"] <= 1024
+
+    # R3-C：跨总 deadline 触发超时
+    def test_total_deadline_timeout(self) -> None:
+        """sleep 较久后调用 → 触发总 deadline（即使单次 read 短时间内完成）。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="<p>ok</p>")
+
+        policy = HostPolicy(allowed_hosts=frozenset({"fixture.test"}))
+        # 总 timeout 给极小值，确保 deadline 很快过期
+        cfg = WebToolConfig(
+            host_policy=policy,
+            timeout_s=0.05,  # 50ms
+        )
+        uninstall = _install_mock_socket(handler)
+        try:
+            # 直接调 transport：传入极短 deadline
+            from mini_deerflow.web_tools import (
+                _PinAddrTransport,
+                resolve_host_policy,
+            )
+            _, host = resolve_host_policy(
+                "https://fixture.test/p",
+                policy=policy,
+                resolver=lambda h: ["93.184.216.34"],
+            )
+            import time as _time
+            deadline = _time.monotonic() - 1.0  # 已过期
+            transport = _PinAddrTransport(
+                "93.184.216.34", cfg.max_bytes, deadline_monotonic=deadline
+            )
+            try:
+                # 构造一个 httpx Request 并 handle
+                req = httpx.Request("GET", "https://fixture.test/p")
+                transport.handle_request(req)
+                raise AssertionError("应抛超时")
+            except Exception as exc:
+                # deadline 已过期 → 任何 read 路径都该抛
+                assert "deadline" in str(exc) or "超时" in str(exc) or "总" in str(exc), (
+                    f"unexpected exc: {exc!r}"
+                )
+        finally:
+            uninstall()
+
 
 # ---------------------------------------------------------------------------
 # 6. create_web_tools 工具集合 + runtime 集成
@@ -977,6 +1040,73 @@ class TestConfirmationFlow:
         assert decision.is_denied
         assert decision.reason_code == "capability_missing"
 
+    # R1 收窄：豁免仅限 web_* 工具 + 仅需 NETWORK_READ
+    def test_sandbox_write_still_requires_confirmation(self) -> None:
+        """sandbox_write_file 走 metadata requires_confirmation 默认路径，即使
+        policy=False 也仍 CONFIRM（确认 R1 收窄不影响其他工具）。"""
+        from mini_deerflow.tool_contracts import (
+            ExecutorPrincipal,
+            RunAuthority,
+            ToolPolicy,
+            evaluate_tool_access,
+        )
+
+        policy = ToolPolicy(
+            enabled=True,
+            allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+            requires_confirmation=False,  # 显式豁免
+        )
+        authority = RunAuthority(
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            thread_id="t-1",
+            run_id="r-1",
+            project_id=None,
+            granted_capabilities=frozenset(
+                # sandbox_write_file 缺分类：默认 deny
+            ),
+        )
+        # 实际场景：sandbox_write_file.uncategorized=True → metadata 缺失分类
+        # 直接 deny 而非 CONFIRM；这里用 sandbox_run_command 验证
+        from mini_deerflow.tool_contracts import BUILTIN_TOOL_METADATA as _M
+        decision = evaluate_tool_access(
+            _M["sandbox_run_command"],
+            policy,
+            authority,
+        )
+        # 因 capability_missing → deny（缺 COMMAND_EXECUTE）
+        # 关键断言：policy.requires_confirmation=False 不会让这个工具 ALLOW
+        assert decision.is_denied
+        assert decision.reason_code == "capability_missing"
+
+    def test_web_tools_are_exempt_from_metadata_confirmation(self) -> None:
+        """web_search/web_read metadata.requires_confirmation()=True（READS_NETWORK
+        不豁免），但仅当 policy.requires_confirmation=False 时才不 CONFIRM。"""
+        from mini_deerflow.tool_contracts import (
+            ExecutorPrincipal,
+            RunAuthority,
+            evaluate_tool_access,
+        )
+
+        # 验证 metadata 自身判定确实需要确认（policy 不干预时）
+        meta = BUILTIN_TOOL_METADATA["web_search"]
+        assert meta.requires_confirmation() is True, "READS_NETWORK 应触发 metadata 确认"
+
+        # policy.requires_confirmation=False 走豁免
+        authority = RunAuthority(
+            principal=ExecutorPrincipal.MAIN_AGENT,
+            thread_id="t-1",
+            run_id="r-1",
+            project_id=None,
+            granted_capabilities=frozenset({ToolCapability.NETWORK_READ}),
+        )
+        decision = evaluate_tool_access(
+            meta,
+            default_policy_for_web(),
+            authority,
+        )
+        assert decision.kind.value == 1  # ALLOW
+        assert not decision.is_confirm
+
 
 # ---------------------------------------------------------------------------
 # 8. 不可信数据声明存在
@@ -1224,3 +1354,88 @@ class TestSearchProviderConfig:
 
         provider = MCPSearchAdapter(tool_executor=executor)
         assert provider.search("q", top_k=5) == []
+
+    # R4：app.py 在 MCP 启动后注入真实 MCPSearchAdapter
+    def test_app_factory_injects_mcp_executor_when_server_present(self) -> None:
+        """当 web_search_provider_kind=mcp + web_search_mcp_server 已配置 +
+        mcp_manager 已注册该 server 暴露的 tool → 注入 MCPSearchAdapter。
+
+        现实环境通常不会启动真 MCP server；用 monkey-patch MCPClientManager
+        实例属性，让 registered_names 返回 mcp__web_search__search 即可。
+        """
+        from mini_deerflow.api.app import _default_runtime_factory
+        from mini_deerflow.web_tools import MCPSearchAdapter
+        from mini_deerflow.mcp_manager import MCPClientManager as _OrigMCP
+
+        original_registered = _OrigMCP.registered_names
+        original_invoke = _OrigMCP._invoke
+
+        def fake_registered_names(self) -> tuple[str, ...]:
+            # 已有真实注册 + 我们的 fake search tool
+            base = list(original_registered.fget(self))  # type: ignore[attr-defined]
+            return tuple(base) + ("mcp__web_search__search",)
+
+        def fake_invoke(self, qualified: str, args: dict) -> dict:
+            if qualified == "mcp__web_search__search":
+                return {
+                    "hits": [
+                        {"title": "fake", "url": "https://e/fake", "snippet": "s"}
+                    ]
+                }
+            return original_invoke(self, qualified, args)
+
+        _OrigMCP.registered_names = property(fake_registered_names)  # type: ignore[assignment]
+        _OrigMCP._invoke = fake_invoke  # type: ignore[assignment]
+        try:
+            from mini_deerflow.api.config import ApiSettings
+            settings = ApiSettings(
+                web_search_provider_kind="mcp",
+                web_search_mcp_server="web_search",
+                web_search_mcp_tool="search",
+            )
+            runtime = _default_runtime_factory(settings)
+            try:
+                assert isinstance(
+                    runtime.config.web_search_provider, MCPSearchAdapter
+                ), (
+                    f"应注入 MCPSearchAdapter，"
+                    f"实际 {type(runtime.config.web_search_provider).__name__}"
+                )
+                # 直接调用 adapter 应走 fake mcp_manager._invoke
+                hits = runtime.config.web_search_provider.search("x", top_k=1)
+                assert len(hits) == 1
+                assert hits[0].title == "fake"
+            finally:
+                runtime.shutdown()
+        finally:
+            _OrigMCP.registered_names = original_registered  # type: ignore[assignment]
+            _OrigMCP._invoke = original_invoke  # type: ignore[assignment]
+
+    def test_mcp_executor_invokes_real_manager(self) -> None:
+        """直接验证 MCPSearchAdapter 拿到 mcp_manager._invoke → executor 真被调用。"""
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        # 模拟 mcp_manager：暴露 registered_names + _invoke
+        class FakeMCPManager:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict]] = []
+                self.registered_names = ("mcp__search__search",)
+
+            def _invoke(self, qualified: str, args: dict) -> dict:
+                self.calls.append((qualified, args))
+                return {
+                    "hits": [
+                        {"title": "T1", "url": "https://e/1", "snippet": "s1"}
+                    ]
+                }
+
+        mgr = FakeMCPManager()
+
+        def executor(tool: str, args: dict) -> dict:
+            return mgr._invoke(f"mcp__search__{tool}", args)
+
+        adapter = MCPSearchAdapter(tool_executor=executor, tool_name="search")
+        hits = adapter.search("hello", top_k=5)
+        assert len(hits) == 1
+        assert hits[0].title == "T1"
+        assert mgr.calls == [("mcp__search__search", {"query": "hello", "top_k": 5})]

@@ -361,6 +361,20 @@ class ToolResult:
 # ---------------------------------------------------------------------------
 
 
+def _is_authorized_read_only_web(metadata: ToolMetadata) -> bool:
+    """R1 收窄的「默认已授权豁免」条件。
+
+    仅当工具是 TOOL-06 web_search / web_read，且**唯一**所需能力是 NETWORK_READ
+    时，才视为「已授权的网络只读工具」——policy.requires_confirmation=False
+    时不需要弹确认。其他工具（命令执行、文件写入、API 写）按 metadata
+    默认判定走原逻辑。
+    """
+    if metadata.name not in ("web_search", "web_read"):
+        return False
+    required = metadata.capabilities
+    return required == frozenset({ToolCapability.NETWORK_READ})
+
+
 def evaluate_tool_access(
     metadata: ToolMetadata | None,
     policy: "ToolPolicy | None",
@@ -434,19 +448,22 @@ def evaluate_tool_access(
 
     # 6. 已授权但需要确认（策略覆盖 > 元数据默认值）
     #
-    # - policy.requires_confirmation=True → 强制 CONFIRM（用户/产品要求逐次确认）
-    # - policy.requires_confirmation=False 且 metadata.requires_confirmation()=True →
-    #   视为「已授权豁免」，不弹确认（仅对 read-only 网络/沙箱操作生效，写操作保持原行为）
-    # - project_execute 仍走其受控派发例外（即使 metadata 要求确认，policy=False 也放行）
+    # - policy.requires_confirmation=True → 强制 CONFIRM
+    # - policy.requires_confirmation=False 且工具是「网络只读 web_*」+ 仅需
+    #   NETWORK_READ 能力 → 视为「已授权豁免」，不弹确认
+    # - project_execute 走受控派发例外（policy=False 时直接派发）
+    # - 其余工具按 metadata.requires_confirmation() 判定
     if policy.requires_confirmation:
         needs_confirm = True
     elif metadata.name == "project_execute":
         # 受控执行路径：policy.requires_confirmation=False 时直接派发
         needs_confirm = False
-    elif metadata.requires_confirmation():
-        # R1：策略显式豁免 = 默认已授权的只读网络/沙箱操作不弹确认
-        # 只对"显式声明 requires_confirmation=True"的策略生效
+    elif _is_authorized_read_only_web(metadata):
+        # R1 收紧：仅对已授权的网络只读 web 工具豁免
         needs_confirm = False
+    elif metadata.requires_confirmation():
+        # 默认走 metadata 自身判定（命令执行、项目写入等仍要弹确认）
+        needs_confirm = True
     else:
         needs_confirm = False
     if needs_confirm:

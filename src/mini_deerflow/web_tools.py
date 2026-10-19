@@ -691,9 +691,13 @@ def build_web_search_provider_from_config(
 # ---------------------------------------------------------------------------
 
 
-def _make_pinned_transport(pinned_ip: str, max_bytes: int) -> httpx.BaseTransport:
+def _make_pinned_transport(
+    pinned_ip: str,
+    max_bytes: int,
+    deadline_monotonic: float | None = None,
+) -> httpx.BaseTransport:
     """构造把目标 IP 强制绑到 `pinned_ip` 的 transport（仅本实例，进程全局不受影响）。"""
-    return _PinAddrTransport(pinned_ip, max_bytes)
+    return _PinAddrTransport(pinned_ip, max_bytes, deadline_monotonic=deadline_monotonic)
 
 
 class _PinAddrTransport(httpx.BaseTransport):
@@ -706,15 +710,18 @@ class _PinAddrTransport(httpx.BaseTransport):
     影响范围：仅本 httpx.Client 实例；不修改进程全局 `socket.create_connection`。
     """
 
-    def __init__(self, pinned_ip: str, max_bytes: int) -> None:
+    def __init__(self, pinned_ip: str, max_bytes: int, deadline_monotonic: float | None = None) -> None:
         self._pinned_ip = pinned_ip
         self._max_bytes = max_bytes
+        # R3-C：transport 持有的总 deadline（绝对 monotonic time）
+        self._deadline = deadline_monotonic
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         """实现 R3 流式读取：socket 边读边累计，max_bytes 内实时关闭。
 
         - 用 socket.makefile() 按行读 HTTP 头
         - 读 body 时按 chunk_size 累计，到达 max_bytes 立即停止读 socket 并关闭
+        - 每次 read 前检查总 deadline，超时即抛 WebToolNetworkError
         - 返回 httpx.Response + ByteStream（流）让调用方按需消费
         """
         from urllib.parse import urlparse as _urlparse
@@ -730,15 +737,29 @@ class _PinAddrTransport(httpx.BaseTransport):
         if parsed.query:
             path = f"{path}?{parsed.query}"
 
+        # R3-C：httpx.Timeout 是 httpx.Timeout（不是 dict）。访问 .read / .connect
         timeout_obj = request.extensions.get("timeout")
         timeout_s = 10.0
         if timeout_obj is not None:
+            # httpx.Timeout 是对象；用属性访问拿 read
             try:
-                timeout_s = float(getattr(timeout_obj, "read", None) or 10.0)
+                read_attr = getattr(timeout_obj, "read", None)
+                if read_attr is not None:
+                    timeout_s = float(read_attr)
             except (TypeError, ValueError):
                 pass
 
-        # 1. TCP 连接（绑到 pinned IP）
+        def _check_deadline() -> None:
+            # R3-C：总 deadline 跨所有跳 + body 读取；超时即抛
+            if self._deadline is not None:
+                remaining = self._deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WebToolNetworkError(
+                        f"请求总耗时超过总 deadline"
+                    )
+
+        # 1. TCP 连接（绑到 pinned IP），连接前检查总 deadline
+        _check_deadline()
         raw_sock = socket.create_connection(
             (self._pinned_ip, port), timeout=timeout_s
         )
@@ -820,6 +841,7 @@ class _PinAddrTransport(httpx.BaseTransport):
                 if transfer_encoding_chunked:
                     # 读 chunked 编码：<size>\r\n<data>\r\n
                     while True:
+                        _check_deadline()  # R3-C
                         size_line = fp.readline()
                         if not size_line:
                             return
@@ -833,7 +855,14 @@ class _PinAddrTransport(httpx.BaseTransport):
                         # 读 size 字节
                         remaining = size
                         while remaining > 0:
-                            buf = fp.read(remaining)
+                            _check_deadline()  # R3-C
+                            # R3-A：单次 read 受 max_bytes 限制
+                            space_left = max_bytes - total
+                            if space_left <= 0:
+                                truncated = True
+                                return
+                            want = min(remaining, space_left)
+                            buf = fp.read(want)
                             if not buf:
                                 return
                             if total + len(buf) > max_bytes:
@@ -842,7 +871,6 @@ class _PinAddrTransport(httpx.BaseTransport):
                                     chunks.append(buf[:space])
                                     total += space
                                 truncated = True
-                                # 多余的丢给下一个 readline 解析（让 server 看到关闭）
                                 return
                             chunks.append(buf)
                             total += len(buf)
@@ -856,8 +884,16 @@ class _PinAddrTransport(httpx.BaseTransport):
                         to_read = content_length
                     else:
                         to_read = max_bytes + 1
+                    # R3-B：声明长度本身就超过 max_bytes → 截断
+                    if content_length is not None and content_length > max_bytes:
+                        truncated = True
                     while total < max_bytes:
-                        want = min(8192, max_bytes - total, to_read)
+                        _check_deadline()  # R3-C
+                        space_left = max_bytes - total
+                        if space_left <= 0:
+                            truncated = True
+                            break
+                        want = min(8192, space_left, to_read)
                         if want <= 0:
                             break
                         buf = fp.read(want)
@@ -962,7 +998,8 @@ def _fetch_with_redirect_check(
             raise WebToolSSRFError(f"DNS 解析返回空: {host}")
 
         # R2：构造 pinned transport（不污染全局 socket）；max_bytes 由 transport 内部流式截断
-        transport = _make_pinned_transport(pinned_ip, max_bytes)
+        # deadline 透传到 transport 以便跨 hop + body 读取统一执行
+        transport = _make_pinned_transport(pinned_ip, max_bytes, deadline_monotonic=deadline)
 
         # 剩余时间作为本次 http timeout
         remaining = max(0.5, deadline - time.monotonic())
