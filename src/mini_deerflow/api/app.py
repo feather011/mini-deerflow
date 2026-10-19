@@ -166,13 +166,15 @@ def _default_runtime_factory(
         if qualified in mcp_manager.registered_names:
             # 超时：复用 MCP server 的 call_timeout（缺省 30s）
             try:
-                from mini_deerflow.mcp_config import find_server_config
+                from mini_deerflow.mcp_manager import find_server_config
 
                 call_timeout = find_server_config(
                     load_mcp_config(), server_name
                 ).call_timeout
-            except Exception:
+            except LookupError:
+                # 服务器未在配置中 → 回落默认值
                 call_timeout = 30.0
+            # 其他异常（MCPConfigError / OSError 等）不捕获，由调用方处理
 
             def _mcp_executor(_tool: str, args: dict) -> str:
                 # 真实契约：第三个位置参数 timeout；返回值是 **JSON 字符串**

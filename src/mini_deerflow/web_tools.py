@@ -88,7 +88,7 @@ class WebToolUsageError(WebToolError):
     """参数不合法（URL 格式、类型错）：模型可改参重试。"""
 
 
-class WebToolNetworkError(WebToolError):
+class WebToolNetworkError(httpx.TransportError):
     """网络层错误（DNS、连接、超时、HTTP 状态）：如实告知。"""
 
 
@@ -856,9 +856,10 @@ class _PinAddrTransport(httpx.BaseTransport):
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         """实现 R3 流式读取：socket 边读边累计，max_bytes 内实时关闭。
 
-        - 用 socket.makefile() 按行读 HTTP 头
-        - 读 body 时按 chunk_size 累计，到达 max_bytes 立即停止读 socket 并关闭
-        - 每次 read 前检查总 deadline，超时即抛 WebToolNetworkError
+        - 直接用 socket.recv() 按行读 HTTP 头和 body（不用 makefile 缓冲，
+          保证每次 recv 都受剩余总时间约束）
+        - 读 body 时按 chunk 累计，到达 max_bytes 立即停止读 socket 并关闭
+        - 每次 recv 前检查总 deadline，超时即抛 WebToolNetworkError
         - 返回 httpx.Response + ByteStream（流）让调用方按需消费
         """
         from urllib.parse import urlparse as _urlparse
@@ -931,242 +932,188 @@ class _PinAddrTransport(httpx.BaseTransport):
         else:
             sock = raw_sock
 
-        # 2. 发送请求
+        # 2. 构造并发送 HTTP 请求
+        headers_list: list[tuple[str, str]] = [
+            (k, v) for (k, v) in request.headers.raw if k.lower() != "host"
+        ]
+        headers_list.append(("Host", host))
+        header_lines = [f"{request.method} {path} HTTP/1.1"]
+        for k, v in headers_list:
+            header_lines.append(f"{k}: {v}")
+        header_lines.append("Connection: close")
+        header_lines.append("")
+        header_lines.append("")
+        request_data = "\r\n".join(header_lines).encode("ascii")
+        if request.content:
+            request_data += request.content
+        _check_deadline()
+        sock.settimeout(_bounded_timeout(timeout_s))
         try:
-            headers_list: list[tuple[str, str]] = [
-                (k, v) for (k, v) in request.headers.raw if k.lower() != "host"
-            ]
-            headers_list.append(("Host", host))
-            header_lines = [
-                f"{request.method} {path} HTTP/1.1",
-            ]
-            for k, v in headers_list:
-                header_lines.append(f"{k}: {v}")
-            header_lines.append("Connection: close")
-            header_lines.append("")
-            header_lines.append("")
-            request_data = "\r\n".join(header_lines).encode("ascii")
-            if request.content:
-                request_data += request.content
-            # 发送也是阻塞操作：受剩余总时间约束
-            _check_deadline()
-            sock.settimeout(_bounded_timeout(timeout_s))
-            try:
-                sock.sendall(request_data)
-            except (socket.timeout, TimeoutError) as exc:
-                raise WebToolNetworkError(f"发送请求超时: {exc}") from exc
+            sock.sendall(request_data)
+        except (socket.timeout, TimeoutError) as exc:
+            raise WebToolNetworkError(f"发送请求超时: {exc}") from exc
 
-            # 3. 读 HTTP 响应头（按行）
-            # 每次阻塞读前都重新按「剩余总时间」收敛 socket 超时
-            def _prepare_read() -> None:
+        # 3. 读 HTTP 响应（直接用 sock.recv，不再用 makefile 缓冲）
+        #    每次 recv 都受剩余总时间约束，max_bytes 精确控制总读量
+        def _recv_until_delim(delim: bytes = b"\r\n") -> bytes:
+            """从 socket 接收直到遇到 delim（\r\n 或 \n），返回整行。"""
+            buf = b""
+            while True:
                 _check_deadline()
                 sock.settimeout(_bounded_timeout(timeout_s))
+                b = sock.recv(1)
+                if not b:
+                    return buf  # EOF
+                buf += b
+                if buf.endswith(delim):
+                    return buf
 
-            _prepare_read()
-            fp = sock.makefile("rb")
-            status_line = fp.readline()
-            if not status_line:
-                raise httpx.RemoteProtocolError("响应为空", request=request)
+        _check_deadline()
+        status_line = _recv_until_delim()
+        if not status_line:
+            raise httpx.RemoteProtocolError("响应为空", request=request)
+        try:
+            _, status_str, _ = status_line.split(b" ", 2)
+            status_code = int(status_str)
+        except (ValueError, IndexError) as exc:
+            raise httpx.RemoteProtocolError(
+                f"无法解析状态行: {status_line!r}", request=request
+            ) from exc
+
+        # 读 headers
+        header_dict: list[tuple[str, str]] = []
+        content_length: int | None = None
+        transfer_encoding_chunked = False
+        while True:
+            line = _recv_until_delim()
+            if not line or line in (b"\r\n", b"\n", b""):
+                break
             try:
-                # HTTP/1.1 200 OK
-                _, status_str, _ = status_line.split(b" ", 2)
-                status_code = int(status_str)
-            except (ValueError, IndexError) as exc:
-                raise httpx.RemoteProtocolError(
-                    f"无法解析状态行: {status_line!r}", request=request
-                ) from exc
-
-            # 读 headers
-            header_dict: list[tuple[str, str]] = []
-            content_length: int | None = None
-            transfer_encoding_chunked = False
-            while True:
-                _prepare_read()
-                line = fp.readline()
-                if not line or line in (b"\r\n", b"\n", b""):
-                    break
+                name, _, value = line.decode("latin-1").partition(":")
+            except UnicodeDecodeError:
+                continue
+            name = name.strip()
+            value = value.strip()
+            if name.lower() == "content-length":
                 try:
-                    name, _, value = line.decode("latin-1").partition(":")
-                except UnicodeDecodeError:
-                    continue
-                name = name.strip()
-                value = value.strip()
-                if name.lower() == "content-length":
-                    try:
-                        content_length = int(value)
-                    except ValueError:
-                        content_length = None
-                elif name.lower() == "transfer-encoding" and "chunked" in value.lower():
-                    transfer_encoding_chunked = True
-                header_dict.append((name, value))
+                    content_length = int(value)
+                except ValueError:
+                    content_length = None
+            elif name.lower() == "transfer-encoding" and "chunked" in value.lower():
+                transfer_encoding_chunked = True
+            header_dict.append((name, value))
 
-            # 4. R3：流式读 body——按 chunk 累计，max_bytes 内实时截断
-            max_bytes = self._max_bytes
-            truncated = False
-            chunks: list[bytes] = []
-            total = 0
-            eof_reached = False
+        # 4. R3：流式读 body——每次 recv 受剩余总时间 + max_bytes 双重约束
+        max_bytes = self._max_bytes
+        truncated = False  # 必须在此（函数定义之前），供 nonlocal 解析
+        chunks: list[bytes] = []
+        total = 0
+        eof_reached = False
 
-            def _probe_ahead(fp_obj: Any, *, chunked: bool) -> bool:
-                """停在 max_bytes 后做一次**有界**探测，判断是否还有未读数据。
+        def _recv_some(space: int) -> bytes | None:
+            """从 socket 读最多 space 字节；超限或 EOF 返回 None。
 
-                返回 True 表示「确实还有更多数据」（→ 截断），
-                False 表示「已读到 EOF/终结块」（→ 完整）。
-                探测受剩余总时间约束；超时视为无法确认 → 按截断处理（保守）。
-                """
-                if self._deadline is not None and time.monotonic() >= self._deadline:
-                    return True  # 已无时间确认，保守按截断
-                probe_timeout = _bounded_timeout(0.5)
-                if probe_timeout <= 0:
-                    return True
-                prev_timeout = sock.gettimeout()
+            读量同时受 space 和 max_bytes 双重约束，防止吞掉多余数据。
+            """
+            nonlocal eof_reached
+            if space <= 0:
+                return None
+            buf = b""
+            while len(buf) < space:
+                remaining_budget = max_bytes - total - len(buf)
+                if remaining_budget <= 0:
+                    return buf if buf else None
+                recv_size = min(space - len(buf), remaining_budget, 8192)
+                _check_deadline()
+                sock.settimeout(_bounded_timeout(timeout_s))
                 try:
-                    sock.settimeout(probe_timeout)
-                    if chunked:
-                        line = fp_obj.readline()
-                        if not line:
-                            return True  # EOF，无法确认终结块 → 保守截断
-                        try:
-                            size = int(line.strip(), 16)
-                        except ValueError:
-                            return True
-                        return size != 0
-                    one = fp_obj.read(1)
-                    return bool(one)  # 读到 1 字节 → 后面还有数据
-                except (socket.timeout, TimeoutError):
-                    return True  # 超时无法确认 → 保守截断
-                except OSError:
-                    return True
-                finally:
-                    try:
-                        sock.settimeout(prev_timeout)
-                    except Exception:
-                        pass
+                    chunk = sock.recv(recv_size)
+                except socket.timeout:
+                    return buf if buf else None
+                if not chunk:
+                    eof_reached = True
+                    return None
+                buf += chunk
+            return buf
 
-            def _read_more() -> None:
-                """从 socket 读 chunk 并累计到 chunks。"""
-                nonlocal total, truncated, eof_reached
-                if transfer_encoding_chunked:
-                    # 读 chunked 编码：<size>\r\n<data>\r\n
-                    while True:
-                        _prepare_read()
-                        size_line = fp.readline()
-                        if not size_line:
-                            return
-                        try:
-                            size = int(size_line.strip(), 16)
-                        except ValueError:
-                            return
-                        if size == 0:
-                            fp.readline()  # 末尾 \r\n
-                            return
-                        # 读 size 字节
-                        remaining = size
-                        while remaining > 0:
-                            _prepare_read()
-                            # R3-A：单次 read 受 max_bytes 限制
-                            space_left = max_bytes - total
-                            if space_left <= 0:
-                                truncated = True
-                                return
-                            want = min(remaining, space_left)
-                            buf = fp.read(want)
-                            if not buf:
-                                eof_reached = True
-                                return
-                            if total + len(buf) > max_bytes:
-                                space = max_bytes - total
-                                if space > 0:
-                                    chunks.append(buf[:space])
-                                    total += space
-                                truncated = True
-                                return
-                            chunks.append(buf)
-                            total += len(buf)
-                            remaining -= len(buf)
-                        fp.readline()  # chunk 后的 \r\n
-                        if truncated:
-                            return
-                        if total >= max_bytes:
-                            # 恰好填满上限：有界探测判断后面还有没有数据
-                            truncated = _probe_ahead(fp, chunked=True)
-                            return
-                else:
-                    # 不带 transfer-encoding：按 content-length 或读到 EOF
-                    # content_length 为 None ⇒ 以连接关闭(EOF)作为终止判定
-                    to_read = content_length
-                    # R3-B：声明长度本身就超过 max_bytes → 截断
-                    if content_length is not None and content_length > max_bytes:
+        def _read_more() -> None:
+            """从 socket 读 body 并累计到 chunks。"""
+            nonlocal total, truncated, eof_reached
+            if transfer_encoding_chunked:
+                while True:
+                    if total >= max_bytes:
                         truncated = True
-                    while True:
+                        return
+                    size_line = _recv_until_delim()
+                    if not size_line:
+                        return
+                    try:
+                        size = int(size_line.strip(), 16)
+                    except ValueError:
+                        return
+                    if size == 0:
+                        _recv_until_delim()
+                        return
+                    while size > 0:
                         if total >= max_bytes:
-                            # 停在上限：有长度 ⇒ 已知还有剩余；无长度 ⇒ 有界探测
-                            if content_length is None:
-                                truncated = _probe_ahead(fp, chunked=False)
-                            return
-                        _prepare_read()
-                        space_left = max_bytes - total
-                        want = 8192 if to_read is None else min(8192, space_left, to_read)
-                        want = min(want, space_left)
-                        if want <= 0:
-                            return
-                        buf = fp.read(want)
-                        if not buf:
-                            eof_reached = True
-                            return
-                        if total + len(buf) > max_bytes:
-                            space = max_bytes - total
-                            chunks.append(buf[:space])
-                            total += space
                             truncated = True
+                            return
+                        space = max_bytes - total
+                        buf = _recv_some(space)
+                        if buf is None or not buf:
+                            if buf is None:
+                                eof_reached = True
                             return
                         chunks.append(buf)
                         total += len(buf)
-                        if to_read is not None:
-                            to_read -= len(buf)
-                            if to_read <= 0:
-                                return
+                        size -= len(buf)
+                    _recv_until_delim()
+            else:
+                to_read = content_length
+                if content_length is not None and content_length > max_bytes:
+                    truncated = True
+                while True:
+                    if total >= max_bytes:
+                        if content_length is None:
+                            truncated = True
+                        return
+                    _check_deadline()
+                    space = max_bytes - total
+                    want = 8192 if to_read is None else min(8192, space, to_read)
+                    if want <= 0:
+                        return
+                    buf = _recv_some(want)
+                    if buf is None or not buf:
+                        if buf is None:
+                            eof_reached = True
+                        return
+                    chunks.append(buf)
+                    total += len(buf)
+                    if to_read is not None:
+                        to_read -= len(buf)
+                        if to_read <= 0:
+                            return
 
-            try:
-                _read_more()
-            finally:
-                try:
-                    fp.close()
-                except Exception:
-                    pass
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-
-            body = b"".join(chunks)
-            # R3：读完之后**再**核一次总 deadline —— 阻塞读期间超期不能算成功
-            _check_deadline()
-            # 无长度且读到 EOF ⇒ 一定完整（覆盖探测漏判的情形）
-            if content_length is None and eof_reached and total < max_bytes:
-                truncated = False
-            # 让上层知道是否截断：通过响应头加自定义字段
-            header_dict.append(("X-Transport-Truncated", "1" if truncated else "0"))
-            stream = httpx.ByteStream(body)
-            return httpx.Response(
-                status_code=status_code,
-                headers=header_dict,
-                stream=stream,
-                request=request,
-            )
-        except (httpx.HTTPError,):
+        try:
+            _read_more()
+        finally:
             try:
                 sock.close()
             except Exception:
                 pass
-            raise
-        except Exception:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            raise
 
+        body = b"".join(chunks)
+        _check_deadline()
+        if content_length is None and eof_reached and total < max_bytes:
+            truncated = False
+        header_dict.append(("X-Transport-Truncated", "1" if truncated else "0"))
+        stream = httpx.ByteStream(body)
+        return httpx.Response(
+            status_code=status_code,
+            headers=header_dict,
+            stream=stream,
+            request=request,
+        )
     def close(self) -> None:
         return None
 

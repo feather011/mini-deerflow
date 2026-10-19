@@ -1903,3 +1903,16 @@ class TestRealTransportR3:
         assert result["ok"] is False, result
         assert result["kind"] == "network_error", result
         assert elapsed < 2.0, f"总超时未生效，实际耗时 {elapsed:.3f}s"
+
+    def test_total_deadline_tiny_timeout_no_leak(self, local_http_server) -> None:
+        """极小总超时（0.1s）不应泄漏约 4 倍时长（~2s）。"""
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(timeout_s=0.1, max_bytes=1024)
+        started = time.monotonic()
+        result = json.loads(tool.execute({"url": f"{base_url}/slowbody"}))
+        elapsed = time.monotonic() - started
+        assert result["ok"] is False, result
+        assert result["kind"] == "network_error", result
+        # R3 根因：_probe_ahead 里 _bounded_timeout(0.5) 在剩余 >0.5s 时仍阻塞 0.5s，
+        # 4 个 chunk 各漏 0.5s → ~2s；修复后应 <0.8s
+        assert elapsed < 0.8, f"探测泄漏总超时，实际耗时 {elapsed:.3f}s"
