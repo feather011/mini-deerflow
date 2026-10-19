@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -1259,6 +1261,41 @@ class TestProcessIsolation:
 # ---------------------------------------------------------------------------
 
 
+class _WebSearchScriptedModel:
+    """脚本模型：第一步调 web_search，第二步把检索到的来源写进最终答案。"""
+
+    def __init__(self, *, query: str = "harness", top_k: int = 3) -> None:
+        self._query = query
+        self._top_k = top_k
+        self.calls = 0
+
+    def decide(self, messages: list[Any], tools: Any = None) -> Any:
+        from mini_deerflow.models import FinalAnswer, ToolCall
+
+        self.calls += 1
+        if self.calls == 1:
+            return ToolCall(
+                name="web_search",
+                arguments={"query": self._query, "top_k": self._top_k},
+                id="call-web-1",
+            )
+        for message in reversed(messages):
+            content = getattr(message, "content", None)
+            if not isinstance(content, str) or '"results"' not in content:
+                continue
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            results = payload.get("results") or []
+            if results:
+                first = results[0]
+                return FinalAnswer(
+                    content=f"来源：{first.get('title')} {first.get('url')}"
+                )
+        return FinalAnswer(content="没有检索到来源")
+
+
 class TestSearchProviderConfig:
     def test_unavailable_kind_returns_unavailable(self) -> None:
         provider = build_web_search_provider_from_config(kind="unavailable")
@@ -1355,39 +1392,95 @@ class TestSearchProviderConfig:
         provider = MCPSearchAdapter(tool_executor=executor)
         assert provider.search("q", top_k=5) == []
 
-    # R4：app.py 在 MCP 启动后注入真实 MCPSearchAdapter
-    def test_app_factory_injects_mcp_executor_when_server_present(self) -> None:
-        """当 web_search_provider_kind=mcp + web_search_mcp_server 已配置 +
-        mcp_manager 已注册该 server 暴露的 tool → 注入 MCPSearchAdapter。
+    # ------------------------------------------------------------------
+    # R4：app 配置 → Runtime → **真实** stdio MCP（真实 _invoke 签名与返回格式）
+    #     → MCPSearchAdapter → title / url / snippet
+    # ------------------------------------------------------------------
 
-        现实环境通常不会启动真 MCP server；用 monkey-patch MCPClientManager
-        实例属性，让 registered_names 返回 mcp__web_search__search 即可。
+    @staticmethod
+    def _run_real_mcp_web_search(
+        monkeypatch: Any,
+        *,
+        enabled: bool,
+        principals: list[str],
+        side_effects: list[str],
+        query: str = "harness",
+        top_k: int = 3,
+        via_agent: bool = False,
+    ) -> tuple[dict, list[str], object]:
+        """启动真实 stdio MCP 搜索夹具，走 app 工厂，执行 web_search。
+
+        **不替换 `_invoke`**：使用真实签名
+        `(qualified, arguments, timeout) -> str` 与真实返回格式（JSON 字符串）。
+        返回 `(result_json, invoke_call_records, provider)`。
         """
+        import shutil
+        import sys as _sys
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+
         from mini_deerflow.api.app import _default_runtime_factory
-        from mini_deerflow.web_tools import MCPSearchAdapter
-        from mini_deerflow.mcp_manager import MCPClientManager as _OrigMCP
+        from mini_deerflow.api.config import ApiSettings
+        from mini_deerflow.middleware import ExecutionContext
+        from mini_deerflow.mcp_manager import MCPClientManager
 
-        original_registered = _OrigMCP.registered_names
-        original_invoke = _OrigMCP._invoke
+        server_path = str(_Path("tests/fixtures/mcp_search_server.py").resolve())
+        qualified = "mcp__web_search__search"
+        calls: list[str] = []
+        original_invoke = MCPClientManager._invoke
 
-        def fake_registered_names(self) -> tuple[str, ...]:
-            # 已有真实注册 + 我们的 fake search tool
-            base = list(original_registered.fget(self))  # type: ignore[attr-defined]
-            return tuple(base) + ("mcp__web_search__search",)
+        def counting_invoke(self: Any, qualified_name: str, arguments: Any, timeout: float) -> str:
+            calls.append(qualified_name)
+            return original_invoke(self, qualified_name, arguments, timeout)
 
-        def fake_invoke(self, qualified: str, args: dict) -> dict:
-            if qualified == "mcp__web_search__search":
-                return {
-                    "hits": [
-                        {"title": "fake", "url": "https://e/fake", "snippet": "s"}
-                    ]
-                }
-            return original_invoke(self, qualified, args)
-
-        _OrigMCP.registered_names = property(fake_registered_names)  # type: ignore[assignment]
-        _OrigMCP._invoke = fake_invoke  # type: ignore[assignment]
+        MCPClientManager._invoke = counting_invoke  # type: ignore[assignment]
+        tmp = _tempfile.mkdtemp(prefix="tool06-mcp-")
         try:
-            from mini_deerflow.api.config import ApiSettings
+            cfg_path = _Path(tmp) / "mcp.json"
+            cfg_path.write_text(
+                json.dumps(
+                    {
+                        "servers": [
+                            {
+                                "name": "web_search",
+                                "command": _sys.executable,
+                                "args": [server_path],
+                                "enabled": True,
+                                "required": False,
+                                "startup_timeout": 30,
+                                "call_timeout": 20,
+                                "tool_capabilities": ["NETWORK_READ"],
+                                "tool_side_effects": side_effects,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_path = _Path(tmp) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "tools": {
+                            qualified: {
+                                "enabled": enabled,
+                                "allowed_principals": principals,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            monkeypatch.setenv("MINI_DEERFLOW_MCP_CONFIG", str(cfg_path))
+            monkeypatch.setenv("MINI_DEERFLOW_MCP_TOOL_STATE", str(state_path))
+            for key in (
+                "MINI_DEERFLOW_WEB_SEARCH_PROVIDER_KIND",
+                "MINI_DEERFLOW_WEB_SEARCH_FAKE_RESULTS",
+                "MINI_DEERFLOW_WEB_SEARCH_MCP_SERVER",
+                "MINI_DEERFLOW_WEB_SEARCH_MCP_TOOL",
+            ):
+                monkeypatch.delenv(key, raising=False)
+
             settings = ApiSettings(
                 web_search_provider_kind="mcp",
                 web_search_mcp_server="web_search",
@@ -1395,47 +1488,418 @@ class TestSearchProviderConfig:
             )
             runtime = _default_runtime_factory(settings)
             try:
-                assert isinstance(
-                    runtime.config.web_search_provider, MCPSearchAdapter
-                ), (
-                    f"应注入 MCPSearchAdapter，"
-                    f"实际 {type(runtime.config.web_search_provider).__name__}"
-                )
-                # 直接调用 adapter 应走 fake mcp_manager._invoke
-                hits = runtime.config.web_search_provider.search("x", top_k=1)
-                assert len(hits) == 1
-                assert hits[0].title == "fake"
+                provider = runtime.config.web_search_provider
+                agent = runtime.integrated_agent._agent
+                if via_agent:
+                    # 走**真实 Agent.run**：可见性过滤 → 三层授权 → registry
+                    # → web_search → 授权复核 → 真实 MCPManager._invoke
+                    agent._model = _WebSearchScriptedModel(query=query, top_k=top_k)
+                    runtime.store.create(thread_id="t-tool06-agent")
+                    answer, _trace = agent.run(
+                        "t-tool06-agent", "检索一下相关资料"
+                    )
+                    result = {"ok": True, "answer": answer}
+                else:
+                    ctx = ExecutionContext(
+                        thread_id="t-tool06", run_id="r-tool06"
+                    )
+                    result = json.loads(
+                        agent._registry.execute(
+                            "web_search",
+                            {"query": query, "top_k": top_k},
+                            context=ctx,
+                        )
+                    )
+                return result, calls, provider
             finally:
                 runtime.shutdown()
         finally:
-            _OrigMCP.registered_names = original_registered  # type: ignore[assignment]
-            _OrigMCP._invoke = original_invoke  # type: ignore[assignment]
+            MCPClientManager._invoke = original_invoke  # type: ignore[assignment]
+            shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_mcp_executor_invokes_real_manager(self) -> None:
-        """直接验证 MCPSearchAdapter 拿到 mcp_manager._invoke → executor 真被调用。"""
+    def test_real_mcp_search_end_to_end_authorized(self, monkeypatch: Any) -> None:
+        """已启用 + 已授权 → 走真实 MCP → adapter 解析 JSON 字符串 → 标题/URL/摘要。"""
         from mini_deerflow.web_tools import MCPSearchAdapter
 
-        # 模拟 mcp_manager：暴露 registered_names + _invoke
-        class FakeMCPManager:
-            def __init__(self) -> None:
-                self.calls: list[tuple[str, dict]] = []
-                self.registered_names = ("mcp__search__search",)
+        result, calls, provider = self._run_real_mcp_web_search(
+            monkeypatch,
+            enabled=True,
+            principals=["MAIN_AGENT"],
+            side_effects=[],
+        )
+        assert isinstance(provider, MCPSearchAdapter), (
+            f"应注入 MCPSearchAdapter，实际 {type(provider).__name__}"
+        )
+        assert result["ok"] is True, result
+        assert result["count"] >= 1
+        first = result["results"][0]
+        assert first["title"], "缺少 title"
+        assert first["url"].startswith("https://"), first["url"]
+        assert first["snippet"], "缺少 snippet"
+        # 真实 _invoke 恰好被调用一次（参数格式由真实签名校验）
+        assert calls == ["mcp__web_search__search"]
 
-            def _invoke(self, qualified: str, args: dict) -> dict:
-                self.calls.append((qualified, args))
-                return {
-                    "hits": [
-                        {"title": "T1", "url": "https://e/1", "snippet": "s1"}
-                    ]
-                }
+    def test_real_agent_search_then_answer_with_source(
+        self, monkeypatch: Any
+    ) -> None:
+        """app 配置 → **真实 Agent.run** → 真实 MCPManager._invoke → adapter
+        → 最终答案带上来源链接（不替换 _invoke、不用假 executor）。
+        """
+        result, calls, provider = self._run_real_mcp_web_search(
+            monkeypatch,
+            enabled=True,
+            principals=["MAIN_AGENT"],
+            side_effects=[],
+            via_agent=True,
+        )
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        assert isinstance(provider, MCPSearchAdapter)
+        assert result["ok"] is True, result
+        assert "https://example.invalid/harnessagent" in result["answer"], result
+        assert calls == ["mcp__web_search__search"], calls
+
+    def test_real_mcp_search_disabled_blocks_handler(self, monkeypatch: Any) -> None:
+        """工具未启用 → DENY → handler=0（真实 MCP 一次都不被调用）。"""
+        result, calls, _provider = self._run_real_mcp_web_search(
+            monkeypatch,
+            enabled=False,
+            principals=["MAIN_AGENT"],
+            side_effects=[],
+        )
+        assert result["ok"] is False
+        assert result["kind"] == "authorization_error"
+        assert calls == [], f"未授权时不应调用底层 MCP，实际 {calls}"
+
+    def test_real_mcp_search_revoked_principal_blocks_handler(
+        self, monkeypatch: Any
+    ) -> None:
+        """主体被撤销 → DENY → handler=0。"""
+        result, calls, _provider = self._run_real_mcp_web_search(
+            monkeypatch,
+            enabled=True,
+            principals=[],
+            side_effects=[],
+        )
+        assert result["ok"] is False
+        assert result["kind"] == "authorization_error"
+        assert calls == [], f"无授权主体时不应调用底层 MCP，实际 {calls}"
+
+    def test_real_mcp_search_confirmation_not_bypassed(self, monkeypatch: Any) -> None:
+        """目标工具按 READS_NETWORK 分类（metadata 要求确认）→ CONFIRM →
+        web_search 别名**不得绕过**确认链路：handler=0。
+        """
+        result, calls, _provider = self._run_real_mcp_web_search(
+            monkeypatch,
+            enabled=True,
+            principals=["MAIN_AGENT"],
+            side_effects=["READS_NETWORK"],
+        )
+        assert result["ok"] is False
+        assert result["kind"] == "authorization_error"
+        assert calls == [], f"待确认时不应调用底层 MCP，实际 {calls}"
+
+    def test_mcp_executor_matches_real_invoke_contract(self) -> None:
+        """executor 必须兼容**真实** `_invoke(qualified, args, timeout) -> str`：
+        三位置参数 + 返回 JSON 字符串，由 adapter 解析。
+        """
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        class FakeMCPManager:
+            """复刻真实签名与返回格式（不替换真实 _invoke）。"""
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict, float]] = []
+                self.registered_names = ("mcp__web_search__search",)
+
+            def _invoke(
+                self, qualified: str, arguments: dict, timeout: float
+            ) -> str:
+                self.calls.append((qualified, dict(arguments), timeout))
+                # 真实返回：JSON **字符串**
+                return json.dumps(
+                    {
+                        "hits": [
+                            {"title": "T1", "url": "https://e/1", "snippet": "s1"}
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
 
         mgr = FakeMCPManager()
 
-        def executor(tool: str, args: dict) -> dict:
-            return mgr._invoke(f"mcp__search__{tool}", args)
+        def executor(tool: str, args: dict, timeout: float = 30.0) -> str:
+            return mgr._invoke(f"mcp__web_search__{tool}", args, timeout)
 
         adapter = MCPSearchAdapter(tool_executor=executor, tool_name="search")
         hits = adapter.search("hello", top_k=5)
         assert len(hits) == 1
         assert hits[0].title == "T1"
-        assert mgr.calls == [("mcp__search__search", {"query": "hello", "top_k": 5})]
+        assert hits[0].url == "https://e/1"
+        assert hits[0].snippet == "s1"
+        assert mgr.calls == [
+            (
+                "mcp__web_search__search",
+                {"query": "hello", "top_k": 5},
+                30.0,
+            )
+        ]
+
+    def test_mcp_return_not_json_raises(self) -> None:
+        """真实返回不是合法 JSON → 显式报错，**不静默当成空结果**。"""
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        adapter = MCPSearchAdapter(
+            tool_executor=lambda tool, args: "抱歉，搜索服务出错了",
+            tool_name="search",
+        )
+        with pytest.raises(WebToolError, match="JSON"):
+            adapter.search("q", top_k=5)
+
+    def test_mcp_return_missing_hits_field_raises(self) -> None:
+        """返回 JSON 但缺 hits/results/data → 显式报错，不静默返回空。"""
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        adapter = MCPSearchAdapter(
+            tool_executor=lambda tool, args: json.dumps({"status": "ok"}),
+            tool_name="search",
+        )
+        with pytest.raises(WebToolError, match="hits/results/data"):
+            adapter.search("q", top_k=5)
+
+    def test_mcp_return_empty_string_raises(self) -> None:
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        adapter = MCPSearchAdapter(
+            tool_executor=lambda tool, args: "  ",
+            tool_name="search",
+        )
+        with pytest.raises(WebToolError, match="空字符串"):
+            adapter.search("q", top_k=5)
+
+    def test_mcp_executor_exception_surfaces(self) -> None:
+        """底层超时/KeyError 等异常必须上抛，不吞成空结果。"""
+        from mini_deerflow.web_tools import MCPSearchAdapter
+
+        def boom(tool: str, args: dict) -> str:
+            raise TimeoutError("MCP 操作超过 30 秒未返回")
+
+        adapter = MCPSearchAdapter(tool_executor=boom, tool_name="search")
+        with pytest.raises(WebToolError, match="MCP 搜索调用失败"):
+            adapter.search("q", top_k=5)
+
+
+# ---------------------------------------------------------------------------
+# 12. R3：真实传输层 —— 本地 HTTP 夹具（验证截断标记 / 读取上界 / 超时生效）
+# ---------------------------------------------------------------------------
+
+
+class _Tool06HTTPHandler:
+    """在 fixture 内构造，便于访问每个 server 的 state。"""
+
+    def _build(self):  # noqa: ANN201
+        from http.server import BaseHTTPRequestHandler
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            server_version = "Tool06Fixture"
+
+            def log_message(self, *args: Any) -> None:  # 静音访问日志
+                return
+
+            def _state(self) -> Any:
+                return self.server.state  # type: ignore[attr-defined]
+
+            def do_GET(self) -> None:  # noqa: N802
+                path = self.path.split("?")[0]
+                if path == "/nolen":
+                    # 无 Content-Length：close-delimited 正文
+                    body = b"x" * 4096
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    self.wfile.write(body)
+                elif path == "/clen":
+                    body = b"w" * 4096
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif path == "/small":
+                    body = b"hello"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif path == "/big":
+                    total = 8 * 1024 * 1024
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(total))
+                    self.end_headers()
+                    self._state()["sent"] = 0  # type: ignore[index]
+                    chunk = b"y" * 4096
+                    sent = 0
+                    try:
+                        while sent < total:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            sent += len(chunk)
+                            self._state()["sent"] = sent  # type: ignore[index]
+                            time.sleep(0.002)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                elif path == "/delay":
+                    # 响应头延迟：验证 read timeout 真的落到 socket
+                    time.sleep(1.5)
+                    body = b"abcd"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif path == "/slowbody":
+                    # 响应头立刻返回，正文极慢：验证总超时
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    try:
+                        for _ in range(200):  # 全量约 30s
+                            self.wfile.write(b"z" * 100)
+                            self.wfile.flush()
+                            time.sleep(0.15)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+        return Handler
+
+    def __init__(self) -> None:
+        self.handler_cls = self._build()
+
+
+@pytest.fixture()
+def local_http_server():  # noqa: ANN201
+    """本地 HTTP 夹具（127.0.0.1 随机端口）；返回 (base_url, state)。"""
+    from http.server import ThreadingHTTPServer
+
+    state: dict[str, Any] = {"sent": 0}
+    handler_cls = _Tool06HTTPHandler().handler_cls
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    server.state = state  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield base_url, state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _loopback_read_tool(**overrides: Any):
+    """允许 loopback 的 web_read 工具（本地夹具专用）。"""
+    kwargs: dict[str, Any] = {
+        "host_policy": HostPolicy(allow_loopback=True, allow_ip_literal=True),
+        "timeout_s": 5.0,
+    }
+    kwargs.update(overrides)
+    return build_web_read_tool(WebToolConfig(**kwargs))
+
+
+class TestRealTransportR3:
+    """R3：真发请求，验证读取上界、截断标记与超时确实生效。"""
+
+    def test_timeout_extension_is_a_dict(self) -> None:
+        """R3 根因：httpx 把 timeout 放进 extensions['timeout']，形态是 **dict**。"""
+        from mini_deerflow.web_tools import (
+            _connect_timeout_seconds,
+            _read_timeout_seconds,
+        )
+
+        ext: dict[str, Any] = {
+            "timeout": {"connect": 0.025, "read": 0.05, "write": 1.0, "pool": 1.0}
+        }
+        assert _read_timeout_seconds(ext) == 0.05
+        assert _connect_timeout_seconds(ext) == 0.025
+        # 缺字段 → 默认值
+        assert _read_timeout_seconds({}) == WEB_TOOL_LIMITS["read_read_timeout_s"]
+        # 非法值 → 默认值，不抛
+        assert (
+            _read_timeout_seconds({"timeout": {"read": -1}})
+            == WEB_TOOL_LIMITS["read_read_timeout_s"]
+        )
+        # 对象形态也兼容
+        assert _read_timeout_seconds({"timeout": httpx.Timeout(1.0, read=0.25)}) == 0.25
+
+    def test_no_length_response_truncated_flagged(self, local_http_server) -> None:
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(max_bytes=1024, timeout_s=5.0)
+        result = json.loads(tool.execute({"url": f"{base_url}/nolen"}))
+        assert result["ok"] is True, result
+        # 关键断言：无 Content-Length 且停在上限 → 必须标 truncated
+        assert result["truncated"] is True, result
+        assert result["bytes"] <= 1024
+
+    def test_content_length_over_cap_flagged(self, local_http_server) -> None:
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(max_bytes=1024, timeout_s=5.0)
+        result = json.loads(tool.execute({"url": f"{base_url}/clen"}))
+        assert result["ok"] is True, result
+        assert result["truncated"] is True, result
+        assert result["bytes"] <= 1024
+
+    def test_under_limit_not_truncated(self, local_http_server) -> None:
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(max_bytes=1024, timeout_s=5.0)
+        result = json.loads(tool.execute({"url": f"{base_url}/small"}))
+        assert result["ok"] is True, result
+        assert result["truncated"] is False, result
+        assert result["bytes"] == 5
+
+    def test_bounded_consumption_not_full_download(self, local_http_server) -> None:
+        """8MB 响应 + max_bytes=1024：客户端必须早停，不整包下载。"""
+        base_url, state = local_http_server
+        tool = _loopback_read_tool(max_bytes=1024, timeout_s=5.0)
+        started = time.monotonic()
+        result = json.loads(tool.execute({"url": f"{base_url}/big"}))
+        elapsed = time.monotonic() - started
+        assert result["ok"] is True, result
+        assert result["truncated"] is True, result
+        assert result["bytes"] <= 1024
+        # 远小于整包（8MB）；整包至少要 4s 才发完
+        assert elapsed < 2.0, f"读取耗时 {elapsed:.3f}s，未体现早停"
+        time.sleep(0.5)
+        sent = int(state.get("sent", 0))
+        assert sent < 1024 * 1024, f"服务端实际写出 {sent} 字节，说明仍在整包消费"
+
+    def test_read_timeout_reaches_socket(self, local_http_server) -> None:
+        """配置的读超时必须真正落到 socket（不是回落默认 10s）。"""
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(timeout_s=0.2)
+        started = time.monotonic()
+        result = json.loads(tool.execute({"url": f"{base_url}/delay"}))
+        elapsed = time.monotonic() - started
+        assert result["ok"] is False, result
+        assert result["kind"] == "network_error", result
+        assert elapsed < 1.0, f"超时未生效，实际耗时 {elapsed:.3f}s（服务端延迟 1.5s）"
+
+    def test_total_deadline_on_slow_body(self, local_http_server) -> None:
+        """慢正文：总超时必须在预算内中止，不等正文发完。"""
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(timeout_s=0.5, max_bytes=1024)
+        started = time.monotonic()
+        result = json.loads(tool.execute({"url": f"{base_url}/slowbody"}))
+        elapsed = time.monotonic() - started
+        assert result["ok"] is False, result
+        assert result["kind"] == "network_error", result
+        assert elapsed < 2.0, f"总超时未生效，实际耗时 {elapsed:.3f}s"

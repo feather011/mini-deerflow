@@ -44,6 +44,12 @@ __all__ = [
     "WebSearchHit",
     "WebToolConfig",
     "WEB_TOOL_LIMITS",
+    "WebToolError",
+    "WebToolUsageError",
+    "WebToolNetworkError",
+    "WebToolSSRFError",
+    "WebToolHTTPError",
+    "WebToolPolicyError",
     "resolve_host_policy",
     "build_web_search_tool",
     "build_web_read_tool",
@@ -365,23 +371,36 @@ class FixedListWebSearchProvider(WebSearchProvider):
         return list(self._results)[:top_k]
 
 
+class WebToolPolicyError(WebToolError):
+    """目标 MCP 工具未授权（禁用/未授权主体/缺能力/需确认）：调用被拒绝。
+
+    与 `WebToolSSRFError` 同级——都是"请求不该发生"；这里代表**授权**拦截，
+    对应 kind='authorization_error'，且**不调用底层 MCP**。
+    """
+
+
 class MCPSearchAdapter(WebSearchProvider):
     """TOOL-06 R4：把 MCP 工具调用适配为 WebSearchProvider。
 
-    适用于已通过 MCP 接入的搜索服务器（本地 stdio）。调用方传入一个执行器
-    `tool_executor`，形如 `(tool_name, arguments) -> dict`。MCPManager 的
-    `registered_names` 与 `invoke_tool` 可直接对接。
+    对接真实 `MCPClientManager._invoke(qualified, arguments, timeout) -> str`：
+    - executor 签名 `(tool_name, arguments) -> str | dict | list`（真实返回是 **JSON 字符串**）
+    - JSON 字符串在此解析；解析失败 / 字段缺失 / 底层抛错 → 显式 `WebToolError`，
+      不静默返回空结果
+    - `context_guard`：每次搜索前用当前可信 run 上下文**重新校验**目标 MCP 工具的
+      enable / 三主体授权 / 能力 / 确认；不通过则抛 `WebToolPolicyError`，
+      底层 MCP **一次都不会被调用**。
     """
 
     def __init__(
         self,
-        tool_executor: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        tool_executor: Callable[[str, dict[str, Any]], Any] | None = None,
         *,
         tool_name: str = "search",
         hits_path: tuple[str, ...] = ("hits", "results", "data"),
         title_keys: tuple[str, ...] = ("title", "name"),
         url_keys: tuple[str, ...] = ("url", "link", "href"),
         snippet_keys: tuple[str, ...] = ("snippet", "description", "summary"),
+        context_guard: Callable[[object], None] | None = None,
     ) -> None:
         self._tool_name = tool_name
         self._executor = tool_executor
@@ -389,26 +408,62 @@ class MCPSearchAdapter(WebSearchProvider):
         self._title_keys = title_keys
         self._url_keys = url_keys
         self._snippet_keys = snippet_keys
+        self._context_guard = context_guard
 
     def is_available(self) -> bool:
         return self._executor is not None
 
+    @property
+    def qualified_tool_name(self) -> str:
+        """被适配的 MCP 工具名（供授权判定使用；未设时为 'search'）。"""
+        return self._tool_name
+
+    def assert_allowed(self, context: object | None) -> None:
+        """R4：调用底层 MCP 前的授权复核；不通过抛 `WebToolPolicyError`。"""
+        if self._context_guard is None:
+            return
+        try:
+            self._context_guard(context)
+        except WebToolPolicyError:
+            raise
+        except Exception as exc:  # 守卫自身异常 → fail-closed
+            raise WebToolPolicyError(f"授权校验失败: {exc}") from exc
+
+    @staticmethod
+    def _coerce_payload(raw: Any) -> Any:
+        """真实 `_invoke` 返回 **JSON 字符串**；统一归一为可解析对象。
+
+        字符串无法解析时**抛错**，不静默当成"无结果"。
+        """
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", errors="replace")
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                raise WebToolError("MCP 搜索返回空字符串")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise WebToolError(
+                    f"MCP 搜索返回不是合法 JSON: {exc}"
+                ) from exc
+        return raw
+
     def search(self, query: str, *, top_k: int) -> list[WebSearchHit]:
         if self._executor is None:
             raise WebToolError("MCP 搜索 Provider 未配置 executor")
-        raw = self._executor(self._tool_name, {"query": query, "top_k": top_k})
-        # 适配常见返回形态：{"hits": [...]}, {"results": [...]}, {"data": [...]}
-        hits_raw: list[Any] = []
-        for key in self._hits_path:
-            if isinstance(raw, dict) and key in raw:
-                value = raw[key]
-                if isinstance(value, list):
-                    hits_raw = value
-                    break
-        if not hits_raw and isinstance(raw, list):
-            hits_raw = raw
-        if not hits_raw:
-            return []
+        try:
+            raw = self._executor(
+                self._tool_name, {"query": query, "top_k": top_k}
+            )
+        except WebToolError:
+            raise
+        except Exception as exc:
+            # TimeoutError / KeyError / MCPError 等：如实上抛，不吞成空结果
+            raise WebToolError(f"MCP 搜索调用失败: {exc}") from exc
+
+        payload = self._coerce_payload(raw)
+        hits_raw = self._extract_hits(payload)
         out: list[WebSearchHit] = []
         for item in hits_raw[:top_k]:
             if not isinstance(item, dict):
@@ -420,6 +475,26 @@ class MCPSearchAdapter(WebSearchProvider):
                 continue
             out.append(WebSearchHit(title=title, url=url, snippet=snippet or ""))
         return out
+
+    def _extract_hits(self, payload: Any) -> list[Any]:
+        """从 dict/list 中取命中列表；字段缺失时**抛错**而非静默返回空。"""
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            raise WebToolError(
+                f"MCP 搜索返回类型不受支持: {type(payload).__name__}"
+            )
+        for key in self._hits_path:
+            if key in payload:
+                value = payload[key]
+                if isinstance(value, list):
+                    return value
+                raise WebToolError(
+                    f"MCP 搜索返回的 {key} 不是数组"
+                )
+        raise WebToolError(
+            "MCP 搜索返回缺少 hits/results/data 字段"
+        )
 
     @staticmethod
     def _first_str(d: dict[str, Any], keys: tuple[str, ...]) -> str:
@@ -542,8 +617,25 @@ def build_web_search_tool(
                 hint="请直接调用 web_read 读取已知 URL，或配置搜索 Provider。",
             )
 
+        # R4：调用底层 MCP 前用当前可信 run 上下文复核目标工具授权
+        # （enable / 三主体 / 能力 / 确认）。不通过 → 不发任何 MCP 请求。
+        assert_allowed = getattr(search_provider, "assert_allowed", None)
+        if callable(assert_allowed):
+            try:
+                assert_allowed(context)
+            except WebToolPolicyError as exc:
+                return err_response(
+                    "web_search", str(exc), kind="authorization_error"
+                )
+            except Exception as exc:
+                return err_response(
+                    "web_search", f"授权校验失败: {exc}", kind="authorization_error"
+                )
+
         try:
             hits = search_provider.search(query, top_k=top_k)
+        except WebToolPolicyError as exc:
+            return err_response("web_search", str(exc), kind="authorization_error")
         except WebToolError as exc:
             return err_response("web_search", str(exc))
         except Exception as exc:  # 防御：不让 provider 抛出的内部异常炸工具层
@@ -569,7 +661,8 @@ def build_web_search_tool(
         ),
         parameters=dict(_WEB_SEARCH_PARAMETERS),
         handler=handler,
-        needs_context=False,
+        # R4：授权复核需要当前可信 run 上下文（thread_id / run_id）
+        needs_context=True,
     )
 
 
@@ -665,8 +758,9 @@ def build_web_search_provider_from_config(
     *,
     kind: str,
     fake_results: list[tuple[str, str, str]] | None = None,
-    mcp_executor: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    mcp_executor: Callable[[str, dict[str, Any]], Any] | None = None,
     mcp_tool_name: str = "search",
+    context_guard: Callable[[object], None] | None = None,
 ) -> WebSearchProvider:
     """TOOL-06 R4：根据应用配置构造搜索 Provider。
 
@@ -681,7 +775,11 @@ def build_web_search_provider_from_config(
     if kind == "mcp":
         if mcp_executor is None:
             return UnavailableWebSearchProvider()
-        return MCPSearchAdapter(tool_executor=mcp_executor, tool_name=mcp_tool_name)
+        return MCPSearchAdapter(
+            tool_executor=mcp_executor,
+            tool_name=mcp_tool_name,
+            context_guard=context_guard,
+        )
     # 未知 kind / 默认：fallback 到 unavailable（不抛异常，宽松）
     return UnavailableWebSearchProvider()
 
@@ -689,6 +787,45 @@ def build_web_search_provider_from_config(
 # ---------------------------------------------------------------------------
 # HTTP 抓取 + 重定向校验
 # ---------------------------------------------------------------------------
+
+
+def _timeout_from_extensions(
+    extensions: dict[str, Any], key: str, default: float
+) -> float:
+    """从 httpx `request.extensions['timeout']` 取某一项超时。
+
+    形态兼容两种：
+    - dict：`{'connect': .., 'read': .., 'write': .., 'pool': ..}`（httpx 0.28 实际形态）
+    - 对象：`httpx.Timeout`（属性访问）
+
+    取不到时回落到 `default`，且拒绝负值/非数值。
+    """
+    raw = extensions.get("timeout")
+    if isinstance(raw, dict):
+        value = raw.get(key)
+    else:
+        value = getattr(raw, key, None)
+    if value is None:
+        return default
+    try:
+        value = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if value < 0:
+        return default
+    return value
+
+
+def _read_timeout_seconds(extensions: dict[str, Any]) -> float:
+    return _timeout_from_extensions(
+        extensions, "read", WEB_TOOL_LIMITS["read_read_timeout_s"]
+    )
+
+
+def _connect_timeout_seconds(extensions: dict[str, Any]) -> float:
+    return _timeout_from_extensions(
+        extensions, "connect", WEB_TOOL_LIMITS["read_connect_timeout_s"]
+    )
 
 
 def _make_pinned_transport(
@@ -737,38 +874,60 @@ class _PinAddrTransport(httpx.BaseTransport):
         if parsed.query:
             path = f"{path}?{parsed.query}"
 
-        # R3-C：httpx.Timeout 是 httpx.Timeout（不是 dict）。访问 .read / .connect
-        timeout_obj = request.extensions.get("timeout")
-        timeout_s = 10.0
-        if timeout_obj is not None:
-            # httpx.Timeout 是对象；用属性访问拿 read
-            try:
-                read_attr = getattr(timeout_obj, "read", None)
-                if read_attr is not None:
-                    timeout_s = float(read_attr)
-            except (TypeError, ValueError):
-                pass
+        # R3：httpx 0.28 把 timeout 放进 request.extensions['timeout']，
+        # 形态是 **dict**（{connect, read, write, pool}）；直接 getattr(.read) 会
+        # 取到 None 从而回落到默认 10s（审查复现：read_timeout=0.025 → 实际 10.0）。
+        # 同时兼容对象形态（历史/自定义 transport 可能传 httpx.Timeout）。
+        timeout_s = _read_timeout_seconds(request.extensions)
+        connect_timeout_s = _connect_timeout_seconds(request.extensions)
+
+        def _remaining() -> float:
+            if self._deadline is None:
+                return float("inf")
+            return self._deadline - time.monotonic()
 
         def _check_deadline() -> None:
-            # R3-C：总 deadline 跨所有跳 + body 读取；超时即抛
-            if self._deadline is not None:
-                remaining = self._deadline - time.monotonic()
-                if remaining <= 0:
-                    raise WebToolNetworkError(
-                        f"请求总耗时超过总 deadline"
-                    )
+            # R3：总 deadline 跨所有跳 + 每次阻塞读之前都检查；超时即抛
+            if self._deadline is not None and time.monotonic() >= self._deadline:
+                raise WebToolNetworkError(
+                    "请求总耗时超过总 deadline"
+                )
+
+        def _bounded_timeout(nominal: float) -> float:
+            """阻塞操作的 socket 超时 = min(名义超时, 剩余总时间)。
+
+            下限 1ms：`settimeout(0)` 会把 socket 变成非阻塞，抛的就不再是
+            TimeoutError 而是 BlockingIOError，语义完全走样。
+            """
+            rem = _remaining()
+            if rem == float("inf"):
+                return max(0.001, nominal)
+            return max(0.001, min(nominal, rem))
 
         # 1. TCP 连接（绑到 pinned IP），连接前检查总 deadline
         _check_deadline()
-        raw_sock = socket.create_connection(
-            (self._pinned_ip, port), timeout=timeout_s
-        )
+        try:
+            raw_sock = socket.create_connection(
+                (self._pinned_ip, port), timeout=_bounded_timeout(connect_timeout_s)
+            )
+        except (socket.timeout, TimeoutError) as exc:
+            raise WebToolNetworkError(f"连接超时: {exc}") from exc
         sock: socket.socket
         if parsed.scheme == "https":
             import ssl
 
             ctx = ssl.create_default_context()
-            sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+            _check_deadline()
+            # TLS 握手同样受剩余总时间约束
+            raw_sock.settimeout(_bounded_timeout(connect_timeout_s))
+            try:
+                sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+            except (socket.timeout, TimeoutError) as exc:
+                try:
+                    raw_sock.close()
+                except Exception:
+                    pass
+                raise WebToolNetworkError(f"TLS 握手超时: {exc}") from exc
         else:
             sock = raw_sock
 
@@ -789,10 +948,21 @@ class _PinAddrTransport(httpx.BaseTransport):
             request_data = "\r\n".join(header_lines).encode("ascii")
             if request.content:
                 request_data += request.content
-            sock.sendall(request_data)
+            # 发送也是阻塞操作：受剩余总时间约束
+            _check_deadline()
+            sock.settimeout(_bounded_timeout(timeout_s))
+            try:
+                sock.sendall(request_data)
+            except (socket.timeout, TimeoutError) as exc:
+                raise WebToolNetworkError(f"发送请求超时: {exc}") from exc
 
             # 3. 读 HTTP 响应头（按行）
-            sock.settimeout(timeout_s)
+            # 每次阻塞读前都重新按「剩余总时间」收敛 socket 超时
+            def _prepare_read() -> None:
+                _check_deadline()
+                sock.settimeout(_bounded_timeout(timeout_s))
+
+            _prepare_read()
             fp = sock.makefile("rb")
             status_line = fp.readline()
             if not status_line:
@@ -811,6 +981,7 @@ class _PinAddrTransport(httpx.BaseTransport):
             content_length: int | None = None
             transfer_encoding_chunked = False
             while True:
+                _prepare_read()
                 line = fp.readline()
                 if not line or line in (b"\r\n", b"\n", b""):
                     break
@@ -834,14 +1005,51 @@ class _PinAddrTransport(httpx.BaseTransport):
             truncated = False
             chunks: list[bytes] = []
             total = 0
+            eof_reached = False
+
+            def _probe_ahead(fp_obj: Any, *, chunked: bool) -> bool:
+                """停在 max_bytes 后做一次**有界**探测，判断是否还有未读数据。
+
+                返回 True 表示「确实还有更多数据」（→ 截断），
+                False 表示「已读到 EOF/终结块」（→ 完整）。
+                探测受剩余总时间约束；超时视为无法确认 → 按截断处理（保守）。
+                """
+                if self._deadline is not None and time.monotonic() >= self._deadline:
+                    return True  # 已无时间确认，保守按截断
+                probe_timeout = _bounded_timeout(0.5)
+                if probe_timeout <= 0:
+                    return True
+                prev_timeout = sock.gettimeout()
+                try:
+                    sock.settimeout(probe_timeout)
+                    if chunked:
+                        line = fp_obj.readline()
+                        if not line:
+                            return True  # EOF，无法确认终结块 → 保守截断
+                        try:
+                            size = int(line.strip(), 16)
+                        except ValueError:
+                            return True
+                        return size != 0
+                    one = fp_obj.read(1)
+                    return bool(one)  # 读到 1 字节 → 后面还有数据
+                except (socket.timeout, TimeoutError):
+                    return True  # 超时无法确认 → 保守截断
+                except OSError:
+                    return True
+                finally:
+                    try:
+                        sock.settimeout(prev_timeout)
+                    except Exception:
+                        pass
 
             def _read_more() -> None:
                 """从 socket 读 chunk 并累计到 chunks。"""
-                nonlocal total, truncated
+                nonlocal total, truncated, eof_reached
                 if transfer_encoding_chunked:
                     # 读 chunked 编码：<size>\r\n<data>\r\n
                     while True:
-                        _check_deadline()  # R3-C
+                        _prepare_read()
                         size_line = fp.readline()
                         if not size_line:
                             return
@@ -855,7 +1063,7 @@ class _PinAddrTransport(httpx.BaseTransport):
                         # 读 size 字节
                         remaining = size
                         while remaining > 0:
-                            _check_deadline()  # R3-C
+                            _prepare_read()
                             # R3-A：单次 read 受 max_bytes 限制
                             space_left = max_bytes - total
                             if space_left <= 0:
@@ -864,6 +1072,7 @@ class _PinAddrTransport(httpx.BaseTransport):
                             want = min(remaining, space_left)
                             buf = fp.read(want)
                             if not buf:
+                                eof_reached = True
                                 return
                             if total + len(buf) > max_bytes:
                                 space = max_bytes - total
@@ -878,39 +1087,45 @@ class _PinAddrTransport(httpx.BaseTransport):
                         fp.readline()  # chunk 后的 \r\n
                         if truncated:
                             return
+                        if total >= max_bytes:
+                            # 恰好填满上限：有界探测判断后面还有没有数据
+                            truncated = _probe_ahead(fp, chunked=True)
+                            return
                 else:
                     # 不带 transfer-encoding：按 content-length 或读到 EOF
-                    if content_length is not None:
-                        to_read = content_length
-                    else:
-                        to_read = max_bytes + 1
+                    # content_length 为 None ⇒ 以连接关闭(EOF)作为终止判定
+                    to_read = content_length
                     # R3-B：声明长度本身就超过 max_bytes → 截断
                     if content_length is not None and content_length > max_bytes:
                         truncated = True
-                    while total < max_bytes:
-                        _check_deadline()  # R3-C
+                    while True:
+                        if total >= max_bytes:
+                            # 停在上限：有长度 ⇒ 已知还有剩余；无长度 ⇒ 有界探测
+                            if content_length is None:
+                                truncated = _probe_ahead(fp, chunked=False)
+                            return
+                        _prepare_read()
                         space_left = max_bytes - total
-                        if space_left <= 0:
-                            truncated = True
-                            break
-                        want = min(8192, space_left, to_read)
+                        want = 8192 if to_read is None else min(8192, space_left, to_read)
+                        want = min(want, space_left)
                         if want <= 0:
-                            break
+                            return
                         buf = fp.read(want)
                         if not buf:
-                            break
+                            eof_reached = True
+                            return
                         if total + len(buf) > max_bytes:
                             space = max_bytes - total
                             chunks.append(buf[:space])
                             total += space
                             truncated = True
-                            break
+                            return
                         chunks.append(buf)
                         total += len(buf)
-                        if content_length is not None:
+                        if to_read is not None:
                             to_read -= len(buf)
                             if to_read <= 0:
-                                break
+                                return
 
             try:
                 _read_more()
@@ -925,6 +1140,11 @@ class _PinAddrTransport(httpx.BaseTransport):
                     pass
 
             body = b"".join(chunks)
+            # R3：读完之后**再**核一次总 deadline —— 阻塞读期间超期不能算成功
+            _check_deadline()
+            # 无长度且读到 EOF ⇒ 一定完整（覆盖探测漏判的情形）
+            if content_length is None and eof_reached and total < max_bytes:
+                truncated = False
             # 让上层知道是否截断：通过响应头加自定义字段
             header_dict.append(("X-Transport-Truncated", "1" if truncated else "0"))
             stream = httpx.ByteStream(body)
@@ -968,8 +1188,9 @@ def _fetch_with_redirect_check(
     """
     current = url
     visited: set[str] = set()
-    timeout_total_s = config.timeout_s + WEB_TOOL_LIMITS["read_connect_timeout_s"]
-    deadline = time.monotonic() + timeout_total_s
+    # `timeout_s` 是**整次抓取的总超时**（含连接、TLS、头、body、全部重定向跳），
+    # 与 ApiSettings.web_read_timeout_s 的文档语义一致。
+    deadline = time.monotonic() + config.timeout_s
     headers = {
         "User-Agent": config.user_agent,
         "Accept": "text/html, text/plain;q=0.9, */*;q=0.5",
@@ -1001,8 +1222,11 @@ def _fetch_with_redirect_check(
         # deadline 透传到 transport 以便跨 hop + body 读取统一执行
         transport = _make_pinned_transport(pinned_ip, max_bytes, deadline_monotonic=deadline)
 
-        # 剩余时间作为本次 http timeout
-        remaining = max(0.5, deadline - time.monotonic())
+        # 剩余时间作为本次 http timeout：read 直接用剩余总时间，
+        # 因此**单次阻塞读也绝不会超过整次抓取的总预算**
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WebToolNetworkError("请求总耗时超过总超时")
         per_timeout = httpx.Timeout(
             connect=min(WEB_TOOL_LIMITS["read_connect_timeout_s"], remaining),
             read=remaining,

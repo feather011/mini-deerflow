@@ -151,7 +151,8 @@ def _default_runtime_factory(
 
     # R4：MCP 启动后二次注入真实搜索 Provider
     # kind=mcp + web_search_mcp_server 已配置 + MCPManager 已就绪 →
-    # 把 mcp_manager._invoke 包装成 mcp_executor 注入到 web_search_provider
+    # 把 mcp_manager._invoke 按**真实签名** (qualified, args, timeout) -> str
+    # 包装成 executor，并用当前可信 run 上下文挂上目标工具的授权复核。
     if (
         resolved.web_search_provider_kind == "mcp"
         and resolved.web_search_mcp_server
@@ -163,18 +164,68 @@ def _default_runtime_factory(
         # 验证该 server 已注册并暴露目标工具
         qualified = f"mcp__{server_name}__{tool_name}"
         if qualified in mcp_manager.registered_names:
-            def _mcp_executor(_tool: str, args: dict) -> dict:
-                return mcp_manager._invoke(qualified, args)
+            # 超时：复用 MCP server 的 call_timeout（缺省 30s）
+            try:
+                from mini_deerflow.mcp_config import find_server_config
+
+                call_timeout = find_server_config(
+                    load_mcp_config(), server_name
+                ).call_timeout
+            except Exception:
+                call_timeout = 30.0
+
+            def _mcp_executor(_tool: str, args: dict) -> str:
+                # 真实契约：第三个位置参数 timeout；返回值是 **JSON 字符串**
+                return mcp_manager._invoke(qualified, args, call_timeout)
+
+            # 授权复核：与 Agent._do_tool_call 第三层同一套判定
+            policy_reg = getattr(
+                runtime.integrated_agent._agent, "_tool_policy_registry", None
+            )
+
+            def _context_guard(context: object | None) -> None:
+                if policy_reg is None:
+                    return  # 未启用策略层时不做额外判定（前两层仍生效）
+                from mini_deerflow.tool_authorization import (
+                    check_tool_access,
+                    session_capabilities,
+                )
+
+                thread_id = getattr(context, "thread_id", None) or ""
+                run_id = getattr(context, "run_id", "") or ""
+                project_id = None
+                store = getattr(policy_reg, "_thread_store", None)
+                if thread_id and store is not None:
+                    try:
+                        project_id = store.get(thread_id).project_id
+                    except Exception:
+                        project_id = None
+                authority = policy_reg.get_authority(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    project_id=project_id,
+                    granted_capabilities=session_capabilities(project_id),
+                )
+                decision = check_tool_access(policy_reg, qualified, authority)
+                if decision.is_denied or decision.is_confirm:
+                    from mini_deerflow.web_tools import WebToolPolicyError
+
+                    raise WebToolPolicyError(
+                        f"目标 MCP 工具 {qualified} 未授权: {decision.reason}"
+                    )
+
+            from mini_deerflow.web_tools import create_web_tools
+
             new_provider = build_web_search_provider_from_config(
                 kind="mcp",
                 mcp_executor=_mcp_executor,
                 mcp_tool_name=tool_name,
+                context_guard=_context_guard,
             )
             # 替换 config 上的 provider；并重建 web_search 工具以使用新 provider
             runtime.config = replace(
                 runtime.config, web_search_provider=new_provider
             )
-            from mini_deerflow.web_tools import create_web_tools
             # 找到 Agent 持有的 registry（私有属性）
             agent = runtime.integrated_agent._agent
             agent_registry = getattr(agent, "_registry", None)
