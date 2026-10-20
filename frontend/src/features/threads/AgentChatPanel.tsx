@@ -37,6 +37,9 @@ import { ingestRealTaskData, ingestProjectExecuteResult } from '../inspector/rea
 import type { OptimisticMessage, UserSubmitStatus } from './types'
 import { generateClientId } from './types'
 import { useDraftStore } from './useDraftStore'
+// TOOL-05：确认卡（聊天内嵌紧邻对应工具活动）
+import { useConfirmations } from '../confirmations/useConfirmations'
+import { ConfirmationCardList } from '../confirmations/ConfirmationCardList'
 import styles from './AgentChatPanel.module.css'
 
 interface AgentChatPanelProps {
@@ -210,6 +213,17 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
   // unknown 状态下：pendingSent 存在即可恢复（恢复只清 pendingSent，不影响新草稿 draft.current）
   const canRestore = submitStatus === 'unknown' && draft.pendingSent !== null
 
+  // TOOL-05：确认卡数据源（轮询；切换 thread 重新启动）
+  const {
+    byRunId,
+    online: confirmOnline,
+    activeRunId: confirmActiveRunId,
+    inFlight: confirmInFlight,
+    deny: confirmDeny,
+    approveAndExecute: confirmApproveAndExecute,
+    verify: confirmVerify,
+  } = useConfirmations(thread.thread_id)
+
   return (
     <SSEContext.Provider value={{ events, status: streamStatus }}>
       <div className={styles.panel}>
@@ -219,6 +233,16 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
             messages={thread.messages}
             optimisticMessage={optimisticMsg}
             streamingText={currentText}
+          />
+          {/* TOOL-05：确认卡紧邻消息流底部渲染（按 run_id 分组） */}
+          <ConfirmationCardList
+            byRunId={byRunId}
+            activeRunId={confirmActiveRunId}
+            online={confirmOnline}
+            inFlight={confirmInFlight}
+            onDeny={confirmDeny}
+            onApproveAndExecute={confirmApproveAndExecute}
+            onVerify={confirmVerify}
           />
         </div>
 

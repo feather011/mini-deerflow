@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Callable, Iterator, TypeVar
 
 from mini_deerflow.context_assembler import AssembledContext, ContextAssembler
@@ -240,13 +242,20 @@ class Agent:
                 session_caps = frozenset({
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
+                    ToolCapability.SESSION_STATE_WRITE,
+                    # TOOL-06：网络只读工具需要 NETWORK_READ
+                    ToolCapability.NETWORK_READ,
                 })
                 session_project_id: str | None = None
             else:
                 session_caps = frozenset({
                     ToolCapability.PROJECT_READ,
+                    ToolCapability.PROJECT_EXEC_DELEGATE,
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
+                    ToolCapability.SESSION_STATE_WRITE,
+                    # TOOL-06：项目会话同样可调用网络只读工具
+                    ToolCapability.NETWORK_READ,
                 })
                 session_project_id = thread.project_id
             visible_names: set[str] = set()
@@ -415,8 +424,10 @@ class Agent:
                 ))
 
                 # Tool call：通过 middleware_pipeline 包装（含 budget 检查/记录）
+                # R1 round 4：tool_ctx.run_id 取 Agent.run 入口的 run_id，
+                # 保证确认请求绑定的 run_id 与 IntegratedAgent/AgentRunService 一致。
                 tool_ctx = ExecutionContext(
-                    run_id="",
+                    run_id=run_id or "",
                     thread_id=thread_id,
                     operation=OperationType.TOOL_CALL,
                     operation_name=decision.name,
@@ -438,17 +449,24 @@ class Agent:
                     if self._tool_policy_registry is not None:
                         # 根据会话类型授予默认基础能力
                         if thread.project_id is None:
-                            # 普通会话：允许 calculator(history_search 等
+                            # 普通会话：calculator / history / task_note
                             default_caps = frozenset({
                                 ToolCapability.COMPUTE,
                                 ToolCapability.SESSION_HISTORY_READ,
+                                ToolCapability.SESSION_STATE_WRITE,
+                                # TOOL-06：网络只读
+                                ToolCapability.NETWORK_READ,
                             })
                         else:
-                            # 项目会话：允许 project_read_file/calculator/history_search
+                            # 项目会话：项目读写 + 普通会话基础能力
                             default_caps = frozenset({
                                 ToolCapability.PROJECT_READ,
+                                ToolCapability.PROJECT_EXEC_DELEGATE,
                                 ToolCapability.COMPUTE,
                                 ToolCapability.SESSION_HISTORY_READ,
+                                ToolCapability.SESSION_STATE_WRITE,
+                                # TOOL-06：网络只读
+                                ToolCapability.NETWORK_READ,
                             })
                         authority = self._tool_policy_registry.get_authority(
                             thread_id=thread_id,
@@ -457,9 +475,81 @@ class Agent:
                             granted_capabilities=default_caps,
                             principal=self._run_principal,
                         )
-                        decision = check_tool_access(self._tool_policy_registry, _name, authority)
-                        if decision.is_denied or decision.is_confirm:
-                            raise ToolAuthorizationError(decision)
+                        auth_decision = check_tool_access(self._tool_policy_registry, _name, authority)
+                        if auth_decision.is_denied:
+                            raise ToolAuthorizationError(auth_decision)
+                        if auth_decision.is_confirm:
+                            # R1 round 4：使用真实 run_id 创建 pending，挂起等待 API 决议
+                            # - run_id 取自当前 ExecutionContext（与运行入口一致）
+                            # - 等待 outcome 决定返回真实工具结果或合成错误
+                            cm = getattr(self, "_confirmation_manager", None)
+                            runtime_obj = getattr(self, "_runtime", None)
+                            if cm is not None:
+                                from mini_deerflow.tool_contracts import (
+                                    ExecutorPrincipal as _EP,
+                                )
+                                principal = _EP[
+                                    authority.principal.name
+                                ] if hasattr(authority.principal, "name") else authority.principal
+                                # R1 round 4：run_id 贯通——优先取 ExecutionContext
+                                # 的 run_id（与 IntegratedAgent.run 传入的一致），
+                                # 回退到 authority.run_id（per-tool-call 构造），
+                                # 最后才用 "main"（向后兼容）。
+                                real_run_id = (
+                                    getattr(_ctx, "run_id", None)
+                                    or authority.run_id
+                                    or "main"
+                                )
+                                pending = cm.create(
+                                    run_id=real_run_id,
+                                    thread_id=thread_id,
+                                    project_id=thread.project_id,
+                                    principal=principal,
+                                    tool_name=_name,
+                                    arguments=_args,
+                                )
+                                # 把 request_id 写入决策 metadata
+                                try:
+                                    auth_decision.metadata["request_id"] = pending.request_id
+                                except Exception:
+                                    pass
+                                # R1 round 4：runtime 提供 wait 接口时，
+                                # 在 Agent 线程中挂起等待 API 决议，
+                                # 而非直接 raise 结束本 run。
+                                if runtime_obj is not None and hasattr(
+                                    runtime_obj, "wait_for_confirmation"
+                                ):
+                                    remaining = max(
+                                        0.0,
+                                        pending.expires_at - time.time(),
+                                    )
+                                    slot = runtime_obj.wait_for_confirmation(
+                                        request_id=pending.request_id,
+                                        run_id=real_run_id,
+                                        thread_id=thread_id,
+                                        tool_name=_name,
+                                        ttl_seconds=remaining,
+                                        cancellation_token=getattr(
+                                            _ctx, "cancellation_token", None
+                                        ),
+                                    )
+                                    outcome = slot.get("outcome", "expired")
+                                    if outcome == "executed":
+                                        # 工具实际执行结果回灌到 working_messages，
+                                        # 让模型继续推进。
+                                        return slot.get("result") or ""
+                                    # 拒绝/过期/取消/失败：合成错误结果反馈给模型
+                                    err = slot.get("error", "confirmation " + outcome)
+                                    return json.dumps(
+                                        {
+                                            "ok": False,
+                                            "error": f"confirmation_{outcome}: {err}",
+                                            "unknown": True,
+                                        }
+                                    )
+                            raise ToolAuthorizationError(auth_decision)
+                        # 授权通过：记录已授予能力，供 handler（如 subagent_submit）读取并传递
+                        _ctx.granted_capabilities = default_caps
                     # 真正发起调用前原子消费额度（成功/失败都计）
                     if self._budget is not None:
                         self._budget.consume_tool_call()

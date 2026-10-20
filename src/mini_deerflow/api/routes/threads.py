@@ -143,6 +143,24 @@ def get_thread(
     return thread_to_detail(thread.thread_id, messages, thread.project_id, thread.last_run_result)
 
 
+@router.get(
+    "/threads/{thread_id}/active_run",
+    summary="TOOL-05：返回 thread_id 当前活跃 run_id；无活跃返回 null",
+    description=(
+        "只读探针：通过协调器加锁读。无活跃返回 200 {run_id: null}。"
+    ),
+)
+def get_active_run(
+    thread_id: str,
+    runtime: RuntimeContext = Depends(get_runtime),
+) -> dict:
+    coordinator = getattr(runtime, "thread_run_coordinator", None)
+    if coordinator is None:
+        return {"run_id": None}
+    run_id = coordinator.get_running(thread_id)
+    return {"run_id": run_id}
+
+
 @router.delete(
     "/threads/{thread_id}",
     status_code=status.HTTP_204_NO_CONTENT,

@@ -72,6 +72,14 @@ class ThreadRunCoordinator:
         with self._lock:
             return len(self._running)
 
+    def get_running(self, thread_id: str) -> str | None:
+        """TOOL-05：返回当前占用 thread_id 的 run_id；无占用返回 None。
+
+        加锁读，与 try_acquire/release 互斥，避免读到中间状态。
+        """
+        with self._lock:
+            return self._running.get(thread_id)
+
     def shutdown(self) -> None:
         """清空占用表；幂等，重复调用安全。"""
         with self._lock:
