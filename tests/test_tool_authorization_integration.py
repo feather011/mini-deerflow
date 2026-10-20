@@ -462,3 +462,65 @@ def test_mini_subagent_cannot_delegate_to_subagent():
     assert decision.kind == AccessDecisionKind.DENY
     assert decision.reason_code == "principal_not_allowed"
 
+
+# ---------------------------------------------------------------------------
+# TOOL-07：子 Agent 授权不随派发扩大
+# ---------------------------------------------------------------------------
+
+
+def test_subagent_authority_not_expanded_by_dispatch_roundtrip():
+    """派发回来的结果不扩大子 Agent 的授权。
+
+    子 Agent 拿到父授予的能力集合后，即使父在别处持有更强能力，
+    子 Agent 的 RunAuthority 也只能用它自己那套。
+    """
+    registry = ToolPolicyRegistry()
+
+    # 父（主代理）持有 PROJECT_EXEC_DELEGATE
+    parent_authority = RunAuthority(
+        principal=ExecutorPrincipal.MAIN_AGENT,
+        thread_id="t-1", run_id="r1", project_id="p1",
+        granted_capabilities=frozenset({
+            ToolCapability.PROJECT_READ,
+            ToolCapability.PROJECT_EXEC_DELEGATE,
+        }),
+    )
+    assert check_tool_access(
+        registry, "project_execute", parent_authority
+    ).kind is not AccessDecisionKind.DENY
+
+    # 子 Agent 只被授予 PROJECT_READ（派发后回来的结果不改这一点）
+    child_authority = RunAuthority(
+        principal=ExecutorPrincipal.MINI_SUBAGENT,
+        thread_id="t-1", run_id="r2", project_id="p1",
+        granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
+    )
+    decision = check_tool_access(registry, "project_execute", child_authority)
+    assert decision.kind is AccessDecisionKind.DENY, (
+        f"子 Agent 不应具备派发执行能力: {decision}"
+    )
+
+
+def test_subagent_authority_is_thread_scoped():
+    """子 Agent 的授权绑定到它自己的 run_id，不能借用父的 run_id。"""
+    registry = ToolPolicyRegistry()
+
+    child_authority = RunAuthority(
+        principal=ExecutorPrincipal.MINI_SUBAGENT,
+        thread_id="t-1", run_id="r-child", project_id="p1",
+        granted_capabilities=frozenset({ToolCapability.COMPUTE}),
+    )
+    # 父的 run_id 不该出现在子 Agent 的授权里
+    assert child_authority.run_id == "r-child"
+    assert child_authority.principal is ExecutorPrincipal.MINI_SUBAGENT
+
+    # 拿父的 run_id 构造 authority，principal 仍是子，结论不变
+    borrowed = RunAuthority(
+        principal=ExecutorPrincipal.MINI_SUBAGENT,
+        thread_id="t-1", run_id="r-parent", project_id="p1",
+        granted_capabilities=frozenset({ToolCapability.COMPUTE}),
+    )
+    a = check_tool_access(registry, "project_execute", child_authority)
+    b = check_tool_access(registry, "project_execute", borrowed)
+    assert a.kind is b.kind, "run_id 不应改变授权结论"
+
