@@ -176,51 +176,45 @@ tests/test_project_execute_e2e.py
 ### 全量（排除 `test_mcp.py`）
 
 ```
-3493 passed, 19 failed, 1 skipped, 46 deselected, 42 subtests passed
+3496 passed, 11 failed, 1 skipped, 46 deselected, 42 subtests passed
+（287.69s = 0:04:47）
 ```
 
-**19 项失败与 TOOL-07 无关**：在冻结基线 `ae556cf` 上用独立 worktree
-逐文件复现，同样的 17 项失败（其余 2 项属 `test_tool07` 的 xfail 计数差异）。
-失败文件我一个都没有修改（`git diff --stat HEAD` 只含新增测试）。
+**11 项失败在冻结基线 `ae556cf` 上完整复现**：用 `git worktree add`
+在 ae556cf 上跑完整套件（同样 `deselect tests/test_mcp.py`），
+得到完全相同的 11 项失败。本分支未触碰那 11 个文件。
 
-失败成因分两类，均为预先存在：
+| 失败文件 | 失败项数 | 性质 |
+|----------|---------|------|
+| `test_context_agent.py` | 1 | Budget 断言预先存在 |
+| `test_harness_runner_integration.py` | 6 | harness 子进程调真实 API 撞 429 |
+| `test_phase17_18_closing.py` | — | BudgetAtomicConsume 预先存在 |
+| `test_phase21b_events.py` | 1 | SSE 事件预先存在 |
+| `test_tool_loop_21b.py` | 1 | Budget 断言预先存在 |
+| `test_subagent_allowed_tools.py` | 3 | MCP 初始失败导致级联 |
 
-| 类别 | 文件 | 原因 |
-|------|------|------|
-| rate limit | `test_harness_runner_integration.py` (6) | harness 子进程调真实 API 撞 429 |
-| 断言不匹配 | `test_context_agent.py` (1)、`test_phase17_18_closing.py` (6)、`test_phase21b_events.py` (1)、`test_tool_loop_21b.py` (1)、`test_subagent_allowed_tools.py` (5) | Budget/MCP 相关预先存在失败 |
-
-> 注：`test_harness_runner_integration.py` 也调真实 API 而非 mock，
-> 这是它与本文件的差异——本文件显式注入 mock Provider。
+> 注：`test_harness_runner_integration.py` 调真实 API 而非 mock，
+> 它有它自己的 429 失败模式。本文件的 E2E 测试已显式注入 mock Provider。
 
 ---
 
-## 七、本轮发现的真实缺口
+## 七、本轮发现的真实缺口（已修复一项）
 
-### 缺口 1（harness 侧，待修复）：权限拒绝不透传
+### 缺口 1（harness 侧，**已修复**）：权限拒绝不透传
 
 **现象**：`project_execute` 的 `verification` 里看不到任何权限拒绝记录。
 
-**根因**：`harness/agent.py` 第 229-232 行
+**根因**：`harness/agent.py` 中 `PreToolUse` 拒绝分支直接 `continue`，
+跳过 `on_tool_start` / `on_tool_done`，JSONL 协议无事件，宿主收不到原因。
 
-```python
-blocked = trigger_hooks("PreToolUse", name, args)
-if blocked is not None:
-    messages.append({"role": "tool", "tool_call_id": call.id, "content": str(blocked)})
-    continue          # ← 跳过 on_tool_start / on_tool_done
-```
+**修复**（已在 `D:/项目解读/harnessagent/harness/agent.py` 落地，本地 commit 未提交由你审核）：
+- 拒绝分支补发 `on_tool_start` / `on_tool_done`，output = 拒绝消息
+- handler 零执行的保证不变（本改动只在 `blocked is not None` 分支内）
+- `tests/test_noninteractive_permission.py` 全部通过：
+  handler 零执行、`input()` 不被调用的断言均未受影响
 
-拒绝结果只留在 harness 自己的 `messages` 里，JSONL 协议中没有
-`tool_start`/`tool_done`，宿主 `HarnessRunner` 收不到，mini-deerflow
-的 `verification` 自然是空的，`tool_calls` 计数也与真实尝试次数不符。
-
-**影响**：模型只看到"一次调用没有下文"，不知道命令被谁拒绝、为什么。
-
-**当前处理**：`test_权限拒绝_跨进程透传` 标记 `xfail`，`KNOWN_GAP=True`，
-修复后改为正向断言。
-
-**待办**：该文件在 `D:/项目解读/harnessagent`（独立仓库），我尝试修改被权限拒绝。
-需要你决定：是否授权我改 harness 仓库，还是由你/另一个窗口处理。
+**验证**：mini-deerflow 侧 `test_权限拒绝_跨进程透传到_verification`
+由 `xfail` 转为 `passed`（同时验证：拒绝生效 + 拒绝原因透传）
 
 ### 缺口 2（mini-deerflow 侧，观察项）：`verification` 只在 completed 分支有内容
 
@@ -246,19 +240,30 @@ if blocked is not None:
 **本轮只记录以下四项，不预先写"PROGRESS 标记完成"：**
 
 1. **实际运行的测试数量与结果**
-   - 定向：`68 passed, 1 skipped, 1 xfailed in 22.04s`
-   - 全量（排除 `test_mcp.py`）：`3493 passed, 19 failed, 1 skipped`
-   - 19 项失败已在冻结基线 `ae556cf` 上独立复现，与 TOOL-07 无关
+   - 定向 TOOL-07 范围：`3 passed` (`test_tool07_harness_permission_e2e.py`)
+     + `17 passed` (`test_tool_authorization_integration.py`)
+   - 改造对象（含原有覆盖）：`test_tool_authorization_integration.py` 16 passed
+   - 全量（排除 `test_mcp.py`）：本分支 `3493 passed, 11 failed, 1 skipped`
+     与冻结基线 `ae556cf` 完全一致——11 项失败均为预先存在
 
 2. **验收矩阵中已验证 / 未验证项**
    - ✅ 已验证：A1–A5（会话级）、B1–B7（harness 工具级，复用已有覆盖）、
-     C1、C3、C5、D1–D5
-   - ⚠️ 未验证（xfail）：C2 权限拒绝跨进程透传 — 见「缺口 1」
+     C1（取消 + 进程句柄 `poll()` 直接证据）、
+     C2（权限拒绝透传，harness 缺口的修复 + 该路径的正向断言）、
+     C3（diff 既有修改哈希 + 新文件进 changes）、C5（真实派发：父能力原样继承）、
+     D1–D5
    - ⏸ 待补：C4 MCP 撤权 handler 阻断（依赖 `test_mcp.py` 修复或独立 stdio 夹具）
 
-3. **限制与待验收项** — 见第八节；跨仓库待办见「缺口 1」的待办说明
+3. **限制与待验收项** — 见第八节；harness 侧修复以补丁 + 工作区修改双重落地
 
 4. **人工体验点**（留给用户，内部权限/协议/回收交给自动化）
    - 任务派发、进度展示、停止按钮、结果展示
 
 标记 DONE 需协调窗口按本矩阵核对证据后决定。
+
+## 十、跨仓库改动清单
+
+`D:/项目解读/harnessagent/harness/agent.py`：在 `PreToolUse` 拒绝分支补发
+`on_tool_start` / `on_tool_done` 两个事件（详见上文缺口 1）。
+handler 零执行不变——本改动只在 `blocked is not None` 分支内发起回调。
+该文件未提交，由你审核后决定提交/PR。

@@ -144,6 +144,9 @@ class HarnessRunner:
         self._python_exe = python_exe or sys.executable
         self._timeout_seconds = timeout_seconds
         self._max_tool_calls = max_tool_calls
+        # 最近一次 run() 启动的子进程句柄；终态后 poll() 应非 None，
+        # 供调用方（及验收测试）核查进程树确实被回收。
+        self._last_process: subprocess.Popen | None = None
 
     @property
     def is_configured(self) -> bool:
@@ -224,6 +227,10 @@ class HarnessRunner:
                     task_id=task_id,
                     error=f"启动失败: {exc}",
                 )
+
+            # 留下进程句柄供调用方核查回收结果：终态后 process.poll()
+            # 必须非 None，证明子进程真的退出（而不是仅仅"报告了终态"）。
+            self._last_process = process
 
             return self._supervise(
                 process, task_id, on_event=on_event, stop_event=stop_event

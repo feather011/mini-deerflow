@@ -374,19 +374,25 @@ def test_取消_子进程启动后_进程树回收(mock_env, tmp_path):
     assert elapsed < 20.0, (
         f"取消应在 sleep 30 结束前返回，实际耗时 {elapsed:.2f}s"
     )
-
-    # 4) 回收时机必须在 sleep 结束之前，且远快于 30s
-    #
-    #    进程树回收由 `_terminate_process_tree` 用 `taskkill /PID <pid> /T /F`
-    #    完成，`/T` 覆盖整棵子树（bash 及其 sleep 孙进程）。
-    #    不用 CIM/PID 断言：Windows 上进程退出后 PID 仍会留在
-    #    `Get-CimInstance` 的结果里一段时间，会误报"残留"。
-    #    这里断言返回远早于 sleep 的 30s，且状态是 stopped 而非 timeout。
-    assert elapsed < 20.0, (
-        f"取消应在 sleep 30 结束前返回，实际耗时 {elapsed:.2f}s"
-    )
     assert result.get("status") == "stopped", (
         f"应由取消触发停止（stopped），而不是等到超时（timeout）: {result}"
+    )
+
+    # 4) 进程真的被回收（直接证据，不靠时间推断）
+    #
+    #    `_terminate_process_tree` 用 `taskkill /PID <pid> /T /F` 杀整棵子树
+    #    （`/T` 覆盖 bash 与 sleep 孙进程），随后 `process.wait()`。
+    #    终态返回后句柄必须已收割——poll() 非 None 表示子进程已退出。
+    #    不用 CIM/PID 断言：Windows 上进程退出后 PID 仍会留在
+    #    `Get-CimInstance` 结果里一段时间，会误报"残留"。
+    proc = runner._last_process
+    assert proc is not None, "HarnessRunner 未记录子进程句柄"
+    for _ in range(50):  # 最多等 5s 兜底
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    assert proc.poll() is not None, (
+        f"取消后子进程未被回收：poll() 仍为 None（pid={proc.pid}）"
     )
 
 
@@ -398,22 +404,14 @@ def test_取消_子进程启动后_进程树回收(mock_env, tmp_path):
 def test_权限拒绝_跨进程透传到_verification(mock_env, tmp_path):
     """harness 的三道闸拒绝结果必须回到 project_execute.verification。
 
-    当前实测：**拒绝生效，但不透传**。
+    两条断言，缺一不可：
 
-    - harness 侧确实拒绝了（它的 messages 里是 "Permission denied:
-      dangerous command 'rm -rf /'"），危险命令没有执行
-    - 但 `harness/agent.py` 在 `trigger_hooks("PreToolUse")` 返回拒绝时
-      直接 `continue`，跳过了 `on_tool_start` / `on_tool_done`，
-      JSONL 协议里因此没有这两条事件
-    - 后果：mini-deerflow 的 `project_execute.verification` 收不到任何
-      拒绝记录，`tool_calls` 计数也与真实尝试次数不符，
-      模型只看到"一次调用没有下文"
-
-    本测试锁定"拒绝确实生效"（副作用未发生），并显式标注透传缺口，
-    避免把前者误当成后者。harness 修复后把 KNOWN_GAP 改为 False。
+    1. **拒绝生效**：handler 零执行（工作区里只有写入的文件，
+       `rm -rf /` 没有造成任何副作用）
+    2. **拒绝透传**：`verification` 里能看到拒绝命令和拒绝原因
+       （此前 harness/agent.py 在 PreToolUse 拒绝后直接 continue，
+       跳过 on_tool_start/on_tool_done，JSONL 无事件，宿主收不到原因）
     """
-    KNOWN_GAP = True  # harness 侧修复后改为 False
-
     url = mock_env({
         "tools": [
             {
@@ -432,34 +430,31 @@ def test_权限拒绝_跨进程透传到_verification(mock_env, tmp_path):
 
     result, _pid = _run_project_execute(runner, repo_path=repo)
 
-    # 1) 危险命令的副作用没有发生：拒绝在 handler 之前生效
+    # 1) 危险命令的副作用没有发生：拒绝在 handler 之前生效（handler 零执行）
     assert repo.is_dir(), "工作区目录不应被删除"
     files_on_disk = sorted(p.name for p in repo.iterdir())
     assert files_on_disk == ["must_survive.txt"], (
         f"工作区出现预期外文件（rm -rf / 未被拒绝？）: {files_on_disk}"
     )
 
-    # 2) 拒绝记录是否透传到 verification
+    # 2) 拒绝记录透传到 verification
     verification = result.get("verification", [])
     denied = [
         v for v in verification
         if "Permission denied" in str(v.get("output", ""))
     ]
-
-    if KNOWN_GAP:
-        assert not verification, (
-            f"已知缺口：拒绝事件未透传，verification 应为空。实际: {verification}"
-        )
-        pytest.xfail(
-            "已知缺口（harness 侧）：harness/agent.py 在 PreToolUse 拒绝时"
-            "跳过 on_tool_start/on_tool_done，JSONL 无拒绝事件，"
-            "project_execute.verification 收不到拒绝记录。"
-            "拒绝本身生效（工作区完好）。"
-        )
-
     assert denied, (
         f"拒绝记录未透传回 verification："
         f"{[v.get('output') for v in verification]}"
+    )
+
+    # 拒绝原因要让模型读得懂：命令本身 + 拒绝消息
+    record = denied[0]
+    assert "rm -rf /" in str(record.get("command", "")), (
+        f"拒绝记录应含被拒命令: {record}"
+    )
+    assert result.get("status") == "completed", (
+        f"任务整体应正常完成（拒绝是单次工具级事件）: {result}"
     )
 
 

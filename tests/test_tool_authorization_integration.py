@@ -3,6 +3,8 @@
 验证 Runtime 注入、模型可见性过滤、Subagent 权限隔离的端到端行为。
 """
 
+import json
+
 import pytest
 
 from mini_deerflow.agent import Agent
@@ -523,4 +525,89 @@ def test_subagent_authority_is_thread_scoped():
     a = check_tool_access(registry, "project_execute", child_authority)
     b = check_tool_access(registry, "project_execute", borrowed)
     assert a.kind is b.kind, "run_id 不应改变授权结论"
+
+
+# ---------------------------------------------------------------------------
+# TOOL-07 C5：真实派发链路的授权证据
+# （不是直接构造 authority 调 check_tool_access，而是走
+#  _SubmitHandler → SubagentManager.submit → task → runner → BudgetAwareAgent）
+# ---------------------------------------------------------------------------
+
+
+def test_subagent_dispatch_inherits_parent_caps_exactly():
+    """真实派发：父授 PROJECT_READ，子代理的 authority 就只含 PROJECT_READ。
+
+    证据链：
+      _SubmitHandler(从 ExecutionContext 取 granted_capabilities)
+        → SubagentManager.submit(parent_granted_capabilities=...)
+        → task.parent_granted_capabilities
+        → runner 构造 _BudgetAwareAgent(parent_granted_capabilities=task 的值)
+        → BudgetAwareAgent.run 里 get_authority(principal=MINI_SUBAGENT)
+    任一环节丢能力，下面的断言都会失败。
+    """
+    from mini_deerflow.subagent_executor import SubagentBudget, SubagentManager
+    from mini_deerflow.subagent_tools import _SubmitHandler
+
+    registry = ToolRegistry()
+    policy_registry = ToolPolicyRegistry()
+    store = InMemoryThreadStore()
+    store.create("t-sub-dispatch")
+
+    parent_caps = frozenset({
+        ToolCapability.COMPUTE,
+        ToolCapability.PROJECT_READ,   # 有 PROJECT_READ，但没有 PROJECT_EXEC_DELEGATE
+    })
+
+    manager = SubagentManager(
+        max_concurrency=1,
+        max_depth=3,
+        max_tasks_per_parent=10,
+        default_timeout=30.0,
+        default_budget=SubagentBudget(max_steps=3),
+        tool_policy_registry=policy_registry,
+        thread_store=store,
+    )
+    handler = _SubmitHandler(
+        manager=manager,
+        parent_run_id="parent-run-1",
+        parent_thread_id="t-sub-dispatch",
+        depth=1,
+        thread_store=store,
+    )
+
+    # 与 ExecutionContext 同构的上下文，携带父授权能力
+    ctx = type("Ctx", (), {
+        "run_id": "parent-run-1",
+        "thread_id": "t-sub-dispatch",
+        "granted_capabilities": parent_caps,
+    })()
+
+    data = json.loads(handler(
+        {"instruction": "只读检索任务"},
+        ctx,
+    ))
+    assert data.get("ok"), f"派发应成功: {data}"
+
+    # 断言：manager 里存下的 task 持有父授权能力的**原样副本**
+    task_id = data["task_id"]
+    task = manager._tasks[task_id]
+    assert task.parent_granted_capabilities == parent_caps, (
+        f"子任务能力应与父授权完全一致: {task.parent_granted_capabilities}"
+    )
+
+    # 断言：用这些能力构造的子 Agent authority，仍不具备派发执行能力
+    authority = policy_registry.get_authority(
+        thread_id="t-sub-dispatch",
+        run_id=task_id,
+        project_id=None,
+        granted_capabilities=task.parent_granted_capabilities,
+        principal=ExecutorPrincipal.MINI_SUBAGENT,
+    )
+    assert check_tool_access(
+        policy_registry, "project_execute", authority
+    ).kind is AccessDecisionKind.DENY, "子 Agent 不应能派发执行"
+
+    # 断言：能力集合里确实有 PROJECT_READ（证明不是"空集合所以被拒"）
+    assert ToolCapability.PROJECT_READ in task.parent_granted_capabilities
+    assert ToolCapability.PROJECT_EXEC_DELEGATE not in task.parent_granted_capabilities
 
