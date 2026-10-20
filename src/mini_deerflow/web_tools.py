@@ -951,12 +951,14 @@ class _PinAddrTransport(httpx.BaseTransport):
         # R3-fix：发送和读取都在 try/finally 内，确保超时/异常时 socket 仍被关闭
         try:
             sock.sendall(request_data)
-        except (socket.timeout, TimeoutError) as exc:
+        except Exception as exc:
             try:
                 sock.close()
             except Exception:
                 pass
-            raise WebToolNetworkError(f"发送请求超时: {exc}") from exc
+            if isinstance(exc, (socket.timeout, TimeoutError)):
+                raise WebToolNetworkError(f"发送请求超时: {exc}") from exc
+            raise WebToolNetworkError(f"发送请求失败: {exc}") from exc
 
         # 3. 读 HTTP 响应（直接用 sock.recv，不再用 makefile 缓冲）
         #    每次 recv 都受剩余总时间约束，max_bytes 精确控制总读量
@@ -1016,6 +1018,7 @@ class _PinAddrTransport(httpx.BaseTransport):
             chunks: list[bytes] = []
             total = 0
             eof_reached = False
+            chunked_complete = False  # chunked 编码：是否收到终结块 0\r\n\r\n
 
             def _recv_exact(n: int) -> bytes | None:
                 """从 socket 精确读 n 字节（EOF 或超限返回 None）。"""
@@ -1040,7 +1043,7 @@ class _PinAddrTransport(httpx.BaseTransport):
 
             def _read_more() -> None:
                 """从 socket 读 body 并累计到 chunks。"""
-                nonlocal total, truncated, eof_reached
+                nonlocal total, truncated, eof_reached, chunked_complete
                 if transfer_encoding_chunked:
                     # chunked 编码：<size>\r\n<data>\r\n...
                     while True:
@@ -1049,6 +1052,9 @@ class _PinAddrTransport(httpx.BaseTransport):
                             return
                         size_line = _recv_until_delim()
                         if not size_line:
+                            # chunked 未读到终结块就 EOF → 提前断开
+                            eof_reached = True
+                            truncated = True
                             return
                         try:
                             size = int(size_line.strip(), 16)
@@ -1056,6 +1062,7 @@ class _PinAddrTransport(httpx.BaseTransport):
                             return
                         if size == 0:
                             _recv_until_delim()  # 末尾 \r\n
+                            chunked_complete = True  # 收到终结块
                             return
                         # 读当前 chunk 的 size 字节，严格限制在 chunk 边界内
                         chunk_remaining = size
@@ -1110,12 +1117,15 @@ class _PinAddrTransport(httpx.BaseTransport):
 
         body = b"".join(chunks)
         _check_deadline()
-        # R3-fix：有 Content-Length 但提前 EOF → 服务器异常断开，标记 truncated
+        # R3-fix：判断 truncated 的完整逻辑
         if eof_reached and content_length is not None and total < content_length:
+            # 有 Content-Length：服务器声明 N 字节但提前 EOF → truncated
             truncated = True
-        elif content_length is None and eof_reached and total < max_bytes:
-            # 无 Content-Length + 自然 EOF：内容完整，未超限
-            truncated = False
+        elif eof_reached and transfer_encoding_chunked and not chunked_complete:
+            # chunked 编码：未收到终结块 0\r\n\r\n 就 EOF → truncated
+            truncated = True
+        # 其余情况（close-delimited 完整响应、无 Content-Length 自然读完、max_bytes 截断）
+        # truncated 保持 False 或已在 _read_more 中设为 True
         header_dict.append(("X-Transport-Truncated", "1" if truncated else "0"))
         stream = httpx.ByteStream(body)
         return httpx.Response(

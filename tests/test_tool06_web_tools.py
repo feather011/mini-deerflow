@@ -1812,6 +1812,14 @@ class _Tool06HTTPHandler:
                     self.end_headers()
                     self.wfile.write(b"hello")  # 只发 5 字节
                     self.close_connection = True
+                elif path == "/chunkearly":
+                    # Transfer-Encoding: chunked，但发完第一个 chunk 后不发送终结块就直接 EOF
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(b"5\r\nhello\r\n")  # 只发一个 chunk，不发 "0\r\n\r\n"
+                    self.close_connection = True
                 else:
                     self.send_response(404)
                     self.send_header("Content-Length", "0")
@@ -2022,9 +2030,6 @@ class TestRealTransportR3:
 
         sock = _TimeoutSocket()
 
-        def _mock_connect(addr, timeout=None):
-            return sock
-
         # 注入 mock：让 create_connection 返回我们的超时 socket
         import mini_deerflow.web_tools as wt
         orig_connect = wt.socket.create_connection
@@ -2039,5 +2044,52 @@ class TestRealTransportR3:
                 pass  # 期望的异常
             # R3-fix：socket 必须在异常路径中被关闭
             assert sock.closed, "发送超时时 socket 必须被关闭"
+        finally:
+            wt.socket.create_connection = orig_connect
+
+    def test_chunked_early_eof_truncated(self, local_http_server) -> None:
+        """R3-fix：chunked 编码提前 EOF → 标记 truncated=True。"""
+        base_url, _state = local_http_server
+        tool = _loopback_read_tool(timeout_s=5.0, max_bytes=1024)
+        result = json.loads(tool.execute({"url": f"{base_url}/chunkearly"}))
+        assert result["ok"] is True, result
+        # 发了一个 chunk 后直接 EOF，未收到终结块 0\r\n\r\n
+        assert result["truncated"] is True, f"chunked 提前 EOF 必须标 truncated，实际: {result}"
+        assert result["bytes"] == 5, f"期望 5，实际 {result['bytes']}"
+        assert "hello" in result["text"], f"期望含 'hello'，实际 {result['text']!r}"
+
+    def test_send_non_timeout_exception_closes_socket(self) -> None:
+        """R3-fix：发送时非超时异常（连接重置等）也必须关闭 socket。"""
+        import socket
+        from mini_deerflow.web_tools import _PinAddrTransport, WebToolNetworkError
+
+        class _ResetSocket:
+            def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM):
+                self.family = family
+                self.type = type
+                self.closed = False
+            def settimeout(self, val):
+                pass
+            def sendall(self, data):
+                raise ConnectionResetError("connection reset by peer")
+            def recv(self, n):
+                raise ConnectionResetError("connection reset by peer")
+            def close(self):
+                self.closed = True
+
+        sock = _ResetSocket()
+        import mini_deerflow.web_tools as wt
+        orig_connect = wt.socket.create_connection
+        try:
+            wt.socket.create_connection = lambda addr, timeout=None: sock
+            transport = _PinAddrTransport("127.0.0.1", max_bytes=1024, deadline_monotonic=None)
+            req = httpx.Request("GET", "http://example.com/path")
+            try:
+                transport.handle_request(req)
+                assert False, "应抛 WebToolNetworkError"
+            except WebToolNetworkError as e:
+                assert "重置" in str(e) or "reset" in str(e).lower()
+            # R3-fix：非超时异常也必须关闭 socket
+            assert sock.closed, "非超时发送异常时 socket 也必须被关闭"
         finally:
             wt.socket.create_connection = orig_connect
