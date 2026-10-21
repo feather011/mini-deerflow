@@ -282,7 +282,11 @@ class Agent:
 
             # 停止检查：主任务停止时在步骤开始前退出
             if cancellation_token is not None and cancellation_token.is_cancelled():
-                raise BudgetExceededError("steps", self._budget.max_steps)
+                # 预算可能未启用（API 默认 disable_budget=True），
+                # 此时不能解引用 self._budget，否则取消会变成 AttributeError。
+                raise BudgetExceededError(
+                    "steps", self._budget.max_steps if self._budget is not None else None
+                )
             # 组合发送给模型的完整消息列表：Memory → Skill → history → user
             # 每次循环重新组合以包含新增的 tool messages
             if self._context_assembler is not None:

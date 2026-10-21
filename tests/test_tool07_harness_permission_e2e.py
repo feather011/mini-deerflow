@@ -99,6 +99,12 @@ class _MockServer:
         self._scenario = scenario
         self._calls = []
 
+        class _SingleUseHTTPServer(http.server.HTTPServer):
+            # 不允许复用地址：端口被占用时直接 bind 失败（扫描下一个），
+            # 否则 Windows 上多实例可共享同一端口，请求会落到别的实例，
+            # 表现为"拿到别的用例的 scenario"这类跨实例污染。
+            allow_reuse_address = False
+
         def _make_handler():
             class H(http.server.BaseHTTPRequestHandler):
                 protocol_version = "HTTP/1.0"
@@ -167,7 +173,7 @@ class _MockServer:
         handler_cls = _make_handler()
         for port in range(19800, 19990):
             try:
-                self._srv = http.server.HTTPServer(("127.0.0.1", port), handler_cls)
+                self._srv = _SingleUseHTTPServer(("127.0.0.1", port), handler_cls)
                 self._srv._mock_server = self  # type: ignore[attr-defined]
                 self._port = port
                 break

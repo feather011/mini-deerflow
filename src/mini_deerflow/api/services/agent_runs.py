@@ -269,6 +269,12 @@ class AgentRunService:
                     thread_id, message, run_id=run_id, cancellation_token=cancellation_token
                 )
             except BudgetExceededError as exc:
+                # 主动停止：取消令牌已置位 → 报"已取消"，不是预算耗尽。
+                # 与 finally 中的 cancelled 判定保持一致（同一事实、同一语义），
+                # 否则 SSE 终态会退化成 run.failed，前端无法区分
+                # "用户点了停止" 与 "任务真的失败"。
+                if cancellation_token is not None and cancellation_token.is_cancelled():
+                    raise AgentRunCancelledError(thread_id, run_id) from exc
                 # 根据 resource 区分"主动停止"与"模型超时"
                 if exc.resource == "model_call_timeout":
                     raise AgentRunTimeoutError(
