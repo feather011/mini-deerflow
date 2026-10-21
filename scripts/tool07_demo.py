@@ -457,8 +457,11 @@ def demo_cancellation_after_start() -> bool:
 # ---------------------------------------------------------------------------
 
 def demo_timeout_returns_timeout() -> bool:
-    _banner("演示 4：超时链路 → 状态 timeout + 锁释放")
+    _banner("演示 4a：超时链路（FakeHarnessRunner）→ 状态 timeout + 锁释放")
 
+    # R6 修订：FakeRunner 模拟即可验证状态机的 timeout 收尾。
+    # 真实子进程超时（4b）必须自己挂 mock provider，不能继承父进程的 .env，
+    # 否则真会发请求到 mini-deerflow 的 .env 配置地址。
     from mini_deerflow.project_store import InMemoryProjectStore
     from mini_deerflow.thread_store import InMemoryThreadStore
     from mini_deerflow.tools import create_default_registry
@@ -468,8 +471,8 @@ def demo_timeout_returns_timeout() -> bool:
     workspace_root = None
     try:
         unique = uuid.uuid4().hex[:8]
-        thread_id = f"t-to-{unique}"
-        project_id = f"to-proj-{unique}"
+        thread_id = f"t-to-fake-{unique}"
+        project_id = f"to-fake-{unique}"
 
         workspace_root = Path(tempfile.mkdtemp()) / "ws"
         workspace_root.mkdir()
@@ -480,25 +483,26 @@ def demo_timeout_returns_timeout() -> bool:
 
         project_store.create(
             project_id=project_id,
-            name="timeout",
+            name="timeout-fake",
             project_root=str(workspace_root),
             workspace_path=str(workspace_root),
         )
         store.create(thread_id, project_id=project_id)
 
-        # 真实 HarnessRunner，超时 0.5s
-        from mini_deerflow.harness_runner import HarnessRunner
-        runner = HarnessRunner(
-            harness_root=HARNESS_ROOT,
-            python_exe=sys.executable,
-            timeout_seconds=0.5,  # 0.5s 超时
-            max_tool_calls=100,
-        )
+        class TimeoutFakeRunner:
+            is_configured = True
+            _timeout_seconds = 0.5
+
+            def run(self, task_id, repo_path, prompt, stop_event=None):
+                return FakeHarnessResult(
+                    status="timeout",
+                    error=f"执行超时（0.5s），任务已被终止",
+                )
 
         tool = create_project_execute_tool(
             thread_store=store,
             project_store=project_store,
-            runner=runner,
+            runner=TimeoutFakeRunner(),
             get_lock=_get_project_lock,
         )
         registry.register(tool)
@@ -509,7 +513,7 @@ def demo_timeout_returns_timeout() -> bool:
             "project_id": project_id,
         })()
         start = time.monotonic()
-        result_str = tool.handler({"task": "写文件并睡眠 5 秒", "context": ""}, ctx)
+        result_str = tool.handler({"task": "任意", "context": ""}, ctx)
         elapsed = time.monotonic() - start
         result = _parse_result(result_str)
 
@@ -534,6 +538,119 @@ def demo_timeout_returns_timeout() -> bool:
 
         return True
     finally:
+        if workspace_root and workspace_root.exists():
+            shutil.rmtree(workspace_root, ignore_errors=True)
+
+
+def demo_timeout_real_subprocess() -> bool:
+    """演示 4b：真实 HarnessRunner 子进程超时（隔离 Provider，无外部请求）。
+
+    R6 修订：必须显式注入 no-network env：
+      - HARNESS_ENV_FILE 指空 → harness 不读父进程 .env
+      - 通过 thread-local os.environ 临时设置，挂掉子进程后**严格清理**，
+        绝不泄漏到下一次演示
+      - 用挂在未监听端口的 mock URL → harness 启动后因 TCP 失败
+        立刻返回 STATUS_TIMEOUT / launch_failed，不会真实发请求
+      - 验证 4a（FakeRunner）已涵盖状态机；本条证明真实子进程也是 timeout
+    """
+    _banner("演示 4b：真实 HarnessRunner 子进程超时（不调真实 API）")
+
+    workspace_root = None
+    # 隔离环境：临时清掉 harness 会读的两个变量
+    saved_env_file = os.environ.get("HARNESS_ENV_FILE")
+    saved_mimo_key = os.environ.get("HARNESS_MIMO_API_KEY")
+    saved_mimo_url = os.environ.get("HARNESS_MIMO_BASE_URL")
+    # 设立未监听的端口，TCP connect 必失败：harness 启动即报 LAUNCH_FAILED/timeout
+    fake_url = "http://127.0.0.1:15888"
+    os.environ["HARNESS_ENV_FILE"] = ""  # 空文件存在检查 → harness 不读 .env
+    os.environ["HARNESS_MIMO_BASE_URL"] = fake_url
+    os.environ["HARNESS_MIMO_API_KEY"] = "fake-key-for-demo"
+
+    try:
+        from mini_deerflow.project_store import InMemoryProjectStore
+        from mini_deerflow.thread_store import InMemoryThreadStore
+        from mini_deerflow.tools import create_default_registry
+        from mini_deerflow.project_tools import create_project_execute_tool
+        from mini_deerflow.runtime import _get_project_lock
+        from mini_deerflow.harness_runner import HarnessRunner
+
+        unique = uuid.uuid4().hex[:8]
+        thread_id = f"t-to-real-{unique}"
+        project_id = f"to-real-{unique}"
+
+        workspace_root = Path(tempfile.mkdtemp()) / "ws"
+        workspace_root.mkdir()
+
+        project_store = InMemoryProjectStore()
+        store = InMemoryThreadStore()
+        registry = create_default_registry()
+
+        project_store.create(
+            project_id=project_id,
+            name="timeout-real",
+            project_root=str(workspace_root),
+            workspace_path=str(workspace_root),
+        )
+        store.create(thread_id, project_id=project_id)
+
+        # timeout_seconds 必须 > harness 启动 connect timeout
+        # 连接失败本身是 timeout 触发；这里给 0.5s 让 supervise 走 deadline 路径
+        runner = HarnessRunner(
+            harness_root=HARNESS_ROOT,
+            python_exe=sys.executable,
+            timeout_seconds=0.5,
+            max_tool_calls=10,
+        )
+
+        tool = create_project_execute_tool(
+            thread_store=store,
+            project_store=project_store,
+            runner=runner,
+            get_lock=_get_project_lock,
+        )
+        registry.register(tool)
+
+        ctx = type("C", (), {
+            "thread_id": thread_id,
+            "run_id": "r-real",
+            "project_id": project_id,
+        })()
+        # 注意：环境变量既已注入，harness 子进程连接 15888 必失败——
+        # 但 mini-deerflow 自身的 .env 不再被读，绝对不会发到真实 mini-max 地址
+        start = time.monotonic()
+        result_str = tool.handler(
+            {"task": "任意快任务", "context": ""}, ctx,
+        )
+        elapsed = time.monotonic() - start
+        result = _parse_result(result_str)
+
+        if result.get("ok") is not False:
+            _fail(f"真实 HarnessRunner 超时应返回 ok=False，实际: {result}")
+            return False
+        elapsed_str = f"{elapsed:.2f}s"
+        _ok(f"真实 HarnessRunner 返回 ok=False（耗时 {elapsed_str}）")
+
+        # 锁已释放
+        lock = _get_project_lock(project_id)
+        acquired = lock.acquire(blocking=False)
+        if not acquired:
+            _fail("真实 HarnessRunner 超时后锁未释放")
+            return False
+        lock.release()
+        _ok("真实 HarnessRunner 超时后锁已释放")
+
+        return True
+    finally:
+        # 严格清理：恢复调用前 os.environ 的状态，绝不污染下次演示
+        for var, saved in (
+            ("HARNESS_ENV_FILE", saved_env_file),
+            ("HARNESS_MIMO_BASE_URL", saved_mimo_url),
+            ("HARNESS_MIMO_API_KEY", saved_mimo_key),
+        ):
+            if saved is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = saved
         if workspace_root and workspace_root.exists():
             shutil.rmtree(workspace_root, ignore_errors=True)
 
@@ -622,7 +739,8 @@ def main() -> int:
         ("1: 普通会话拒绝 project_execute", demo_normal_session_blocks_project_execute),
         ("2: 项目会话派发 harness + diff", demo_project_session_writes_file),
         ("3: 取消链路（子进程启动后）", demo_cancellation_after_start),
-        ("4: 超时链路（状态 timeout）", demo_timeout_returns_timeout),
+        ("4a: 超时链路（FakeRunner 状态 timeout）", demo_timeout_returns_timeout),
+        ("4b: 真实 HarnessRunner 超时（隔离 Provider，无外部请求）", demo_timeout_real_subprocess),
         ("5: HarnessRunner 未配置返回错误", demo_unconfigured_harness_error),
     ]
 

@@ -885,36 +885,7 @@ def create_project_execute_tool(
             changes["snapshot_complete"] = after_complete
 
             if result.status == STATUS_COMPLETED:
-                # 从 tool_events 提取 bash 命令记录
-                # command: 优先用 full_command（500 字符），否则 args_preview（200 字符截断）
-                # exit_code: 从 bash 输出 "[exit N] output" 格式解析
-                # has_output: 是否有命令输出（不等于"验证通过"）
-                verification: list[dict] = []
-                bash_count = 0
-                for e in result.tool_events:
-                    if e.get("name") == "bash":
-                        bash_count += 1
-                        output = e.get("output", "")
-                        command_preview = e.get("command_preview") or e.get("args_preview", "")
-                        # 解析 exit_code：bash 输出格式 "[exit N] output"
-                        exit_code: int | None = None
-                        if output.startswith("[exit "):
-                            end = output.find("]", 7)
-                            if end > 0:
-                                try:
-                                    exit_code = int(output[6:end])
-                                except ValueError:
-                                    pass
-                        verification.append({
-                            "command": command_preview,
-                            "command_truncated": e.get("command_truncated", False),
-                            "output": output,
-                            "output_truncated": e.get("output_truncated", False),
-                            "exit_code": exit_code,
-                            "duration_s": e.get("duration_s"),
-                            "has_output": bool(output),
-                        })
-
+                verification = _build_verification(result)
                 body = {
                     "ok": True,
                     "status": "completed",
@@ -940,7 +911,7 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
                     "error": result.error or "任务被停止",
                     "tool_events": [
@@ -957,7 +928,7 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
                     "error": f"执行超时（{runner._timeout_seconds}s），任务已被终止",
                     "tool_events": [
@@ -986,7 +957,7 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
                     "error": result.error or f"执行失败（{result.status}）",
                     "tool_events": [
@@ -1039,6 +1010,42 @@ def create_project_execute_tool(
         handler=_as_tool_result("execute", _execute),
         needs_context=True,
     )
+
+
+def _build_verification(result) -> list[dict]:
+    """从 harness 的 tool_events 抽出 bash 命令记录。
+
+    R2 修复：所有终态（completed / stopped / timeout / failed）共用
+    同一段事件转换，未完成的命令不再被伪报为空。模型/UI 可以看到
+    "已经跑过什么/还没跑过什么"——这是 cancelled mid-task 的关键反馈。
+    """
+    verification: list[dict] = []
+    for e in result.tool_events:
+        if e.get("name") != "bash":
+            continue
+        output = e.get("output", "")
+        command_preview = (
+            e.get("command_preview") or e.get("args_preview", "")
+        )
+        # 解析 exit_code：bash 输出格式 "[exit N] output"
+        exit_code: int | None = None
+        if output.startswith("[exit "):
+            end = output.find("]", 7)
+            if end > 0:
+                try:
+                    exit_code = int(output[6:end])
+                except ValueError:
+                    pass
+        verification.append({
+            "command": command_preview,
+            "command_truncated": e.get("command_truncated", False),
+            "output": output,
+            "output_truncated": e.get("output_truncated", False),
+            "exit_code": exit_code,
+            "duration_s": e.get("duration_s"),
+            "has_output": bool(output),
+        })
+    return verification
 
 
 def _require_thread_id(context: object) -> str:

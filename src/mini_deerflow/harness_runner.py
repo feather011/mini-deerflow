@@ -139,11 +139,16 @@ class HarnessRunner:
         python_exe: str | None = None,
         timeout_seconds: float = 600.0,
         max_tool_calls: int = 50,
+        env_file: str | None = None,
     ) -> None:
         self._harness_root = Path(harness_root).resolve() if harness_root else None
         self._python_exe = python_exe or sys.executable
         self._timeout_seconds = timeout_seconds
         self._max_tool_calls = max_tool_calls
+        # 测试隔离：优先用测试传入的 .env 文件路径
+        self._env_file = env_file
+        # 测试注入：直接注入环境变量到子进程（无需 .env 文件）
+        self._extra_env: dict[str, str] = {}
         # 最近一次 run() 启动的子进程句柄；终态后 poll() 应非 None，
         # 供调用方（及验收测试）核查进程树确实被回收。
         self._last_process: subprocess.Popen | None = None
@@ -155,6 +160,14 @@ class HarnessRunner:
             self._harness_root is not None
             and (self._harness_root / "harness" / "noninteractive.py").exists()
         )
+
+    def set_extra_env(self, env: dict[str, str]) -> None:
+        """设置注入子进程的环境变量（覆盖同名变量）。
+
+        测试隔离用：在调用 run() 前设置 mock LLM URL，
+        之后每次 run() 都会注入这些变量，无需 .env 文件。
+        """
+        self._extra_env = dict(env)
 
     def run(
         self,
@@ -186,8 +199,20 @@ class HarnessRunner:
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
         env["PYTHONPATH"] = str(self._harness_root) + os.pathsep + env.get("PYTHONPATH", "")
         env["HARNESS_NONINTERACTIVE"] = "1"
-        # 让 harness 加载 mini-deerflow 的 .env（包含 MINI_MAX 配置）
-        env["HARNESS_ENV_FILE"] = str(Path(__file__).parent.parent.parent / ".env")
+        # 测试隔离：仅当测试注入了 .env 文件时才设置 HARNESS_ENV_FILE。
+        # 此时也要清除真实 API 凭证，防止父进程把 key 传给子进程。
+        # 生产场景（self._env_file=None）不设置此变量，harness 走默认行为。
+        if self._env_file:
+            # 清除真实 API 凭证——测试子进程只能从测试 .env 文件读测试 key
+            env.pop("MINIMAX_API_KEY", None)
+            env.pop("MINIMAX_OPENAI_BASE_URL", None)
+            env.pop("MINIMAX_MODEL", None)
+            env.pop("MIMO_API_KEY", None)
+            env.pop("HARNESS_MIMO_BASE_URL", None)
+            env.pop("HARNESS_MIMO_API_KEY", None)
+            env["HARNESS_ENV_FILE"] = self._env_file
+        # 测试注入：set_extra_env() 设置的环境变量直接覆盖同名变量
+        env.update(self._extra_env)
         if extra_env:
             env.update(extra_env)
 
@@ -207,6 +232,18 @@ class HarnessRunner:
             ]
 
             try:
+                # R1：进程组隔离（让 taskkill /T /F / killpg 精确定向回收）
+                #   - POSIX: start_new_session=True → 新会话组长
+                #   - Windows: CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW
+                # DETACHED_PROCESS 让子进程脱离父 console，CREATE_NO_WINDOW
+                # 抑制启动时一闪而过的命令行窗口。
+                creationflags = 0
+                if sys.platform == "win32":
+                    creationflags = (
+                        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                        | getattr(subprocess, "DETACHED_PROCESS", 0)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    )
                 process = subprocess.Popen(
                     argv,
                     cwd=str(repo_path),
@@ -215,6 +252,8 @@ class HarnessRunner:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     shell=False,
+                    start_new_session=True,
+                    creationflags=creationflags or 0,
                     # bufsize=1 + 文本模式：按行读协议流
                     text=True,
                     encoding="utf-8",
