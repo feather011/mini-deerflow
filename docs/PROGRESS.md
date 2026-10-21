@@ -2464,3 +2464,67 @@ TOOL-02 + Subagent 定向（8 文件）：169 passed in 16.05s
 
 **改动文件**：
 - `tests/test_tool_e2e_behavior.py`（重写）
+
+
+---
+
+### TOOL-07 R1–R6 返修整理 + 提交后复审（2026-10-21）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：mini-deerflow `30090236b38496cd04fa75dcb6e7b50bbb960ac5`（`automation/tool-07`） / harnessagent `89fa546ea7a30cbeefb0f6292b928bd2cb01ce26`（`master`）
+- 当前状态：**READY_FOR_REVIEW**（TOOL-07 尚未通过；不合并、不启动后续模块）
+- 更新时间：2026-10-21
+
+**实际完成内容**
+
+- R1 进程组隔离（POSIX `start_new_session` / Windows `CREATE_NEW_PROCESS_GROUP|DETACHED_PROCESS|CREATE_NO_WINDOW`），保留 `_last_process` 供核查子进程确已退出
+- R2 `project_tools._build_verification()`：completed/stopped/timeout/failed 四终态共用事件转换，不再把未执行的命令伪报为空
+- R3 测试隔离：mock server 场景改实例变量 + 每用例独立临时 `.env`（`HarnessRunner(env_file=...)`），子进程环境清除真实 API 凭证
+- R4 C1 以 `tool_start` 事件为"子进程已存活"证据，取消后才断言进程树回收
+- R5 新增 `test_subagent_dispatch_inherits_parent_caps_exactly` + 2 单元用例（父能力原样继承）
+- R6 harness `.env` 懒加载 + `load_dotenv(override=False)`（环境变量优先于文件）
+- 删除 `docs/patches/0001-permission-denied-events.patch`（已随 harness `f59bef9` 落地）
+
+**改动文件**
+
+- mini-deerflow：`src/mini_deerflow/harness_runner.py`、`src/mini_deerflow/project_tools.py`、`tests/test_tool07_harness_permission_e2e.py`、`tests/test_tool_authorization_integration.py`、`scripts/tool07_demo.py`
+- harnessagent：`harness/config.py`
+
+**接口变化**
+
+- `HarnessRunner.__init__` 新增 `env_file` 参数；新增 `set_extra_env()`、`_last_process` 属性
+- `harness.config.load_config()` 改为懒加载 .env，行为等价但不再在导入期覆盖环境变量
+
+**验证命令与实际结果**
+
+```
+python -m pytest tests/test_tool07_harness_permission_e2e.py tests/test_tool_authorization_integration.py -v -p no:randomly
+→ 19 passed（harness HEAD = 89fa546，由 HARNESS_LOCKIN_SHA 守卫）
+
+cd harnessagent && python -m pytest tests/ -q --tb=no -rf
+→ 24 failed, 164 passed（与改动前基线 f59bef9 失败清单逐项一致，无新增失败）
+
+python -m pytest -q --tb=line -rf
+→ 22 failed, 3537 passed, 1 skipped, 42 subtests passed
+
+基线 ae556cf（git worktree + PYTHONPATH 隔离，未回滚工作区）
+→ 28 failed, 3525 passed, 1 skipped, 42 subtests passed
+```
+
+**失败清单逐项对比（不按数量）**
+
+- 新增失败：**0 项**
+- 基线有、当前无：6 项，全在 `tests/test_harness_runner_integration.py`（R1 修复）
+- 共有 22 项：错误摘要逐条完全一致 → 既有失败；这些文件本轮一个未改
+- `test_context_agent.py::test_summary_uses_separate_budget_from_decisions` 在基线 worktree 单独复现（`assert 0 == 1`，与当前逐字符相同）→ 既有失败，非本轮引入
+
+**未验证 / 待办**
+
+- C4「MCP 撤权 handler 阻断」未完成：MCP 栈在基线即不可用（`test_mcp.py` 9 项失败在基线同样失败），需先修复 MCP 栈
+- 人工体验四步骤（派发 / 进度 / 停止 / 结果展示）未完成，仍交协调窗口
+- PR #6 已更新并绑定上述两个 SHA；**不自动合并**，等待独立复审
+
+**下一步**
+
+协调窗口安排独立复审 + 人工体验；C4 待 MCP 栈修复后补测。
