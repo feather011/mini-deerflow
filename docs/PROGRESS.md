@@ -2528,3 +2528,58 @@ python -m pytest -q --tb=line -rf
 **下一步**
 
 协调窗口安排独立复审 + 人工体验；C4 待 MCP 栈修复后补测。
+
+
+---
+
+### TOOL-07 人工体验（派发/进度/停止/结果展示）+ 停止路径返修（2026-10-21）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：mini-deerflow `5c6509fab9409da60249c9800eb419363168812f`（`automation/tool-07`） / harnessagent `89fa546ea7a30cbeefb0f6292b928bd2cb01ce26`（`master`）
+- 当前状态：**READY_FOR_REVIEW**（TOOL-07 仍未判通过；不合并、不启动后续模块）
+- 更新时间：2026-10-21
+
+**实际完成内容**
+
+- 人工体验：真实 uvicorn 服务 + 真实 HTTP/SSE，harness 真实子进程，LLM 指向本地 mock（不外呼）
+  - 派发：`POST /api/projects` → `POST /api/threads` → `POST /threads/{id}/runs/stream` 全通
+  - 进度：`run.started → model.started → model.token → model.completed → tool.started(project_execute) → tool.completed → run.result → model.* → run.completed`
+  - 停止：`POST /threads/{id}/runs/stop` → 200；SSE 终态 `run.cancelled`；结果 `status=stopped`；harness 子进程被回收（整轮 5s 返回，被中断命令本身需 30s）
+  - 结果展示：`run.result` 带 `files_written` / `changes` / `verification`；工作区文件与 diff 一致
+- 返修 3 处（人工体验暴露）：
+  1. `agent.py` 取消分支解引用 `self._budget.max_steps`，API 默认 `disable_budget=True`（budget=None）→ 点"停止"抛 AttributeError，被兜底成"运行失败"
+  2. 取消终态退化为 `run.failed`（映射成预算耗尽）→ 改为 `AgentRunCancelledError` → SSE `run.cancelled`（前端早已支持该终态，本次补齐后端一侧）
+  3. e2e mock server 端口在 Windows 上可被多实例共享（SO_REUSEADDR）→ 跨用例 scenario 污染；改 `allow_reuse_address=False`
+
+**改动文件**
+
+- `src/mini_deerflow/agent.py`、`src/mini_deerflow/api/services/agent_runs.py`
+- `tests/test_cancel_semantics.py`（新增，5 项）、`tests/test_tool07_harness_permission_e2e.py`
+
+**验证命令与实际结果**
+
+```
+python -m pytest tests/test_tool07_harness_permission_e2e.py tests/test_tool_authorization_integration.py tests/test_cancel_semantics.py -q -p no:randomly
+→ 24 passed
+
+python -m pytest -q --tb=line -rf
+→ 22 failed, 3542 passed, 1 skipped, 42 subtests passed
+
+基线 ae556cf（git worktree + PYTHONPATH 隔离，未回滚工作区）
+→ 28 failed, 3525 passed, 1 skipped, 42 subtests passed
+```
+
+**失败清单逐项对比（不按数量）**
+
+- 新增失败：**0 项**；共有 22 项错误摘要完全一致；基线独有的 6 项 `test_harness_runner_integration` 失败仍为已修复
+
+**未验证 / 待办**
+
+- C4「MCP 撤权 handler 阻断」未完成：MCP 栈在基线即不可用（`test_mcp.py` 9 项失败在基线同样失败）
+- **待协调窗口裁定**：前端"停止"只断流不取消后端 run（`frontend/src/features/threads/useAgentStream.ts` 的 `stop()` 仅 `AbortController.abort()`，不调后端 `POST /threads/{id}/runs/stop`）→ 后端 run 与 harness 子进程继续跑到底。是否改成"真取消"属产品语义决策，本轮未擅自改前端
+- PR #6 已更新并绑定上述两个 SHA；**不自动合并**，等待独立复审
+
+**下一步**
+
+协调窗口裁定前端"停止"语义；安排独立复审；C4 待 MCP 栈修复后补测。
