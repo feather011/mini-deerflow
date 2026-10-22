@@ -2704,7 +2704,7 @@ cd frontend && npx tsc -p tsconfig.app.json --noEmit
 - 任务 ID：TOOL-07
 - 会话标识：claude-worker-20261020-2015
 - 目标版本：mini-deerflow `25249e7`（`automation/tool-07`） / harnessagent `89fa546ea7a30cbeefb0f6292b928bd2cb01ce26`（`master`，**本轮未改动**）
-- 当前状态：**READY_FOR_REVIEW**（TOOL-07 仍未判通过；不合并、不启动后续模块）
+- 当前状态：**code_review_passed**（独立复审 `6332476358` 通过，无阻断 findings；等待用户最终业务验收和合并决定）
 - 更新时间：2026-10-22
 - 依据：PR #6 审查评论 `6331552612`（head `19d420f`，`changes_requested`）—— **仅处理剩余两项 R1 / R7**，R4/R5/R6 保持关闭
 
@@ -2790,8 +2790,62 @@ cd frontend && npx tsc -p tsconfig.app.json --noEmit
 
 - 聊天界面人工验收（派发 / 进度 / 停止 / 结果展示）仍需协调窗口安排
 - C4 待 MCP 栈修复后补测
-- PR #6 已更新并绑定上述 SHA；**不自动合并**，等待独立复审；**TOOL-07 尚未通过，不进入后续模块**
+- PR #6 已更新并绑定上述 SHA；**不自动合并**；独立复审已于 `6332476358` 通过 → 见下方「TOOL-07 独立复审通过」记录
 
 **下一步**
 
 协调窗口安排独立复审 + 聊天界面人工验收；C4 待 MCP 栈修复后补测。
+
+---
+
+### TOOL-07 独立复审通过（2026-10-22）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：mini-deerflow `07dbdb9ebbc6e96c969617aaa9da4009bbe0371b`（`automation/tool-07`） / harnessagent `89fa546ea7a30cbeefb0f6292b928bd2cb01ce26`（`master`，未改动）
+- 当前状态：**code_review_passed** —— **代码审查已通过，等待用户最终业务验收和合并决定**
+- 更新时间：2026-10-22
+- 依据：PR #6 审查评论 [`6332476358`](https://github.com/feather011/mini-deerflow/pull/6#issuecomment-6332476358)，head `07dbdb9`，**无阻断 findings**
+
+**状态变更**
+
+- 上一条记录中的「TOOL-07 仍未通过、等待独立复审」是**当时**的状态；现更新为：**代码审查已通过，等待用户最终业务验收和合并决定**。
+- **R1 / R7 已关闭**；R4/R5/R6 及更早的 R2/R3、取消终态映射、C4 既有 5 项真实 stdio 夹具证据**保持冻结**。
+
+**审查方独立执行的检查（非作者自跑，列为外部证据）**
+
+| 范围 | 结果 |
+|------|------|
+| 5 项进程回收夹具 + 真实 harness 跨进程拒绝/变更/取消 + 假 LLM 超时 Demo + 授权继承 + 取消语义 | **30 passed** |
+| 原 Runtime→主 Agent→harness 写文件正常路径 + 后端 stop 入口/回收/锁释放 | **2 passed** |
+| 三个相关前端文件 + 独立根 StrictMode 复现（单 worker、15s 超时） | **45 passed** |
+| 独立双项目/同 Runner 停止探针 | 通过（心跳停止，夹具线程已 join） |
+| 当前 head 与 `19d420f` 同环境类型检查 | **均失败于完全相同的 2 处 `realTaskAdapter.ts` 错误**，无新增类型错误 |
+
+> 审查方未重跑完整回归，不声称"全绿"；作者的全量 22 failed / 3548 passed / 1 skipped、前端 463 项、Windows 结果列为**外部作者证据**。当前 head 无 workflow/check/status 结果。
+
+**审查方明确未验证的事项**
+
+- Windows Job Object 实机行为（审查环境为 Linux）
+- 浏览器实际点击 / 桌面与窄屏人工体验、真实 Provider / 付费服务
+- 完整后端/前端回归与作者完整基线失败清单；严格 lockfile 的 `npm ci` 干净安装
+
+**仍未完成 / 单列（不重新阻断本阶段）**
+
+| 项 | 状态 |
+|----|------|
+| **浏览器人工体验**（派发 / 进度 / 停止 / 结果展示） | **待完成** —— jsdom + fetch 夹具的自动化证据**不等于**人工业务验收；HTTP/SSE 记录与人工验收分开记录 |
+| **C4「MCP 撤权 handler 阻断」** | 与已冻结的 **5 项真实 stdio 夹具证据区分记录**：C4 本身未完成，但**不要求先修旧 MCP 整套**才能结束本阶段 |
+| 旧 MCP 测试失败（`test_mcp.py` 10 项等共 22 项） | **单列为既有失败**（基线 `ae556cf` 同样失败），不重新阻断 |
+| 技术限制 | 无操作系统级沙箱；无分布式锁（模块级 dict，单进程部署）；Windows only `harness_root` —— 如实记录，不掩盖 |
+
+**本轮未做**
+
+- 无代码改动；未重复跑全量（按指示"当前无需继续返修或重复跑全量"）
+- 未自动合并；未启动 Skills / Guard / 沙箱等后续模块
+
+**下一步**
+
+- 等待**用户最终业务验收**与**合并决定**（合并需用户授权，本轮不自动合并）
+- 浏览器人工体验仍待协调窗口安排
+- TOOL-07 是本系列最后阶段：工具模块开发到此停止，不启动后续模块
