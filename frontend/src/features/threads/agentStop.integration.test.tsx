@@ -6,7 +6,7 @@
  * 不接任何付费模型。
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, act } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
@@ -34,8 +34,13 @@ const THREAD_ID = 't-stop-1'
 /** 本地 mock 后端：记录 stop 请求，并在收到后推送 run.cancelled */
 class MockBackend {
   stopRequests: Array<{ url: string; body: unknown }> = []
-  private pushSse: ((chunk: string) => void) | null = null
+  pushSse: ((chunk: string) => void) | null = null
   private encoder = new TextEncoder()
+
+  /** 绑定 SSE 推送函数（测试自建 fetch 时用） */
+  setPushSse(fn: (chunk: string) => void): void {
+    this.pushSse = fn
+  }
 
   /** SSE 事件块（与后端 encode_sse 同格式） */
   sseChunk(eventType: string, sequence: number, extra: Record<string, unknown> = {}): string {
@@ -203,6 +208,142 @@ describe('AgentChatPanel 停止（真取消）集成', () => {
     await user.click(stopBtn)
 
     // 如实报告失败：不得显示"已取消"
+    await waitFor(() => {
+      expect(screen.getByText('取消失败')).toBeInTheDocument()
+    })
+    expect(screen.getByText(/后端任务可能仍在运行/)).toBeInTheDocument()
+    expect(screen.queryByText('已取消当前任务')).not.toBeInTheDocument()
+  })
+
+  // -------------------------------------------------------------------------
+  // 根 StrictMode：开发模式会重放 effect（setup → cleanup → setup）。
+  // 若"已挂载"标记只在初始化设置，重放后取消中状态与失败提示再也更新不出来。
+  // -------------------------------------------------------------------------
+
+  it('StrictMode：取消请求发出后按钮禁用并显示"正在停止…"，后端确认后显示已取消', async () => {
+    const user = userEvent.setup()
+    let releaseStop: (() => void) | null = null
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve
+    })
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/runs/stop')) {
+          backend.stopRequests.push({ url, body: null })
+          // 后端延迟受理：留出窗口观察"正在停止…"状态
+          await stopGate
+          backend.pushSse?.(
+            backend.sseChunk('run.cancelled', 2, { answer: null, error: null }),
+          )
+          return new Response(JSON.stringify({ status: 'stopped', thread_id: THREAD_ID }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.includes('/runs/stream')) {
+          const encoder = new TextEncoder()
+          const body = new ReadableStream({
+            start: (controller) => {
+              backend.setPushSse((chunk: string) => controller.enqueue(encoder.encode(chunk)))
+            },
+          })
+          queueMicrotask(() => {
+            backend.pushSse?.(backend.sseChunk('run.started', 1))
+          })
+          return new Response(body, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream', 'X-Run-ID': 'run-mock-1' },
+          })
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }),
+    )
+
+    render(<AgentChatPanel thread={thread} />, { wrapper, reactStrictMode: true })
+
+    await user.type(screen.getByRole('textbox'), '跑个任务')
+    await user.click(screen.getByRole('button', { name: '发送消息' }))
+
+    const stopBtn = await screen.findByRole('button', { name: '停止当前任务' })
+    await user.click(stopBtn)
+
+    // 取消中：按钮禁用 + 文案切换
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '停止当前任务' })).toBeDisabled()
+    })
+    expect(screen.getByRole('button', { name: '停止当前任务' }).textContent).toContain(
+      '正在停止',
+    )
+
+    // 后端受理并推 run.cancelled → 终态如实呈现
+    await act(async () => {
+      releaseStop!()
+      await stopGate
+    })
+    await waitFor(() => {
+      expect(screen.getByText('已取消当前任务')).toBeInTheDocument()
+    })
+  })
+
+  it('StrictMode：取消失败时"取消失败 + 后端任务可能仍在运行"可见', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/runs/stop')) {
+          return new Response(JSON.stringify({ detail: '没有正在运行的 Run' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.includes('/runs/stream')) {
+          const encoder = new TextEncoder()
+          const body = new ReadableStream({
+            start: (controller) => {
+              controller.enqueue(
+                encoder.encode(
+                  `id: 1
+event: run.started
+data: ${JSON.stringify({
+                    run_id: 'r',
+                    thread_id: THREAD_ID,
+                    event_type: 'run.started',
+                    sequence: 1,
+                    timestamp: 1,
+                  })}
+
+`,
+                ),
+              )
+            },
+          })
+          return new Response(body, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream', 'X-Run-ID': 'r' },
+          })
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }),
+    )
+
+    render(<AgentChatPanel thread={thread} />, { wrapper, reactStrictMode: true })
+
+    await user.type(screen.getByRole('textbox'), '跑个任务')
+    await user.click(screen.getByRole('button', { name: '发送消息' }))
+
+    const stopBtn = await screen.findByRole('button', { name: '停止当前任务' })
+    await user.click(stopBtn)
+
     await waitFor(() => {
       expect(screen.getByText('取消失败')).toBeInTheDocument()
     })

@@ -354,4 +354,132 @@ describe('useAgentStream', () => {
     expect(mockStopAgentRun).not.toHaveBeenCalled()
     expect(result.current.status).toBe('stopped')
   })
+
+  // -------------------------------------------------------------------------
+  // 根 StrictMode：开发模式会重放 effect（setup → cleanup → setup）。
+  // 若"已挂载"标记只在初始化设置、cleanup 不恢复 setup 也恢复，
+  // 重放后组件会被永久当成已卸载 —— 取消中状态与取消失败提示再也更新不出来。
+  // -------------------------------------------------------------------------
+
+  describe('根 StrictMode', () => {
+    const strictWrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    )
+    const strictOptions = { wrapper: strictWrapper, reactStrictMode: true } as const
+
+    it('取消请求被受理后进入 cancelling（按钮禁用依据）', async () => {
+      const { result } = renderHook(
+        () => useAgentStream({ threadId: 't1', message: '', autoStart: false }),
+        strictOptions,
+      )
+      act(() => result.current.start('fixture task'))
+
+      await act(async () => {
+        await result.current.cancelRun()
+      })
+
+      expect(mockStopAgentRun).toHaveBeenCalledWith('t1')
+      expect(result.current.cancelState).toBe('cancelling')
+      expect(result.current.cancelError).toBeNull()
+    })
+
+    it('收到后端 run.cancelled 终态后进入 cancelled', async () => {
+      let captured: ((event: RunEvent) => void) | null = null
+      mockConnectAgentStream.mockImplementation((_tid, _msg, opts) => {
+        captured = opts.onTerminal ?? null
+        return { runId: Promise.resolve('r'), cancel: vi.fn() }
+      })
+
+      const { result } = renderHook(
+        () => useAgentStream({ threadId: 't1', message: '', autoStart: false }),
+        strictOptions,
+      )
+      act(() => result.current.start('fixture task'))
+      await act(async () => {
+        await result.current.cancelRun()
+      })
+
+      act(() => {
+        captured!({
+          run_id: 'r',
+          thread_id: 't1',
+          event_type: 'run.cancelled',
+          sequence: 1,
+          timestamp: 1000,
+          answer: null,
+          error: null,
+          attempt: null,
+          operation: null,
+          tool_name: null,
+          duration_seconds: null,
+        } as RunEvent)
+      })
+
+      expect(result.current.status).toBe('cancelled')
+      expect(result.current.cancelState).toBe('cancelled')
+      expect(result.current.cancelError).toBeNull()
+    })
+
+    it('后端无正在运行的 Run（404）时失败提示可见', async () => {
+      mockStopAgentRun.mockRejectedValue(
+        new ApiError({ status: 404, code: 'NOT_FOUND', message: '请求失败（404）' }),
+      )
+
+      const { result } = renderHook(
+        () => useAgentStream({ threadId: 't1', message: '', autoStart: false }),
+        strictOptions,
+      )
+      act(() => result.current.start('fixture task'))
+
+      await act(async () => {
+        await result.current.cancelRun()
+      })
+
+      expect(result.current.cancelState).toBe('failed')
+      expect(result.current.cancelError).toContain('没有正在运行的 Run')
+    })
+
+    it('网络失败后失败提示可见且允许重试', async () => {
+      mockStopAgentRun.mockRejectedValueOnce(
+        new ApiError({ status: 0, code: 'NETWORK_ERROR', message: '无法连接到后端服务' }),
+      )
+
+      const { result } = renderHook(
+        () => useAgentStream({ threadId: 't1', message: '', autoStart: false }),
+        strictOptions,
+      )
+      act(() => result.current.start('fixture task'))
+
+      await act(async () => {
+        await result.current.cancelRun()
+      })
+      expect(result.current.cancelState).toBe('failed')
+      expect(result.current.cancelError).toContain('无法连接到后端服务')
+
+      await act(async () => {
+        await result.current.cancelRun()
+      })
+      expect(mockStopAgentRun).toHaveBeenCalledTimes(2)
+      expect(result.current.cancelState).toBe('cancelling')
+    })
+
+    it('真实卸载仍只断流、不取消后端任务', async () => {
+      const mockCancel = vi.fn()
+      mockConnectAgentStream.mockReturnValue({
+        runId: Promise.resolve('run-1'),
+        cancel: mockCancel,
+      })
+
+      const { result, unmount } = renderHook(
+        () => useAgentStream({ threadId: 't1', message: '', autoStart: false }),
+        strictOptions,
+      )
+      act(() => result.current.start('fixture task'))
+
+      unmount()
+
+      expect(mockCancel).toHaveBeenCalled()
+      expect(mockStopAgentRun).not.toHaveBeenCalled()
+    })
+  })
 })

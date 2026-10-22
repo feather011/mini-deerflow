@@ -329,6 +329,10 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
 
   // 组件卸载时断开（仅断流，不取消后端任务）
   useEffect(() => {
+    // setup 必须恢复"已挂载"标记：根 StrictMode 在开发模式会重放 effect
+    // （setup → cleanup → setup）。若 setup 不恢复，cleanup 之后的组件会被
+    // 永久当成已卸载 —— 取消中状态与取消失败提示再也更新不出来。
+    mountedRef.current = true
     return () => {
       mountedRef.current = false
       runActiveRef.current = false
