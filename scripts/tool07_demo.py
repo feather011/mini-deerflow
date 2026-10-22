@@ -545,27 +545,30 @@ def demo_timeout_returns_timeout() -> bool:
 def demo_timeout_real_subprocess() -> bool:
     """演示 4b：真实 HarnessRunner 子进程超时（隔离 Provider，无外部请求）。
 
-    R6 修订：必须显式注入 no-network env：
-      - HARNESS_ENV_FILE 指空 → harness 不读父进程 .env
-      - 通过 thread-local os.environ 临时设置，挂掉子进程后**严格清理**，
-        绝不泄漏到下一次演示
-      - 用挂在未监听端口的 mock URL → harness 启动后因 TCP 失败
-        立刻返回 STATUS_TIMEOUT / launch_failed，不会真实发请求
-      - 验证 4a（FakeRunner）已涵盖状态机；本条证明真实子进程也是 timeout
+    R6 修订（审查意见）：
+    - 旧写法只设 `HARNESS_ENV_FILE=''` 与错误的 `HARNESS_MIMO_API_KEY`，
+      而 harness 的 `load_config()` 优先读 `MINIMAX_API_KEY`；空的
+      HARNESS_ENV_FILE 会退回 harness 仓库的默认 .env —— 也就是说子进程
+      很可能选中了**父进程的真实 MiniMax 配置**。
+    - 旧写法只断言 `ok=false`，启动失败/配置失败/协议失败都会伪装成
+      "真实超时通过"。
+
+    现在：
+      1) 显式写入**独立的测试 .env**（只含假凭证），并用
+         `HarnessRunner(env_file=...)` 注入 → 子进程的
+         `HARNESS_ENV_FILE` 指向该文件，父进程的真实凭证被清除；
+      2) 用 harness 自带的 `HARNESS_USE_FAKE_LLM=1` + 确定性延迟
+         `HARNESS_FAKE_LLM_DELAY` → 子进程**不读配置、不发任何网络请求**，
+         只是确定性地卡住 → 父进程超时路径必然被触发；
+      3) 断言真实终态是 timeout（不是 launch_failed/protocol_error）、
+         任务进程被回收、锁已释放；
+      4) 断言父进程的真实 Provider 没被选中：子进程环境里没有真实凭证，
+         且 harness 报告的模型是 fake（真实路径会是 MiniMax-M3 / mimo-*）。
     """
     _banner("演示 4b：真实 HarnessRunner 子进程超时（不调真实 API）")
 
     workspace_root = None
-    # 隔离环境：临时清掉 harness 会读的两个变量
-    saved_env_file = os.environ.get("HARNESS_ENV_FILE")
-    saved_mimo_key = os.environ.get("HARNESS_MIMO_API_KEY")
-    saved_mimo_url = os.environ.get("HARNESS_MIMO_BASE_URL")
-    # 设立未监听的端口，TCP connect 必失败：harness 启动即报 LAUNCH_FAILED/timeout
-    fake_url = "http://127.0.0.1:15888"
-    os.environ["HARNESS_ENV_FILE"] = ""  # 空文件存在检查 → harness 不读 .env
-    os.environ["HARNESS_MIMO_BASE_URL"] = fake_url
-    os.environ["HARNESS_MIMO_API_KEY"] = "fake-key-for-demo"
-
+    env_dir = None
     try:
         from mini_deerflow.project_store import InMemoryProjectStore
         from mini_deerflow.thread_store import InMemoryThreadStore
@@ -593,14 +596,46 @@ def demo_timeout_real_subprocess() -> bool:
         )
         store.create(thread_id, project_id=project_id)
 
-        # timeout_seconds 必须 > harness 启动 connect timeout
-        # 连接失败本身是 timeout 触发；这里给 0.5s 让 supervise 走 deadline 路径
+        # 独立测试 .env：只含假凭证（变量名与 harness config.py 一致）
+        env_dir = Path(tempfile.mkdtemp(prefix="harness-demo-env-"))
+        env_file = env_dir / ".env"
+        env_file.write_text(
+            "MIMO_API_KEY=fake-key-for-demo\n"
+            "HARNESS_MIMO_BASE_URL=http://127.0.0.1:1/unused\n",
+            encoding="utf-8",
+        )
+
+        # timeout_seconds 必须 < 假 LLM 的确定性延迟
+        fake_delay = 30.0
         runner = HarnessRunner(
             harness_root=HARNESS_ROOT,
             python_exe=sys.executable,
-            timeout_seconds=0.5,
+            timeout_seconds=3.0,
             max_tool_calls=10,
+            env_file=str(env_file),
         )
+        # harness 自带的假 LLM：不读配置、不联网，只按固定延迟卡住
+        runner.set_extra_env({
+            "HARNESS_USE_FAKE_LLM": "1",
+            "HARNESS_FAKE_LLM_DELAY": str(int(fake_delay)),
+        })
+
+        # 隔离核查：子进程环境里不能有父进程的真实凭证
+        child_env = runner.build_env()
+        for leaked in ("MINIMAX_API_KEY", "MIMO_API_KEY"):
+            if leaked in child_env:
+                _fail(f"子进程环境仍带真实凭证 {leaked}，Provider 隔离失效")
+                return False
+        if child_env.get("HARNESS_ENV_FILE") != str(env_file):
+            _fail(f"子进程未指向独立测试 .env: {child_env.get('HARNESS_ENV_FILE')}")
+            return False
+        if child_env.get("HARNESS_USE_FAKE_LLM") != "1":
+            _fail("子进程未启用假 LLM（可能走真实 Provider）")
+            return False
+        _ok("子进程环境已隔离：无真实凭证 + 指向独立测试 .env + 假 LLM")
+
+        seen_events: list[dict] = []
+        _on_event = staticmethod(seen_events.append)
 
         tool = create_project_execute_tool(
             thread_store=store,
@@ -614,9 +649,8 @@ def demo_timeout_real_subprocess() -> bool:
             "thread_id": thread_id,
             "run_id": "r-real",
             "project_id": project_id,
+            "on_event": _on_event,
         })()
-        # 注意：环境变量既已注入，harness 子进程连接 15888 必失败——
-        # 但 mini-deerflow 自身的 .env 不再被读，绝对不会发到真实 mini-max 地址
         start = time.monotonic()
         result_str = tool.handler(
             {"task": "任意快任务", "context": ""}, ctx,
@@ -627,8 +661,37 @@ def demo_timeout_real_subprocess() -> bool:
         if result.get("ok") is not False:
             _fail(f"真实 HarnessRunner 超时应返回 ok=False，实际: {result}")
             return False
-        elapsed_str = f"{elapsed:.2f}s"
-        _ok(f"真实 HarnessRunner 返回 ok=False（耗时 {elapsed_str}）")
+        _ok(f"真实 HarnessRunner 返回 ok=False（耗时 {elapsed:.2f}s）")
+
+        # 真实终态必须是 timeout：启动失败/协议失败不算"超时通过"
+        if result.get("status") != "timeout":
+            _fail(
+                f"真实终态应为 timeout（不是 launch_failed/protocol_error 的伪装），"
+                f"实际: status={result.get('status')!r} error={result.get('error')!r}"
+            )
+            return False
+        _ok(f"真实终态为 timeout: {str(result.get('error'))[:60]}")
+
+        # 子进程真的被回收（不能留下孤儿）
+        proc = runner._last_process
+        if proc is None:
+            _fail("HarnessRunner 未记录子进程句柄")
+            return False
+        if proc.poll() is None:
+            _fail(f"超时后子进程仍在运行: pid={proc.pid}")
+            return False
+        _ok(f"超时后子进程已被回收: pid={proc.pid}")
+
+        # 父进程的真实 Provider 没被选中：harness 报告的模型是 fake
+        started = [e for e in seen_events if e.get("type") == "started"]
+        if not started:
+            _fail(f"未观察到 harness 的 started 事件: {seen_events}")
+            return False
+        model = started[0].get("model")
+        if model != "fake":
+            _fail(f"harness 未走假 LLM（model={model!r}），可能选中了真实 Provider")
+            return False
+        _ok("harness 走的是假 LLM（model=fake），未选中父进程的真实 Provider")
 
         # 锁已释放
         lock = _get_project_lock(project_id)
@@ -641,23 +704,16 @@ def demo_timeout_real_subprocess() -> bool:
 
         return True
     finally:
-        # 严格清理：恢复调用前 os.environ 的状态，绝不污染下次演示
-        for var, saved in (
-            ("HARNESS_ENV_FILE", saved_env_file),
-            ("HARNESS_MIMO_BASE_URL", saved_mimo_url),
-            ("HARNESS_MIMO_API_KEY", saved_mimo_key),
-        ):
-            if saved is None:
-                os.environ.pop(var, None)
-            else:
-                os.environ[var] = saved
         if workspace_root and workspace_root.exists():
             shutil.rmtree(workspace_root, ignore_errors=True)
+        if env_dir and env_dir.exists():
+            shutil.rmtree(env_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
 # 演示 5：HarnessRunner 配置检测 → 未配置时返回错误
 # ---------------------------------------------------------------------------
+
 
 def demo_unconfigured_harness_error() -> bool:
     _banner("演示 5：HarnessRunner 未配置 → ok=false + error")
