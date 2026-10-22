@@ -2583,3 +2583,116 @@ python -m pytest -q --tb=line -rf
 **下一步**
 
 协调窗口裁定前端"停止"语义；安排独立复审；C4 待 MCP 栈修复后补测。
+
+---
+
+### TOOL-07 复审返修 R1/R4/R5/R6/R7（2026-10-22）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：mini-deerflow `f88ef14312ece4065d0f7ad27965a3b6edbff665`（`automation/tool-07`） / harnessagent `89fa546ea7a30cbeefb0f6292b928bd2cb01ce26`（`master`，**本轮未改动**）
+- 当前状态：**READY_FOR_REVIEW**（TOOL-07 仍未判通过；不合并、不启动后续模块）
+- 更新时间：2026-10-22
+- 依据：PR #6 审查评论（`changes_requested`），集中处理 R1/R4/R5/R6/R7
+
+**实际完成内容**
+
+- **R1 进程树回收**（`src/mini_deerflow/harness_runner.py`）
+  - 根因：`taskkill /T /F` 走 PPID 链，根进程一旦退出（甚至因 stdout 管道被关闭而异常死掉），后代即成孤儿，taskkill 再也定位不到 —— 后代继续跑、继续占着项目锁。
+  - 复现证据：把旧逻辑（根进程已退出就直接返回）放回去，孤儿后代心跳计数从 105 涨到 117 —— **根进程退出 ≠ 整组退出**。
+  - 修复：Windows 改用 Job Object（`SetInformationJobObject` class 9 + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，成员身份由后代继承），关闭句柄即杀整组；创建失败退回 `taskkill /T /F`。POSIX 走 `killpg(SIGTERM) → 有界宽限 → os.killpg(pgid,0) 复查整组 → SIGKILL`；子进程与宿主同组时返回 `None`，绝不 `killpg`。`_supervise` 在根进程退出后统一再回收一次整组。
+  - 新增 `tests/test_tool07_process_tree_recovery.py`（4 项）：正常可终止后代 / 忽略 SIGTERM 的后代 / 根进程先退出 / 超时 —— 每项断言宿主存活、后代停止、锁可再获取、子进程确已退出。全程假 harness，**不调任何 Provider**。
+- **R4 观察链路**（`tests/test_tool07_harness_permission_e2e.py` 的 C1、`src/mini_deerflow/project_tools.py`）
+  - 旧问题：自建 `_canceller` 用 `proc.stdout.readline()` 抢 Runner 的管道；`verification` 条目**没有 name 字段**，`v.get('name') == 'bash'` 恒为空，什么都没证明；`tool_start` 在 handler 执行前就发。
+  - 修复：经 context 挂 `on_event`，用 Runner 既有事件通道**被动观察**；取消动作等被控后代自己写出 ready 标记后才触发；断言按真实 schema（`command` / `exit_code` / `has_output`），保留哨兵文件、锁释放、根进程已退出断言。`project_tools.py` 新增可选 `on_event` 透传（生产链路不传 → 无行为变化）。
+- **R5 授权链路**（`tests/test_tool_authorization_integration.py`、`src/mini_deerflow/subagent_tools.py`）
+  - 旧问题：手工构造 `SubagentRunner` 重跑 Task，绕过 Manager→Runner 装配且与 submit 已提交的任务重复执行；从不 `collect`、从不 `shutdown`；被拒工具 `project_execute` 已被 principal 维度直接拒掉，无法区分能力扩张。
+  - 修复：只由原来的 Manager 执行同一 Task 一次；脚本模型 / 真实注册表依赖**只在 submit 调用**注入（`_SubmitHandler` 新增 `model` / `registry` 可选透传，**生产调用点不变、仍为 None**）；`collect` 结果、`finally shutdown`。证明被授权的只读工具**真的执行**（calculator handler 被调用，结果 `42` 出现在子代理上下文消息里）；缺能力用例换成主体本可使用、父未授 `PROJECT_READ` 的 `project_read_file`，断言原因码 `capability_missing` 且 handler 执行 0 次。
+- **R6 demo 隔离**（`scripts/tool07_demo.py`、新增 `tests/test_tool07_demo_timeout.py`）
+  - 旧问题：未传 `env_file`，只设 `HARNESS_ENV_FILE=''` 与错误的 `HARNESS_MIMO_API_KEY`；harness `load_config()` 优先读 `MINIMAX_API_KEY`，空 `HARNESS_ENV_FILE` 退回 harness 默认 `.env` → 子进程可能选中**父进程的真实 MiniMax 配置**；且只断言 `ok=false`，启动/配置/协议失败都会伪装成"真实超时通过"。
+  - 修复：显式写入**独立测试 `.env`**（只含假凭证）并用 `HarnessRunner(env_file=…)` 注入（生产 Provider 配置行为不变）；启用 harness 自带 `HARNESS_USE_FAKE_LLM=1` + 确定性延迟 → 子进程不读配置、不发任何网络请求、只会确定性地卡住；断言真实终态是 `timeout`（不是 launch_failed/protocol_error）、任务进程被回收、锁已释放；断言父进程真实 Provider 未被选中（子进程环境无真实凭证 + 指向独立 `.env` + harness 报告 `model=fake`）。
+- **R7 前端停止接后端真取消**（`frontend/src/features/threads/*`）
+  - 旧问题：唯一 `onStop` 藏在 `false &&` 隐藏的事件面板里，渲染出的 `MessageComposer` 无停止回调；`stop()` 只调 `cancelRef`，`streamClient.cancel` 只做 `AbortController.abort()`，不调后端取消接口。
+  - 修复：新增 `runsApi.stopAgentRun()`（`POST /api/threads/{id}/runs/stop`，后端既有接口）；`useAgentStream` 新增 `cancelRun()`（防重复、成功后**不断流**等 `run.cancelled`、失败置 `failed` 并透出错误）；`stop()` 保留为"仅断流"（会话切换 / 卸载）；可见入口为 `MessageComposer` 的「停止」按钮；UI 如实反映结果（`run.cancelled` → "已取消当前任务"；失败 → "取消失败 + 后端任务可能仍在运行"），**绝不把仅断流说成任务已停止**。
+
+**改动文件**
+
+- `src/mini_deerflow/harness_runner.py`、`src/mini_deerflow/project_tools.py`、`src/mini_deerflow/subagent_tools.py`
+- `scripts/tool07_demo.py`
+- `tests/test_tool07_process_tree_recovery.py`（新增）、`tests/test_tool07_demo_timeout.py`（新增）
+- `tests/test_tool07_harness_permission_e2e.py`、`tests/test_tool_authorization_integration.py`
+- `frontend/src/features/threads/{AgentChatPanel.tsx,AgentChatPanel.test.tsx,MessageComposer.tsx,MessageComposer.module.css,runsApi.ts,useAgentStream.ts,useAgentStream.test.tsx}`、`frontend/src/features/threads/agentStop.integration.test.tsx`（新增）
+
+**提交（保留历史轮次，未 squash）**
+
+- `7d051c0` R1 进程树回收改为"整组退出" + 夹具证据
+- `e643dd1` R4/R5 观察链路与授权链路改为走真实装配路径
+- `cabc63d` R6 demo 4b 显式注入独立测试 env，断言真实超时终态
+- `f88ef14` R7 "停止"接入后端真实取消，失败如实上报
+
+**接口变化**
+
+- `HarnessRunner.build_env(extra_env=None) -> dict[str,str]`（新增，公开以便核查隔离）
+- `HarnessRunner` 新增 `_last_job` / `_tree_terminated`（内部状态）
+- `project_execute` 上下文支持可选 `on_event`（生产链路不提供 → 无行为变化）
+- `_SubmitHandler.__init__` 新增可选 `model` / `registry`（生产调用点不变）
+- 前端 `runsApi.stopAgentRun(threadId, signal?)`；`useAgentStream` 新增 `cancelRun` / `cancelState` / `cancelError`；`MessageComposer` 新增 `canStop` / `isStopping` / `onStop`
+
+**验证命令与实际结果**
+
+```
+# 定向（TOOL-07 返修范围）
+python -m pytest tests/test_tool07_process_tree_recovery.py tests/test_tool07_harness_permission_e2e.py tests/test_tool07_demo_timeout.py tests/test_tool_authorization_integration.py tests/test_cancel_semantics.py -q
+→ 29 passed in 28.09s
+
+# 后端停止链路（既有 e2e，确认 R1 改造未破坏 stop→reap→锁释放）
+python -m pytest "tests/test_project_execute_e2e.py::test_停止入口_取消链路_进程回收_锁释放" -q
+→ 1 passed in 2.82s
+
+# mini-deerflow 全量（当前 f88ef14）
+python -m pytest -q --tb=no -rf
+→ 22 failed, 3547 passed, 1 skipped, 42 subtests passed in 320.07s
+
+# 基线 ae556cf（git worktree D:/tmp/baseline-ae556cf + PYTHONPATH 隔离，未回滚工作区）
+PYTHONPATH=<baseline>/src python -m pytest -q --tb=no -rf
+→ 28 failed, 3525 passed, 1 skipped, 42 subtests passed in 203.14s
+
+# 前端
+cd frontend && npx vitest run
+→ 40 files passed, 456 tests passed
+cd frontend && npx oxlint .
+→ 0 error（10 条 warning，其中 AgentChatPanel.tsx:264 的 `false &&`、
+   MessageList/useConfirmations/MCPSettings/realTaskAdapter 的告警均为既有）
+cd frontend && npx tsc -p tsconfig.app.json --noEmit
+→ 仅 2 处既有报错（inspector/realTaskAdapter.ts 的 run_id_marker / buildTaskResult，
+   该文件本 PR 未改）
+```
+
+**失败清单逐项对比（按名称与错误，不按数量）**
+
+- **新增失败：0 项**（脚本逐名比对基线与当前的 `FAILED` 行集合，`当前 - 基线 = ∅`）
+- 基线有、当前无：**6 项**，全部在 `tests/test_harness_runner_integration.py`（R1 修复）
+- 共有 22 项：错误摘要逐条完全一致 → **既有失败**，非本轮引入
+  - `tests/test_context_agent.py`（1）、`tests/test_mcp.py`（10）、`tests/test_phase17_18_closing.py`（5）、`tests/test_phase21b_events.py`（1）、`tests/test_subagent_allowed_tools.py`（3）、`tests/test_tool_loop_21b.py`（1）
+- 通过数由基线 3525 增至 3547：+22 = R1 夹具 4 + R6 demo 1 + R4/R5 改写后的净增 + 前端无关；上述文件本 PR 均已改，其余文件未改
+
+**冻结 / 未重做项**
+
+- R2、R3、R1 的宿主隔离部分、取消映射修复、C4 已有 5 项真实 stdio 夹具证据：按裁定**不重做**
+- C4「MCP 撤权 handler 阻断」仍未完成：MCP 栈在基线即不可用（`test_mcp.py` 10 项在基线同样失败），需先修 MCP 栈
+
+**HTTP/SSE 验证与聊天界面人工验收（分开记录）**
+
+- HTTP/SSE 侧：上一轮已记录（派发 / 进度 / 停止 / 结果展示，见 `1fcaf38`）；本轮**未**新增浏览器人工体验记录
+- 聊天界面人工验收：**未做**。前端本轮只有本地 mock 集成证据（UI 动作 → 后端收到取消 → `run.cancelled`），**不能**据此判定四项浏览器/人工体验条目完成
+- R7 后端侧的 stop → cancel → 子进程回收 → 锁释放由既有 e2e `test_停止入口_取消链路_进程回收_锁释放` 覆盖（真实 HTTP，非 mock）
+
+**未验证 / 待办**
+
+- 聊天界面人工验收（派发 / 进度 / 停止 / 结果展示）仍需协调窗口安排
+- C4 待 MCP 栈修复后补测
+- PR #6 已更新并绑定上述 SHA；**不自动合并**，等待独立复审；**TOOL-07 尚未通过，不进入后续模块**
+
+**下一步**
+
+协调窗口安排独立复审 + 聊天界面人工验收；C4 待 MCP 栈修复后补测。
