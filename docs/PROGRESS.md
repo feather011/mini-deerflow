@@ -2696,3 +2696,102 @@ cd frontend && npx tsc -p tsconfig.app.json --noEmit
 **下一步**
 
 协调窗口安排独立复审 + 聊天界面人工验收；C4 待 MCP 栈修复后补测。
+
+---
+
+### TOOL-07 复审返修第 3 轮：R1 并发回收隔离 + R7 StrictMode 生命周期（2026-10-22）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：mini-deerflow `25249e7`（`automation/tool-07`） / harnessagent `89fa546ea7a30cbeefb0f6292b928bd2cb01ce26`（`master`，**本轮未改动**）
+- 当前状态：**READY_FOR_REVIEW**（TOOL-07 仍未判通过；不合并、不启动后续模块）
+- 更新时间：2026-10-22
+- 依据：PR #6 审查评论 `6331552612`（head `19d420f`，`changes_requested`）—— **仅处理剩余两项 R1 / R7**，R4/R5/R6 保持关闭
+
+**实际完成内容**
+
+- **R1 回收状态按每次 run 隔离**（`src/mini_deerflow/harness_runner.py`）
+  - 缺陷：回收标记 `_tree_terminated` 与 Job 句柄 `_last_job` 是 **Runner 实例状态**。生产装配（`runtime.py:886–901`）只建**一个** `HarnessRunner`，所有项目共用；而项目锁只互斥**同一个 project_id** —— 不同项目的任务会并发跑在同一个 Runner 上。
+    - A 收口把 `_tree_terminated` 置 True → B 的取消进入 `_terminate_tree(B)` 直接 return → **B 的进程树残留**（继续写工作区、继续占锁）。
+    - `_last_job` 被后一个 run 覆盖 → 取消 A 时关掉的是 **B 的 Job 句柄**（跨运行误杀），A 自己的句柄泄漏。
+  - 修复：新增每次 run 独占的 `_RunState`（`process` / `job` / `terminated`），`run()` 建本地实例并传给 `_supervise`；`_terminate_tree` / `_close_job` 只认**本次 run** 的句柄与标记，不再使用任何实例级回收状态。`_last_process` 保留但降级为**诊断用途**（并发时可能指向另一轮 run），并已在注释里写明。
+  - 新增夹具 `test_并发_不同项目共用同一Runner_回收互不串`：两个真实 `project_execute` handler、不同项目/仓库目录、**同一 Runner** 并发启动，各自后代写自己仓库目录里的心跳文件。先取消 A（断言 A 的后代已停、B 的后代**仍在**写 → A 收口不误杀 B），再取消 B（断言 B 的后代**不再**写），最后断言两个项目锁都释放。原有 4 项单任务用例（正常终止 / 忽略 SIGTERM / 根进程先退出 / 超时）全部保留且仍通过。
+  - 夹具改造：伪 harness 在未设 `FAKE_TREE_DIR` 时写进自己的 cwd（即项目仓库目录），因此并发两路各写各的目录，互不干扰。
+- **R7 StrictMode 生命周期**（`frontend/src/features/threads/useAgentStream.ts`）
+  - 缺陷：`mountedRef` 只在 `useRef(true)` 初始化，卸载 effect 的 cleanup 置 `false`，**setup 未恢复**。根 StrictMode（`main.tsx`）在开发模式重放 effect（setup → cleanup → setup）后，组件被**永久**当成已卸载 → `applyCancelState` / `setCancelError` 全部被跳过："正在停止…"不出现、按钮不禁用、取消失败提示不显示（请求其实发出去了）。
+  - 修复：卸载 effect 的 **setup 里恢复** `mountedRef.current = true`，使 setup / cleanup 对称。**真实卸载语义不变**：仍然只断流、不取消后端任务。
+  - 测试：`useAgentStream.test.tsx` 新增「根 StrictMode」分组（`renderHook(..., { reactStrictMode: true })`）5 项 —— 取消受理 → `cancelling`；后端 `run.cancelled` → `cancelled`；404 → `failed` + 错误可见；网络失败 → 可见且可重试；真实卸载仍只断流不调后端。`agentStop.integration.test.tsx` 新增 2 项界面级 StrictMode 用例 —— 按钮禁用 + "正在停止…"、失败提示可见。
+
+**改动文件**
+
+- `src/mini_deerflow/harness_runner.py`
+- `tests/test_tool07_process_tree_recovery.py`
+- `frontend/src/features/threads/useAgentStream.ts`、`useAgentStream.test.tsx`、`agentStop.integration.test.tsx`
+
+**提交（保留历史轮次，未 squash）**
+
+- `5b734c4` R1 回收状态按每次 run 隔离，补双项目并发夹具
+- `25249e7` R7 StrictMode 重放后恢复"已挂载"标记，取消反馈不再被抑制
+
+**验证命令与实际结果**
+
+```
+# 定向（后端 TOOL-07 返修范围 + 既有 stop 链路 e2e）
+python -m pytest tests/test_tool07_process_tree_recovery.py tests/test_tool07_harness_permission_e2e.py tests/test_tool07_demo_timeout.py tests/test_tool_authorization_integration.py tests/test_cancel_semantics.py "tests/test_project_execute_e2e.py::test_停止入口_取消链路_进程回收_锁释放" -q
+→ 31 passed in 32.48s
+
+# 后端全量（当前 25249e7）
+python -m pytest -q --tb=no -rf
+→ 22 failed, 3548 passed, 1 skipped, 42 subtests passed in 289.76s
+
+# 基线 ae556cf（git worktree D:/tmp/baseline-ae556cf + PYTHONPATH 隔离，未回滚工作区）
+→ 28 failed, 3525 passed, 1 skipped, 42 subtests passed
+
+# 前端
+cd frontend && npx vitest run
+→ Test Files 40 passed (40)，Tests 463 passed (463)
+cd frontend && npx oxlint .
+→ 0 error（warning 全为既有）
+cd frontend && npx tsc -p tsconfig.app.json --noEmit
+→ 仅 2 处既有报错（inspector/realTaskAdapter.ts，本 PR 未改）
+```
+
+**失败清单逐项对比（按名称与错误，不按数量）**
+
+脚本提取三次运行的 `FAILED` 行集合做差集：
+
+| 对比对象 | 新增失败 |
+|--------|---------|
+| 基线 `ae556cf` | **0** |
+| 上一轮 head `19d420f` | **0** |
+
+- 当前 22 项与基线共有 22 项、上一轮 22 项**完全同一集合**，错误摘要逐条一致 → 既有失败
+- 基线有、当前无：6 项 `tests/test_harness_runner_integration.py`（R1 修复）
+- 通过数 3547 → 3548：+1 = 新增并发夹具 1 项
+
+**判别力验证（夹具确实能抓到缺陷）**
+
+- R1：用**运行时 monkeypatch 还原旧的"实例共享"语义**（不改源码），跑同一并发场景 → 断言失败，表现为「A 收口把 B 的树一起杀了」（心跳不再增长）。与审查在 POSIX 上观察到的「B 取消后心跳仍增长」是同一处共享状态缺陷的两面。
+- R7：把 `useAgentStream.ts` 复制一份、**删掉那行 setup 恢复**，用同一份测试跑 → **4 条 StrictMode 用例失败**（`idle ≠ cancelling`、`idle ≠ failed`），与审查的最小复现一致。两份临时副本已删除，未改动仓库源码。
+
+**冻结 / 未重做项**
+
+- **R4 / R5 / R6：保持关闭**，本轮未重做
+- 已关闭的 R2/R3、取消异常映射、C4 既有 5 项真实 stdio 夹具证据：保持冻结
+- C4「MCP 撤权 handler 阻断」仍未完成：MCP 栈在基线即不可用（`test_mcp.py` 10 项在基线同样失败）
+
+**HTTP/SSE 验证与聊天界面人工验收（分开记录）**
+
+- HTTP/SSE 侧：第 1 轮已记录（见 `1fcaf38`）；本轮**未**新增浏览器人工体验记录
+- 聊天界面人工验收：**仍未做**。本轮前端新增的是 StrictMode 自动化证据（jsdom + 本地 mock），**不据此**判定四项浏览器/人工体验条目完成
+- Windows Job Object 实机行为：本轮**未**在 Windows 上单独验证跨 Job 场景以外的额外路径；并发夹具本身在 Windows 上跑通（Job Object 路径生效）
+
+**未验证 / 待办**
+
+- 聊天界面人工验收（派发 / 进度 / 停止 / 结果展示）仍需协调窗口安排
+- C4 待 MCP 栈修复后补测
+- PR #6 已更新并绑定上述 SHA；**不自动合并**，等待独立复审；**TOOL-07 尚未通过，不进入后续模块**
+
+**下一步**
+
+协调窗口安排独立复审 + 聊天界面人工验收；C4 待 MCP 栈修复后补测。
