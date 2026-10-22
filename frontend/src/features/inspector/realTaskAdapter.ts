@@ -100,6 +100,9 @@ export function ingestRealTaskData(
       },
       files: [],
       events,
+      // 必须记录：下一轮 ingest 用它判断"是否开始了新 run"，
+      // 缺省会变成 undefined，使任何 runId 都被误判成新 run 而清空已有结果。
+      run_id_marker: data.runId,
     })
     return
   }
@@ -187,9 +190,14 @@ function mapStreamStatus(status: StreamStatus | null): TaskStatus {
       return 'stopped'
     case 'timed_out':
       return 'timeout'
+    // 还没有任何 Run：不得显示"运行中"（产品口径：暂无运行）。
+    // idle 是流的初始状态，null 表示根本没有流信息 —— 两者都等同于无 Run。
     case 'idle':
+    case null:
+      return 'no_run'
     case 'connecting':
     case 'streaming':
+      return 'running'
     default:
       return 'running'
   }
@@ -328,30 +336,6 @@ function parseUnifiedDiff(diff: string): DiffLine[] {
     }
   }
   return result
-}
-
-function buildTaskResult(threadId: string, data: RealTaskDataInput): TaskResult {
-  // 已废弃：原实现每次都重建 task 并把 files/validation 重置为空，
-  // 导致「重新进入 thread」或「SSE 重连」时把上一次 run.result 的成果清空。
-  // 保留以避免外部测试引用；新逻辑在 ingestRealTaskData 内联处理。
-  const status = mapStreamStatus(data.streamStatus)
-  return {
-    thread_id: threadId,
-    run_label: data.runId
-      ? `run-${data.runId.slice(0, 4)} · 归属当前会话`
-      : `thread: ${threadId} · 尚未建立 Run`,
-    title: data.title,
-    status,
-    validation: {
-      status: 'not_run',
-      command: null,
-      output: null,
-      note: '执行器输出尚未通过 run.result 事件推送。',
-    },
-    files: [], // 默认空；run.result 事件触发更新
-    events: data.events.map(convertToTimelineEvent),
-    run_id_marker: data.runId,
-  }
 }
 
 // ---- 工具：把 SSE RunEvent 转为 TaskEvent 时间线条目 ----

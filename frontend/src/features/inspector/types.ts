@@ -5,8 +5,14 @@
  * - 任务状态与验证状态分开建模（执行完成 ≠ 业务验收通过）
  * - 没有命令证据（command/output 为 null）时，UI 不得显示测试通过
  */
-/** 任务状态 */
+/**
+ * 任务状态
+ *
+ * `no_run` 与 `running` 必须分开：还没有任何 Run 时说"运行中"是假的
+ * （产品口径：暂无运行）。
+ */
 export type TaskStatus =
+  | 'no_run'
   | 'running'
   | 'completed'
   | 'failed'

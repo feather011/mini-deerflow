@@ -101,7 +101,8 @@ describe('realTaskAdapter 缓存归属', () => {
 
 describe('realTaskAdapter 状态映射', () => {
   const statusCases: Array<{ status: StreamStatus | null; expected: string }> = [
-    { status: 'idle', expected: 'running' },
+    // idle / null 都意味着"还没有任何 Run"，不能说成运行中
+    { status: 'idle', expected: 'no_run' },
     { status: 'connecting', expected: 'running' },
     { status: 'streaming', expected: 'running' },
     { status: 'completed', expected: 'completed' },
@@ -110,7 +111,7 @@ describe('realTaskAdapter 状态映射', () => {
     { status: 'stopped', expected: 'stopped' },
     { status: 'cancelled', expected: 'stopped' },
     { status: 'timed_out', expected: 'timeout' },
-    { status: null, expected: 'running' },
+    { status: null, expected: 'no_run' },
   ]
 
   for (const { status, expected } of statusCases) {
@@ -124,6 +125,109 @@ describe('realTaskAdapter 状态映射', () => {
       expect(realTaskAdapter.getTask('thread-Z')?.status).toBe(expected)
     })
   }
+})
+
+// ---- 无 Run 语义 + run_id_marker 回归防护 ----
+
+describe('realTaskAdapter 无 Run 语义', () => {
+  it('流未开始（idle）时状态是 no_run，不得是 running', () => {
+    ingestRealTaskData('thread-IDLE', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: 'IDLE',
+    })
+    expect(realTaskAdapter.getTask('thread-IDLE')?.status).not.toBe('running')
+    expect(realTaskAdapter.getTask('thread-IDLE')?.status).toBe('no_run')
+  })
+
+  it('无流信息（null）时同样是 no_run', () => {
+    ingestRealTaskData('thread-NULL', {
+      streamStatus: null,
+      events: [],
+      runId: null,
+      title: 'NULL',
+    })
+    expect(realTaskAdapter.getTask('thread-NULL')?.status).toBe('no_run')
+  })
+
+  it('无 Run 时副标题与「暂无运行」一致（都说明尚未建立 Run）', () => {
+    ingestRealTaskData('thread-LBL', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: 'LBL',
+    })
+    expect(realTaskAdapter.getTask('thread-LBL')?.run_label).toContain('尚未建立 Run')
+  })
+
+  it('首次 ingest 就必须落盘 run_id_marker', () => {
+    // 不变式：首次建立 task 时记录的 run_id_marker 必须等于当前 runId。
+    // 缺省（undefined）会让下一轮把同一个 run 误判成"新 run"从而清空结果。
+    ingestRealTaskData('thread-MARK', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-1',
+      title: 'MARK',
+    })
+    expect(realTaskAdapter.getTask('thread-MARK')?.run_id_marker).toBe('run-1')
+  })
+
+  it('同一 run 内后续事件不会清空 run.result 已写入的文件', () => {
+    // 首次 ingest 就带着 runId（重连后立刻收到事件的情形）
+    ingestRealTaskData('thread-RM', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-1',
+      title: 'RM',
+    })
+    ingestProjectExecuteResult(
+      'thread-RM',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: {
+          files: [
+            { path: 'hello.c', status: 'added', unified_diff: '@@ -0,0 +1,1 @@\n+line1' },
+          ],
+        },
+      }),
+    )
+    expect(realTaskAdapter.getTask('thread-RM')?.files).toHaveLength(1)
+
+    // 同一 run 的终态事件再进来一次 —— 文件必须还在
+    ingestRealTaskData('thread-RM', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-1',
+      title: 'RM',
+    })
+    expect(realTaskAdapter.getTask('thread-RM')?.files).toHaveLength(1)
+  })
+
+  it('换了一个 runId 才清空上一轮结果', () => {
+    ingestRealTaskData('thread-RM2', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-1',
+      title: 'RM2',
+    })
+    ingestProjectExecuteResult(
+      'thread-RM2',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: { files: [{ path: 'a.c', status: 'added', unified_diff: '@@ -0,0 +1,1 @@\n+x' }] },
+      }),
+    )
+    ingestRealTaskData('thread-RM2', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-2',
+      title: 'RM2',
+    })
+    expect(realTaskAdapter.getTask('thread-RM2')?.files).toEqual([])
+  })
 })
 
 // ---- 已知限制：files / validation 占位 ----

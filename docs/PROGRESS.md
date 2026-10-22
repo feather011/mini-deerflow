@@ -2976,3 +2976,57 @@ cd frontend && npx tsc -p tsconfig.app.json --noEmit
 
 - 用户就 F5 与「deleted 分支无 diff」给出处置决定
 - 新 SHA 提交后走**独立复审**；通过后再由用户决定是否合并
+---
+
+### TOOL-07 F5 定案返修（暂无运行）+ 两处 tsc 错误清理（2026-10-22）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：`ea4b2ca`（F1/F2/F3 提交）→ 本轮提交
+- 当前状态：**READY_FOR_REVIEW** —— 已推送至 `automation/tool-07` 并更新 PR #6，等待独立复审；**未合并**
+- 更新时间：2026-10-22
+- 依据：用户指示「无 Run 的产品口径明确为"暂无运行"，不能显示"运行中"」「deleted 无 diff、无 Run 两项已知问题暂不夹带修改」中的 deleted 一项」「推送后我审最新 head；目前不宣告修复通过，也不合并」
+
+**F5：产品口径落地为「暂无运行」**
+
+| 环节 | 改动 | 文件 |
+|------|------|------|
+| 类型 | `TaskStatus` 新增 `no_run`（与 `running` 分开：没有 Run 时说"运行中"是假的） | `frontend/src/features/inspector/types.ts` |
+| 文案 | `TASK_STATUS_META.no_run = { label: '暂无运行', tone: 'neutral' }` | `frontend/src/features/inspector/constants.ts` |
+| 映射 | `mapStreamStatus`：`idle`（流未开始）与 `null`（无流信息）→ `no_run`；`connecting` / `streaming` → `running` | `frontend/src/features/inspector/realTaskAdapter.ts` |
+
+- 修掉的自相矛盾：此前无 Run 时面板同时显示「运行中」和副标题「thread: xxx · 尚未建立 Run」。现在两者一致。
+- `deleted` 分支无 diff 正文**按用户指示未动**，仍列为下一轮候选。
+
+**两处既有 tsc 错误：已修，并纠正一条错误记录**
+
+- **上一轮我写过"tsc 通过、请复审时不用找"——该结论错误，此处纠正。** 根因：前端根 `tsconfig.json` 是 `files: []` + project references，直接在根目录跑 `npx tsc --noEmit` **不检查任何文件**，退出码 0 是空的。正确命令是 `npm run typecheck`（依次跑 `tsconfig.app.json` / `tsconfig.node.json` / `tsconfig.e2e.json`）。用正确命令复跑，用户独立执行时看到的两处错误**确实存在**，历史记录不作撤销。
+- `realTaskAdapter.ts` 首进入分支缺 `run_id_marker`：不只是类型错误，还是**潜在缺陷** —— 缺省为 `undefined`，下一轮 ingest 的 `isNewRun` 判断（`runId !== existing.run_id_marker`）会把**同一个 run** 误判成新 run，从而清空已到达的 `run.result` 结果。已补 `run_id_marker: data.runId`。
+- `buildTaskResult` 全仓库**零引用**（其注释所称"保留以避免外部测试引用"经检索不成立），是本会话早前重构留下的孤儿死代码，且触发 `noUnusedLocals` 使 `npm run build` 失败。按"清理自己制造的孤儿"规则删除。
+
+**测试调整说明（未放宽断言）**
+
+- `realTaskAdapter.test.ts` 原断言 `{status:'idle', expected:'running'}` 与 `{status:'null', expected:'running'}` 编码的是**被产品决策推翻的旧行为**，已改为 `no_run` —— 这是把断言收紧到新口径，不是放宽。
+- `TaskInspector.test.tsx` 对 `TASK_STATUS_META` 的 `toEqual` 是**穷举**断言，新增 `no_run` 后必须同步，否则映射表漏项不会被发现。
+- 新增不变式断言「首次 ingest 就落盘 `run_id_marker`」，直接锁住上面那个潜在缺陷。
+
+**验证证据（本轮实际执行）**
+
+| 范围 | 命令 | 结果 |
+|------|------|------|
+| 前端类型检查（**正确命令**） | `npm run typecheck` | **exit 0**，三份配置全过 |
+| 前端全量单测 | `npx vitest run` | **42 files / 491 tests passed**（上一提交为 483，+8） |
+| 前端 inspector 单测 | `npx vitest run src/features/inspector/` | 2 files / 56 passed |
+| 前端 lint | `npx oxlint src` | exit 0，0 error / 8 warning（既有） |
+| 后端 | 本轮未改后端 | 未重跑（`ea4b2ca` 的后端证据仍有效，本提交未触碰 `src/mini_deerflow/`） |
+
+**限制**
+
+- 判别力以**不变式断言**给出（`run_id_marker` 落盘值、`no_run` 文案与 pill 渲染），未做"回滚源码再跑同一份测试"的实测：分类器拦截了该做法，且它与"不回滚代码"的规矩冲突。
+- 未跑真实付费 Provider（按项目约束）。
+- 本轮未改后端，未重跑后端全量 pytest。
+
+**下一步**
+
+- 独立复审本提交（对应 PR #6 最新 head）。
+- **合并由用户决定**；复审通过前不宣告修复通过。
