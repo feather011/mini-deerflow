@@ -801,6 +801,12 @@ def create_project_execute_tool(
         if cancellation_token is not None:
             stop_event = CancellationToStopEvent(cancellation_token)
 
+        # 事件观察回调（可选）：把 harness 的协议事件原样透传给上层。
+        # 由调用方通过上下文提供（生产链路暂不提供 → None → 无额外行为）；
+        # 验收测试用它被动观察执行过程，不去抢读 harness 的 stdout 管道。
+        raw_on_event = getattr(context, "on_event", None) if context is not None else None
+        on_event = raw_on_event if callable(raw_on_event) else None
+
         # 仓库占用检查（与 ProjectService.delete 共用同一锁实例）
         project_lock = get_lock(project_id) if get_lock else None
         if project_lock is not None and not project_lock.acquire(blocking=False):
@@ -872,6 +878,7 @@ def create_project_execute_tool(
                 task_id=run_id,
                 repo_path=str(repo_path),
                 prompt=prompt,
+                on_event=on_event,
                 stop_event=stop_event,
             )
 

@@ -296,17 +296,41 @@ def _sha256(p: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def test_取消_子进程启动后_进程树回收(tmp_path):
-    """harness 子进程真的启动后才取消，验证进程树被回收。"""
+    """harness 子进程真的启动后才取消，验证进程树被回收。
+
+    R4 修订：
+    - **被动观察**：不再另开一个线程去 `proc.stdout.readline()`（那会与
+      `HarnessRunner._supervise` 的 read_stdout 线程抢同一根管道，
+      tool_start 可能被谁先读到不确定）。改为只用 Runner 既有的
+      `on_event` 回调观察协议流。
+    - **ready 标记**：tool_start 事件发生在 handler 执行之前，不能证明
+      bash/sleep 子进程真的起来了。改由被执行的命令自己写 ready 文件，
+      文件出现才算"后代已启动"。
+    - **verification 真实 schema**：verification 条目来自 bash 的 tool_done
+      事件，字段是 command/command_truncated/output/output_truncated/
+      exit_code/duration_s/has_output——**没有 name 字段**。原来的
+      `v.get("name") == "bash"` 永远为空，等于什么都没断言。
+      现在用一个"先完成、后被取消"的命令对，拿到真实的完成记录来校验
+      schema（command + exit_code），再断言被取消的命令没有完成记录。
+    """
     from mini_deerflow.middleware import CancellationToken
 
     sentinel = "cancelled_sentinel.txt"
-    bash_cmd = f"sleep 5 && echo done > {sentinel} && sleep 25"
+    ready_marker = "c1_ready.txt"
+    setup_marker = "c1_setup.txt"
+    # 第一条命令：很快跑完 → 产生真实的 bash 完成记录（校验 verification schema）
+    setup_cmd = f"echo setup > {setup_marker}"
+    # 第二条命令：先写 ready 标记（证明后代已启动），再等 6s 写 sentinel
+    # （sentinel 若出现说明进程树没被回收），最后继续睡
+    long_cmd = (
+        f"echo ready > {ready_marker} && sleep 6 && echo done > {sentinel} && sleep 25"
+    )
 
     scenario = {
-        "tools": [{
-            "name": "bash",
-            "arguments": {"command": bash_cmd},
-        }],
+        "tools": [
+            {"name": "bash", "arguments": {"command": setup_cmd}},
+            {"name": "bash", "arguments": {"command": long_cmd}},
+        ],
     }
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -315,30 +339,25 @@ def test_取消_子进程启动后_进程树回收(tmp_path):
     try:
         token = CancellationToken()
 
-        cancel_signal = threading.Event()
         cancel_at = [None]
-        seen_tool_start = [False]
+        seen_events: list[dict] = []
+
+        def _on_event(payload: dict) -> None:
+            # 只观察，不消费：HarnessRunner 内部线程仍负责读管道
+            seen_events.append(payload)
+
+        # staticmethod：类命名空间里的函数会变成绑定方法，静态方法才拿到
+        # 原始 payload（HarnessRunner 对回调异常是静默吞掉的）
+        _on_event_static = staticmethod(_on_event)
 
         def _canceller():
+            # 等被执行的命令自己写出 ready 标记 —— 这才证明后代真的启动了
             deadline = time.monotonic() + 25.0
             while time.monotonic() < deadline:
-                proc = getattr(runner, "_last_process", None)
-                if proc is not None and proc.stdout is not None:
-                    try:
-                        line = proc.stdout.readline()
-                    except Exception:
-                        line = ""
-                    if line:
-                        line = line.strip()
-                        try:
-                            ev = json.loads(line)
-                        except Exception:
-                            ev = {}
-                        if ev.get("type") == "tool_start" and ev.get("name") == "bash":
-                            seen_tool_start[0] = True
-                            token.cancel()
-                            cancel_at[0] = time.monotonic()
-                            return
+                if (repo / ready_marker).exists():
+                    token.cancel()
+                    cancel_at[0] = time.monotonic()
+                    return
                 time.sleep(0.05)
 
         result_holder: dict = {}
@@ -367,6 +386,7 @@ def test_取消_子进程启动后_进程树回收(tmp_path):
                 ctx = type("Ctx", (), {
                     "thread_id": tid, "run_id": f"r-{unique}",
                     "project_id": pid, "cancellation_token": token,
+                    "on_event": _on_event_static,
                 })()
                 result_holder["raw"] = tool.handler(
                     {"task": "bash sleep", "context": ""}, ctx,
@@ -374,21 +394,21 @@ def test_取消_子进程启动后_进程树回收(tmp_path):
                 result_holder["pid"] = pid
             except Exception as exc:
                 result_holder["error"] = exc
-            finally:
-                cancel_signal.set()
 
         invoke_t = threading.Thread(target=_invoke, daemon=True)
         cancel_t = threading.Thread(target=_canceller, daemon=True)
         invoke_t.start()
         cancel_t.start()
 
-        cancel_signal.wait(timeout=15.0)
+        invoke_t.join(timeout=40)
+        cancel_t.join(timeout=5)
+
         assert "error" not in result_holder, f"tool 异常: {result_holder.get('error')}"
-        assert seen_tool_start[0], (
-            "未从 harness stdout 读到 bash 的 tool_start 事件——"
-            "R4 ready 信号缺失，测试无法验证取消前的进程已存活"
+        assert cancel_at[0] is not None, (
+            "canceller 未等到被取消命令写出的 ready 标记——"
+            "无法证明取消前后代已启动"
         )
-        assert cancel_at[0] is not None, "canceller 未等到 tool_start"
+        assert (repo / ready_marker).exists(), "ready 标记不存在"
 
         result = json.loads(result_holder["raw"])
         pid = result_holder["pid"]
@@ -401,25 +421,59 @@ def test_取消_子进程启动后_进程树回收(tmp_path):
         elapsed = time.monotonic() - cancel_at[0]
         assert elapsed < 15.0, f"cancel → 终态应在 <15s，实际 {elapsed:.2f}s"
 
+        # 被动观察到的协议流：started 有、tool_start 有、done 没有（被取消）
+        types = [e.get("type") for e in seen_events]
+        assert "started" in types, f"未观察到 started 事件: {types}"
+        assert "tool_start" in types, f"未观察到 tool_start 事件: {types}"
+        assert "done" not in types, f"被取消的运行不应有 done 终态: {types}"
+
         from mini_deerflow.runtime import _get_project_lock
         lock = _get_project_lock(pid)
         assert lock.acquire(blocking=False), "取消后项目锁未释放"
         lock.release()
 
-        # 有界行为验证：等待超过 sleep 5，sentinel 永不出现
-        deadline = time.monotonic() + 7.0
+        # 有界行为验证：等待超过 sleep 6，sentinel 永不出现
+        deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
             if (repo / sentinel).exists():
                 pytest.fail(
-                    f"子进程树未被回收：sleep 5 后 bash 写出了 sentinel，"
-                    f"说明 taskkill /T 漏了 bash 子进程"
+                    f"子进程树未被回收：sleep 6 后 bash 写出了 sentinel，"
+                    f"说明整组回收漏了 bash 子进程"
                 )
             time.sleep(0.1)
 
+        # verification：真实 schema 校验（没有 name 字段）
         verification = result.get("verification", [])
-        bash_done = [v for v in verification if v.get("name") == "bash"]
-        assert not bash_done, (
-            f"bash handler 不该跑完（被取消），但 verification 含: {bash_done}"
+        assert isinstance(verification, list), f"verification 应为列表: {verification}"
+        schema_keys = {
+            "command", "command_truncated", "output", "output_truncated",
+            "exit_code", "duration_s", "has_output",
+        }
+        for entry in verification:
+            assert schema_keys.issubset(set(entry)), (
+                f"verification 条目不符合真实 schema: {entry}"
+            )
+
+        # 已完成的那条命令 → 真实记录（含 command 与 exit_code）
+        completed = [v for v in verification if setup_marker in str(v.get("command", ""))]
+        assert completed, (
+            f"先完成的命令应留下 bash 记录（用于校验 verification schema）；"
+            f"实际 verification={verification}"
+        )
+        assert completed[0].get("exit_code") == 0, (
+            f"已完成命令的 exit_code 应为 0: {completed[0]}"
+        )
+        assert completed[0].get("has_output") is True, (
+            f"已完成命令应有输出: {completed[0]}"
+        )
+
+        # 被取消的命令 → 不得有完成记录（"not completed" 的真实事实）
+        cancelled_entries = [
+            v for v in verification
+            if sentinel in str(v.get("command", "")) or ready_marker in str(v.get("command", ""))
+        ]
+        assert not cancelled_entries, (
+            f"被取消的命令不该有完成记录，但 verification 含: {cancelled_entries}"
         )
 
         proc = runner._last_process

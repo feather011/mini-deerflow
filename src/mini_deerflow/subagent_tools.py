@@ -9,7 +9,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from mini_deerflow.subagent_executor import CancellationToken, SubagentBudget, SubagentManager
 from mini_deerflow.subagent_models import (
@@ -18,6 +18,9 @@ from mini_deerflow.subagent_models import (
     TaskStatus,
 )
 from mini_deerflow.tools import Tool, ToolRegistry
+
+if TYPE_CHECKING:
+    from mini_deerflow.models import Model
 
 
 # --- 工具结果工厂 ---
@@ -84,7 +87,10 @@ def _check_int(args: dict, name: str, field: str, min_val: int | None = None) ->
 
 class _SubmitHandler:
     """subagent_submit handler。"""
-    __slots__ = ("_manager", "_parent_run_id", "_parent_thread_id", "_depth", "_thread_store")
+    __slots__ = (
+        "_manager", "_parent_run_id", "_parent_thread_id", "_depth",
+        "_thread_store", "_model", "_registry",
+    )
 
     def __init__(
         self,
@@ -93,6 +99,8 @@ class _SubmitHandler:
         parent_thread_id: str,
         depth: int = 1,
         thread_store: "InMemoryThreadStore | None" = None,
+        model: "Model | None" = None,
+        registry: "ToolRegistry | None" = None,
     ) -> None:
         self._manager = manager
         self._parent_run_id = parent_run_id
@@ -100,6 +108,11 @@ class _SubmitHandler:
         self._depth = depth
         # TOOL-02：子代理与父共享 ThreadStore（用于反查 project_id）
         self._thread_store = thread_store
+        # 子任务执行依赖（模型 / 工具注册表）：由 submit 调用带入，
+        # 由 Manager 在 worker 线程里装配成 SubagentRunner。
+        # 不传则沿用 Manager 默认（FakeModel + 空注册表）。
+        self._model = model
+        self._registry = registry
 
     def __call__(self, arguments: dict[str, object], context: object | None = None) -> str:
         tool_name = "subagent_submit"
@@ -171,6 +184,8 @@ class _SubmitHandler:
                 depth=self._depth,
                 timeout_seconds=timeout if timeout else None,
                 budget=budget,
+                model=self._model,
+                registry=self._registry,
                 context_policy=policy,
                 parent_granted_capabilities=parent_caps,
                 parent_project_id=parent_project_id,
