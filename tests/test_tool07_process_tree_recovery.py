@@ -55,7 +55,9 @@ import time
 _CHILD = r"""
 import os, signal, sys, time
 mode = os.environ.get("FAKE_TREE_MODE", "normal")
-work = os.environ["FAKE_TREE_DIR"]
+# 未指定 FAKE_TREE_DIR 时写进自己的工作目录（cwd = 项目仓库），
+# 这样同一 Runner 的多个并发 run 各写各的目录，互不干扰。
+work = os.environ.get("FAKE_TREE_DIR") or os.getcwd()
 if mode == "ignore_term":
     try:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -81,7 +83,7 @@ def _emit(payload):
 
 def main():
     mode = os.environ.get("FAKE_TREE_MODE", "normal")
-    work = os.environ.get("FAKE_TREE_DIR", "")
+    work = os.environ.get("FAKE_TREE_DIR") or os.getcwd()
     child = subprocess.Popen([sys.executable, "-c", _CHILD])
     _emit({"type": "started", "task_id": "fake", "child_pid": child.pid})
     ready = os.path.join(work, "child_ready.txt")
@@ -360,3 +362,105 @@ def test_超时_后代被强制回收_锁释放(tmp_path):
     lock = _get_project_lock(holder["pid"])
     assert lock.acquire(blocking=False), "超时后项目锁未释放"
     lock.release()
+
+
+def test_并发_不同项目共用同一Runner_回收互不串(tmp_path):
+    """两个项目并发跑在**同一个** Runner 上（生产装配只建一个 Runner）。
+
+    复审 R1 的最小复现：回收标记 / Job 句柄原来是 Runner 的实例状态，
+    A 收口把"已回收"标记留给 B → B 的取消被整段跳过 → B 的后代继续写
+    工作区、锁不释放。
+
+    断言：
+      1. A 取消收口后，B 的后代**仍在**写心跳（A 结束不误杀 B）
+      2. B 随后取消 → 终态 stopped，且 B 的后代**不再**写心跳
+      3. A / B 两个项目的锁都释放
+    """
+    from mini_deerflow.middleware import CancellationToken
+    from mini_deerflow.runtime import _get_project_lock
+
+    fake_root = _make_fake_harness_root(tmp_path)
+    repo_a = tmp_path / "repo_a"
+    repo_a.mkdir()
+    repo_b = tmp_path / "repo_b"
+    repo_b.mkdir()
+
+    # 生产装配形态：一个 Runner，多个项目共用
+    runner = HarnessRunner(
+        harness_root=str(fake_root),
+        python_exe=sys.executable,
+        timeout_seconds=60.0,
+        max_tool_calls=10,
+    )
+    # 忽略 SIGTERM 的后代：只有真正整组强杀才会停 —— 夹具更严格
+    runner.set_extra_env({"FAKE_TREE_MODE": "ignore_term"})
+
+    token_a = CancellationToken()
+    token_b = CancellationToken()
+    holder_a: dict = {}
+    holder_b: dict = {}
+
+    def _run(holder, repo, token):
+        try:
+            holder["result"], holder["pid"] = _run_project_execute(
+                runner, repo_path=repo, token=token,
+            )
+        except Exception as exc:  # noqa: BLE001
+            holder["error"] = exc
+
+    thread_a = threading.Thread(target=_run, args=(holder_a, repo_a, token_a), daemon=True)
+    thread_b = threading.Thread(target=_run, args=(holder_b, repo_b, token_b), daemon=True)
+    thread_a.start()
+    thread_b.start()
+
+    # 两边的后代都起来（各自写在自己的仓库目录里）
+    assert _wait_for(lambda: (repo_a / "child_ready.txt").exists(), 30.0), (
+        "A 的后代进程未在 30s 内启动，夹具无效"
+    )
+    assert _wait_for(lambda: (repo_b / "child_ready.txt").exists(), 30.0), (
+        "B 的后代进程未在 30s 内启动，夹具无效"
+    )
+    assert _heartbeat(repo_a) >= 1 and _heartbeat(repo_b) >= 1, "后代心跳未启动"
+
+    # 先取消 A
+    token_a.cancel()
+    thread_a.join(timeout=40)
+    assert not thread_a.is_alive(), "A 取消后工具未在 40s 内返回"
+    assert "error" not in holder_a, f"A 工具异常: {holder_a.get('error')}"
+    result_a = holder_a["result"]
+    assert result_a.get("ok") is False, f"A 取消后应 ok=false: {result_a}"
+    assert result_a.get("status") == "stopped", (
+        f"A 终态应为 stopped，实际: {result_a.get('status')}"
+    )
+
+    # A 自己的进程树必须被回收（只回收本 run 的树）
+    _assert_descendant_stopped(repo_a, "[并发 A]")
+
+    # A 的收口不得误杀 B：B 的后代应继续写心跳
+    hb_b_before = _heartbeat(repo_b)
+    time.sleep(1.2)
+    hb_b_after = _heartbeat(repo_b)
+    assert hb_b_after > hb_b_before, (
+        f"A 收口后 B 的后代不再写心跳（{hb_b_before} → {hb_b_after}）："
+        f"A 的回收误伤了 B，或 B 已被提前杀掉"
+    )
+
+    # 再取消 B：这次必须真的回收整棵进程树
+    token_b.cancel()
+    thread_b.join(timeout=40)
+    assert not thread_b.is_alive(), "B 取消后工具未在 40s 内返回"
+    assert "error" not in holder_b, f"B 工具异常: {holder_b.get('error')}"
+    result_b = holder_b["result"]
+    assert result_b.get("ok") is False, f"B 取消后应 ok=false: {result_b}"
+    assert result_b.get("status") == "stopped", (
+        f"B 终态应为 stopped，实际: {result_b.get('status')}"
+    )
+
+    # B 的后代必须停止（B 的回收不能再被跳过）
+    _assert_descendant_stopped(repo_b, "[并发 B]")
+
+    # 两个项目的锁都释放
+    for label, holder in (("A", holder_a), ("B", holder_b)):
+        lock = _get_project_lock(holder["pid"])
+        assert lock.acquire(blocking=False), f"{label} 的项目锁未释放"
+        lock.release()

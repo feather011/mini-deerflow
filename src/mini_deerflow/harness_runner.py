@@ -322,8 +322,33 @@ def _terminate_process_tree(
             pass
 
 
+class _RunState:
+    """**单次 run** 的执行上下文：进程句柄 / Job 句柄 / 回收标记。
+
+    为什么不能放在 Runner 实例上：生产装配只建**一个** HarnessRunner
+    （`runtime.py`），而项目锁只互斥**同一个 project_id** —— 不同项目
+    的任务会并发跑在同一个 Runner 上。实例级状态会让 A 的收口把
+    "已回收"标记和 Job 句柄留给 B：B 的取消要么被跳过（进程树残留、
+    继续写工作区、继续占锁），要么取到 A 的句柄（跨运行误杀）。
+
+    因此这三样东西必须按**每一次 run** 归属。
+    """
+
+    __slots__ = ("process", "job", "terminated")
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen | None = None
+        self.job: int | None = None
+        self.terminated = False
+
+
 class HarnessRunner:
-    """驱动一次 harness 非交互执行；同一实例可顺序复用。"""
+    """驱动一次 harness 非交互执行；同一实例可顺序复用。
+
+    **并发**：同一实例可被多个项目并发使用（生产装配只建一个 Runner），
+    因此每次 run 的进程句柄 / Job 句柄 / 回收标记都放在 `_RunState` 里，
+    不放在实例属性上。
+    """
 
     def __init__(
         self,
@@ -343,11 +368,9 @@ class HarnessRunner:
         self._extra_env: dict[str, str] = {}
         # 最近一次 run() 启动的子进程句柄；终态后 poll() 应非 None，
         # 供调用方（及验收测试）核查进程树确实被回收。
+        # **仅供诊断**：并发时它可能指向另一轮 run，真正用于回收的句柄
+        # 存在每次 run 自己的 `_RunState` 里。
         self._last_process: subprocess.Popen | None = None
-        # Windows Job Object 句柄（进程组的等价物）：关闭即杀掉整棵树
-        self._last_job: int | None = None
-        # 本次 run 的进程树是否已回收（_terminate_tree 幂等）
-        self._tree_terminated = False
 
     @property
     def is_configured(self) -> bool:
@@ -422,8 +445,8 @@ class HarnessRunner:
         env = self.build_env(extra_env)
 
         prompt_file: str | None = None
-        self._last_job = None
-        self._tree_terminated = False
+        # 本次 run 独占的执行上下文（并发安全的关键）
+        state = _RunState()
         try:
             fd, prompt_file = tempfile.mkstemp(suffix=".txt", prefix="harness-prompt-")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -477,48 +500,57 @@ class HarnessRunner:
             # 留下进程句柄供调用方核查回收结果：终态后 process.poll()
             # 必须非 None，证明子进程真的退出（而不是仅仅"报告了终态"）。
             self._last_process = process
+            state.process = process
 
             # R1：Windows 上把子进程放进 Job Object —— 进程组的等价物。
             # 后代自动继承成员身份，关闭 Job 即整棵树消失（含根进程先死、
             # 后代被孤儿化的情况：taskkill /T 依赖 PPID 链，根进程一死
             # 就定位不到后代了）。创建失败时退回 taskkill /T /F 路径。
-            self._last_job = _create_kill_on_close_job(process)
+            # 句柄存在**本次 run 自己的 state** 里：并发时不与别的运行串。
+            state.job = _create_kill_on_close_job(process)
 
             return self._supervise(
-                process, task_id, on_event=on_event, stop_event=stop_event
+                process, state, task_id, on_event=on_event, stop_event=stop_event
             )
         finally:
-            # 兜底：若 _supervise 提前抛出，Job 里的后代也不能留下
-            self._close_job()
+            # 兜底：若 _supervise 提前抛出，本次 run 的 Job 里的后代也不能留下
+            self._close_job(state)
             if prompt_file:
                 try:
                     os.unlink(prompt_file)
                 except OSError:
                     pass
 
-    def _close_job(self) -> None:
-        """关闭本次 run 的 Job 句柄：残留后代（孤儿）随之被杀。"""
-        job = self._last_job
-        self._last_job = None
+    def _close_job(self, state: _RunState) -> None:
+        """关闭**本次 run** 的 Job 句柄：残留后代（孤儿）随之被杀。"""
+        job = state.job
+        state.job = None
         if job is not None:
             _close_kill_job(job)
 
-    def _terminate_tree(self, process: subprocess.Popen) -> None:
-        """回收本次 run 的整棵进程树（幂等）。
+    def _terminate_tree(self, state: _RunState) -> None:
+        """回收**本次 run** 的整棵进程树（幂等，仅对本次 run 生效）。
 
         根进程退出 **不代表** 整组退出：后代可能忽略 SIGTERM 而继续运行，
         根进程先死时也定位不到后代。因此必须在根进程退出后复查整组。
+
+        回收标记与 Job 句柄都取自本次 run 的 `state`，**不使用实例状态**：
+        否则并发时 A 的收口会把 B 的回收跳过（进程树残留）或让 B 取到
+        A 的 Job 句柄（跨运行误杀）。
         """
-        if self._tree_terminated:
+        if state.terminated:
             return
-        self._tree_terminated = True
-        job = self._last_job
-        self._last_job = None
-        _terminate_process_tree(process, job=job)
+        state.terminated = True
+        job = state.job
+        state.job = None
+        process = state.process
+        if process is not None:
+            _terminate_process_tree(process, job=job)
 
     def _supervise(
         self,
         process: subprocess.Popen,
+        run_state: _RunState,
         task_id: str,
         *,
         on_event=None,
@@ -619,7 +651,7 @@ class HarnessRunner:
         while True:
             if stop_event is not None and stop_event.is_set():
                 stopped = True
-                self._terminate_tree(process)
+                self._terminate_tree(run_state)
                 break
             try:
                 exit_code = process.wait(timeout=0.2)
@@ -627,12 +659,12 @@ class HarnessRunner:
             except subprocess.TimeoutExpired:
                 if time.monotonic() >= deadline:
                     timed_out = True
-                    self._terminate_tree(process)
+                    self._terminate_tree(run_state)
                     break
 
         # 根进程退出 ≠ 整组退出：可能仍有孤儿后代存活（还会占着 stdout 管道）。
         # 统一再回收一次整组，确保不残留子进程、管道也能正常关闭。
-        self._terminate_tree(process)
+        self._terminate_tree(run_state)
 
         if exit_code is None:
             try:
