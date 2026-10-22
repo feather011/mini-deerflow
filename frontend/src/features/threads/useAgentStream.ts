@@ -14,9 +14,11 @@
  * - SSE 事件 → useReducer
  * - 输入框 → useState（在组件层）
  */
-import { useReducer, useEffect, useCallback, useRef } from 'react'
+import { useReducer, useEffect, useCallback, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { connectAgentStream, type StreamError } from '../../shared/api/streamClient'
+import { ApiError } from '../../shared/api/client'
+import { stopAgentRun } from './runsApi'
 import type { RunEvent, RunEventType } from '../../shared/types/events'
 import { threadKeys } from './queryKeys'
 
@@ -33,8 +35,19 @@ export type StreamStatus =
   | 'failed'      // 失败（run.failed）
   | 'timed_out'   // 超时（run.timed_out）
   | 'cancelled'   // 取消（run.cancelled）
-  | 'stopped'     // 用户手动停止接收
+  | 'stopped'     // 用户手动停止接收（仅断流，后端仍在跑）
   | 'error'       // HTTP 错误或网络错误
+
+/**
+ * 取消（真取消）状态
+ *
+ * - idle      ：没有待处理的取消请求
+ * - cancelling：已向后端发出 stop 请求，等待后端推 run.cancelled
+ * - cancelled ：后端已确认取消（收到 run.cancelled 终态）
+ * - failed    ：取消**失败**（后端没有正在运行的 Run / 网络错误）——
+ *               此时后端任务可能仍在运行，UI 不得谎称"已停止"
+ */
+export type CancelState = 'idle' | 'cancelling' | 'cancelled' | 'failed'
 
 /** 流状态 */
 export interface StreamState {
@@ -177,6 +190,21 @@ export interface UseAgentStreamOptions {
 export function useAgentStream({ threadId, message, autoStart = true }: UseAgentStreamOptions) {
   const queryClient = useQueryClient()
   const cancelRef = useRef<(() => void) | null>(null)
+  // 取消（真取消）状态
+  const [cancelState, setCancelState] = useState<CancelState>('idle')
+  const [cancelError, setCancelError] = useState<string | null>(null)
+  // 防重复：一次 run 只允许发一次取消请求
+  const cancelRequestedRef = useRef(false)
+  const cancelStateRef = useRef<CancelState>('idle')
+  const mountedRef = useRef(true)
+  // 本 hook 是否持有"正在运行的 run"（用 ref 而不是 reducer 状态：
+  // reducer 的 connecting 要等 runId promise 兑现才更新，不适合做门禁）
+  const runActiveRef = useRef(false)
+
+  const applyCancelState = useCallback((next: CancelState) => {
+    cancelStateRef.current = next
+    if (mountedRef.current) setCancelState(next)
+  }, [])
 
   const [state, dispatch] = useReducer(streamReducer, {
     status: 'idle',
@@ -203,6 +231,11 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
       cancelRef.current()
       cancelRef.current = null
     }
+    // 新的一轮 run：取消状态复位
+    cancelRequestedRef.current = false
+    runActiveRef.current = true
+    applyCancelState('idle')
+    if (mountedRef.current) setCancelError(null)
 
     const { runId, cancel } = connectAgentStream(threadId, effectiveMessage, {
       onEvent: (event) => {
@@ -215,6 +248,17 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
       },
       onTerminal: (event) => {
         dispatch({ type: 'TERMINAL', event })
+        runActiveRef.current = false
+        if (event.event_type === 'run.cancelled') {
+          // 后端确认取消：子进程已回收、锁已释放
+          applyCancelState('cancelled')
+        } else if (cancelStateRef.current === 'cancelling') {
+          // 取消请求送达前任务已自己结束：如实报告，不谎称"已取消"
+          applyCancelState('failed')
+          if (mountedRef.current) {
+            setCancelError('任务在取消请求生效前已结束')
+          }
+        }
         // 终态后失效当前 Thread 缓存
         void queryClient.invalidateQueries({ queryKey: threadKeys.detail(threadId) })
       },
@@ -233,9 +277,9 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
     })
 
     cancelRef.current = cancel
-  }, [threadId, message, queryClient])
+  }, [threadId, message, queryClient, applyCancelState])
 
-  // 停止接收
+  // 停止接收（仅断流）：用于会话切换 / 组件卸载，**不取消后端任务**
   const stop = useCallback(() => {
     if (cancelRef.current) {
       cancelRef.current()
@@ -243,6 +287,37 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
     }
     dispatch({ type: 'STOP' })
   }, [])
+
+  /**
+   * 停止当前任务（真取消）：调用后端 stop 接口。
+   *
+   * - 成功后**不**断流：等后端推 run.cancelled 终态，UI 才知道任务真的停了
+   * - 失败（404 = 后端没有正在运行的 Run / 网络错误）：状态置 failed，
+   *   错误文案如实透出，**不**把"仅断流"说成"任务已停止"
+   * - 重复点击只发一次请求（cancelRequestedRef）
+   */
+  const cancelRun = useCallback(async () => {
+    if (cancelRequestedRef.current) return
+    if (!runActiveRef.current) return
+    cancelRequestedRef.current = true
+    applyCancelState('cancelling')
+    if (mountedRef.current) setCancelError(null)
+    try {
+      await stopAgentRun(threadId)
+      // 后端已受理取消：保持 'cancelling'，等 run.cancelled 终态
+    } catch (err) {
+      cancelRequestedRef.current = false
+      const status = err instanceof ApiError ? err.status : 0
+      const message =
+        status === 404
+          ? '后端没有正在运行的 Run（可能已结束）'
+          : err instanceof Error
+            ? err.message
+            : '取消失败'
+      applyCancelState('failed')
+      if (mountedRef.current) setCancelError(message)
+    }
+  }, [threadId, applyCancelState])
 
   // 自动开始：message 必须非空才建立 SSE 流，避免空消息触发"运行中"假状态
   useEffect(() => {
@@ -252,9 +327,11 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
     }
   }, [autoStart, state.status, message, start])
 
-  // 组件卸载时断开
+  // 组件卸载时断开（仅断流，不取消后端任务）
   useEffect(() => {
     return () => {
+      mountedRef.current = false
+      runActiveRef.current = false
       if (cancelRef.current) {
         cancelRef.current()
         cancelRef.current = null
@@ -266,5 +343,8 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
     ...state,
     start,
     stop,
+    cancelRun,
+    cancelState,
+    cancelError,
   }
 }

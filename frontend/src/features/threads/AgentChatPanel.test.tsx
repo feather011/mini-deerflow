@@ -18,6 +18,9 @@ const mockUseAgentStream = vi.hoisted(() => vi.fn(() => ({
   terminalEvent: null,
   start: vi.fn(),
   stop: vi.fn(),
+  cancelRun: vi.fn(),
+  cancelState: 'idle' as 'idle' | 'cancelling' | 'cancelled' | 'failed',
+  cancelError: null as string | null,
 })))
 
 vi.mock('./useAgentStream', () => ({
@@ -49,6 +52,9 @@ describe('AgentChatPanel', () => {
       terminalEvent: null,
       start: vi.fn(),
       stop: vi.fn(),
+      cancelRun: vi.fn(),
+      cancelState: 'idle' as const,
+      cancelError: null,
     })
   })
 
@@ -323,5 +329,81 @@ describe('AgentChatPanel', () => {
     // submittingRef 已释放，发送按钮恢复可用
     expect(screen.getByRole('button', { name: '发送消息' })).not.toBeDisabled()
   })
-})
 
+  // -------------------------------------------------------------------------
+  // R7：停止按钮（真取消入口）在**可见的聊天界面**上
+  // -------------------------------------------------------------------------
+
+  it('运行中显示"停止"按钮', () => {
+    mockUseAgentStream.mockReturnValue({
+      ...mockUseAgentStream(),
+      status: 'streaming' as const,
+    })
+
+    render(<AgentChatPanel thread={emptyThread} />)
+
+    expect(screen.getByRole('button', { name: '停止当前任务' })).toBeInTheDocument()
+  })
+
+  it('空闲时不显示"停止"按钮', () => {
+    render(<AgentChatPanel thread={emptyThread} />)
+    expect(screen.queryByRole('button', { name: '停止当前任务' })).not.toBeInTheDocument()
+  })
+
+  it('点击"停止"调用 cancelRun（真取消，不是仅断流）', async () => {
+    const user = userEvent.setup()
+    const cancelRun = vi.fn()
+
+    mockUseAgentStream.mockReturnValue({
+      ...mockUseAgentStream(),
+      status: 'streaming' as const,
+      cancelRun,
+    })
+
+    render(<AgentChatPanel thread={emptyThread} />)
+    await user.click(screen.getByRole('button', { name: '停止当前任务' }))
+
+    expect(cancelRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('取消进行中：按钮禁用并显示"正在停止…"', () => {
+    mockUseAgentStream.mockReturnValue({
+      ...mockUseAgentStream(),
+      status: 'streaming' as const,
+      cancelState: 'cancelling' as const,
+    })
+
+    render(<AgentChatPanel thread={emptyThread} />)
+
+    const stopBtn = screen.getByRole('button', { name: '停止当前任务' })
+    expect(stopBtn).toBeDisabled()
+    expect(stopBtn.textContent).toContain('正在停止')
+  })
+
+  it('取消失败：如实提示后端任务可能仍在运行（不谎称已停止）', () => {
+    mockUseAgentStream.mockReturnValue({
+      ...mockUseAgentStream(),
+      status: 'streaming' as const,
+      cancelState: 'failed' as const,
+      cancelError: '后端没有正在运行的 Run（可能已结束）',
+    })
+
+    render(<AgentChatPanel thread={emptyThread} />)
+
+    expect(screen.getByText('取消失败')).toBeInTheDocument()
+    expect(screen.getByText(/后端任务可能仍在运行/)).toBeInTheDocument()
+    expect(screen.queryByText('已取消当前任务')).not.toBeInTheDocument()
+  })
+
+  it('后端确认取消后显示"已取消当前任务"', () => {
+    mockUseAgentStream.mockReturnValue({
+      ...mockUseAgentStream(),
+      status: 'cancelled' as const,
+      cancelState: 'cancelled' as const,
+    })
+
+    render(<AgentChatPanel thread={emptyThread} />)
+
+    expect(screen.getByText('已取消当前任务')).toBeInTheDocument()
+  })
+})

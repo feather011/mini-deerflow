@@ -73,6 +73,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
     currentText,
     start,
     stop,
+    cancelRun,
+    cancelState,
+    cancelError,
   } = useAgentStream({
     threadId: thread.thread_id,
     message: '',
@@ -210,6 +213,17 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
 
   const isStopped = streamStatus === 'stopped'
 
+  // 真实取消（真停止）：只在有正在运行的 run 时提供
+  const isRunning = streamStatus === 'connecting' || streamStatus === 'streaming'
+  const canStop = isRunning && cancelState !== 'cancelling' && cancelState !== 'cancelled'
+  const isStopping = cancelState === 'cancelling'
+  const isCancelled = streamStatus === 'cancelled' || cancelState === 'cancelled'
+
+  /** 点击"停止"：请求后端取消当前任务（不是仅断流） */
+  function handleStop() {
+    void cancelRun?.()
+  }
+
   // unknown 状态下：pendingSent 存在即可恢复（恢复只清 pendingSent，不影响新草稿 draft.current）
   const canRestore = submitStatus === 'unknown' && draft.pendingSent !== null
 
@@ -293,6 +307,43 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
           />
         )}
 
+        {/* 已取消：后端确认取消（子进程已回收、锁已释放） */}
+        {isCancelled && (
+          <ErrorNotice
+            error={{ status: 0, code: 'RUN_CANCELLED', message: '' }}
+            context="generic"
+            tone="info"
+            title="已取消当前任务"
+            description="后端已取消该 Run 并回收执行进程，项目锁已释放。"
+            dismissLabel="知道了"
+            onDismiss={() => {
+              setSubmitStatus('submitted')
+              setOptimisticMsg(null)
+              clearPendingSent()
+            }}
+            ariaLabel="已取消提示"
+          />
+        )}
+
+        {/* 取消失败：如实告知后端任务可能仍在运行（不得谎称已停止） */}
+        {cancelState === 'failed' && (
+          <ErrorNotice
+            error={{
+              status: 0,
+              code: 'CANCEL_FAILED',
+              message: cancelError ?? '取消失败',
+            }}
+            context="generic"
+            title="取消失败"
+            description={`${cancelError ?? '取消失败'}。后端任务可能仍在运行，请稍后重试或查看后端日志。`}
+            dismissLabel="关闭"
+            onDismiss={() => {
+              // 不改任何草稿/提交状态：任务状态未知，如实呈现
+            }}
+            ariaLabel="取消失败提示"
+          />
+        )}
+
         {/* 消息输入 */}
         <MessageComposer
           value={draft.current}
@@ -302,6 +353,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
           isSubmitting={submittingRef.current}
           hasPendingRestore={canRestore}
           onRestore={handleRestore}
+          canStop={canStop}
+          isStopping={isStopping}
+          onStop={handleStop}
         />
 
         {/* 上下文用量 */}

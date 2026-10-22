@@ -9,12 +9,20 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useAgentStream } from './useAgentStream'
 import type { ReactNode } from 'react'
 import type { RunEvent } from '../../shared/types/events'
+import { ApiError } from '../../shared/api/client'
 
 // Mock streamClient
 const mockConnectAgentStream = vi.hoisted(() => vi.fn())
 
 vi.mock('../../shared/api/streamClient', () => ({
   connectAgentStream: mockConnectAgentStream,
+}))
+
+// Mock 后端 stop 接口（真取消）
+const mockStopAgentRun = vi.hoisted(() => vi.fn())
+
+vi.mock('./runsApi', () => ({
+  stopAgentRun: mockStopAgentRun,
 }))
 
 describe('useAgentStream', () => {
@@ -30,6 +38,7 @@ describe('useAgentStream', () => {
       runId: Promise.resolve('run-1'),
       cancel: vi.fn(),
     })
+    mockStopAgentRun.mockResolvedValue({ status: 'stopped', thread_id: 't1' })
   })
 
   const wrapper = ({ children }: { children: ReactNode }) => (
@@ -223,5 +232,126 @@ describe('useAgentStream', () => {
 
       expect(result.current.status).toBe(expected)
     }
+  })
+
+  // -------------------------------------------------------------------------
+  // R7：真取消（stop → 后端取消 → run.cancelled）
+  // -------------------------------------------------------------------------
+
+  it('cancelRun 调用后端 stop 接口（绑定当前 thread）', async () => {
+    const { result } = renderHook(() => useAgentStream({ threadId: 't1', message: 'hi' }), { wrapper })
+    act(() => result.current.start())
+
+    await act(async () => {
+      await result.current.cancelRun()
+    })
+
+    expect(mockStopAgentRun).toHaveBeenCalledWith('t1')
+    expect(result.current.cancelState).toBe('cancelling')
+  })
+
+  it('cancelRun 防重复：连点只发一次请求', async () => {
+    const { result } = renderHook(() => useAgentStream({ threadId: 't1', message: 'hi' }), { wrapper })
+    act(() => result.current.start())
+
+    await act(async () => {
+      await Promise.all([result.current.cancelRun(), result.current.cancelRun()])
+      await result.current.cancelRun()
+    })
+
+    expect(mockStopAgentRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('取消成功后收到 run.cancelled 终态 → cancelState=cancelled', async () => {
+    let captured: ((event: RunEvent) => void) | null = null
+    mockConnectAgentStream.mockImplementation((_tid, _msg, opts) => {
+      captured = opts.onTerminal ?? null
+      return { runId: Promise.resolve('r'), cancel: vi.fn() }
+    })
+
+    const { result } = renderHook(() => useAgentStream({ threadId: 't1', message: 'hi' }), { wrapper })
+    act(() => result.current.start())
+    await act(async () => {
+      await result.current.cancelRun()
+    })
+
+    act(() => {
+      captured!({
+        run_id: 'r',
+        thread_id: 't1',
+        event_type: 'run.cancelled',
+        sequence: 1,
+        timestamp: 1000,
+        answer: null,
+        error: null,
+        attempt: null,
+        operation: null,
+        tool_name: null,
+        duration_seconds: null,
+      } as RunEvent)
+    })
+
+    expect(result.current.status).toBe('cancelled')
+    expect(result.current.cancelState).toBe('cancelled')
+    expect(result.current.cancelError).toBeNull()
+  })
+
+  it('取消失败（后端无正在运行的 Run）：如实报 failed，且不断流谎称已停止', async () => {
+    const mockCancel = vi.fn()
+    mockConnectAgentStream.mockReturnValue({
+      runId: Promise.resolve('run-1'),
+      cancel: mockCancel,
+    })
+    mockStopAgentRun.mockRejectedValue(
+      new ApiError({
+        status: 404,
+        code: 'NOT_FOUND',
+        message: '请求失败（404）',
+      }),
+    )
+
+    const { result } = renderHook(() => useAgentStream({ threadId: 't1', message: 'hi' }), { wrapper })
+    act(() => result.current.start())
+    const abortsBefore = mockCancel.mock.calls.length
+
+    await act(async () => {
+      await result.current.cancelRun()
+    })
+
+    expect(result.current.cancelState).toBe('failed')
+    expect(result.current.cancelError).toContain('没有正在运行的 Run')
+    // 关键：不能把"仅断流"当成"任务已停止" —— 取消失败不得 abort 流
+    expect(mockCancel.mock.calls.length).toBe(abortsBefore)
+    expect(result.current.status).not.toBe('cancelled')
+    expect(result.current.status).not.toBe('stopped')
+  })
+
+  it('取消失败后允许重试', async () => {
+    mockStopAgentRun.mockRejectedValueOnce(
+      new ApiError({ status: 0, code: 'NETWORK_ERROR', message: '无法连接到后端服务' }),
+    )
+
+    const { result } = renderHook(() => useAgentStream({ threadId: 't1', message: 'hi' }), { wrapper })
+    act(() => result.current.start())
+
+    await act(async () => {
+      await result.current.cancelRun()
+    })
+    expect(result.current.cancelState).toBe('failed')
+
+    await act(async () => {
+      await result.current.cancelRun()
+    })
+    expect(mockStopAgentRun).toHaveBeenCalledTimes(2)
+    expect(result.current.cancelState).toBe('cancelling')
+  })
+
+  it('stop（仅断流）不调用后端 stop 接口', () => {
+    const { result } = renderHook(() => useAgentStream({ threadId: 't1', message: 'hi' }), { wrapper })
+    act(() => result.current.start())
+    act(() => result.current.stop())
+
+    expect(mockStopAgentRun).not.toHaveBeenCalled()
+    expect(result.current.status).toBe('stopped')
   })
 })
