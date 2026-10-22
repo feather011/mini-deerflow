@@ -2849,3 +2849,130 @@ cd frontend && npx tsc -p tsconfig.app.json --noEmit
 - 等待**用户最终业务验收**与**合并决定**（合并需用户授权，本轮不自动合并）
 - 浏览器人工体验仍待协调窗口安排
 - TOOL-07 是本系列最后阶段：工具模块开发到此停止，不启动后续模块
+
+---
+
+### TOOL-07 浏览器人工验收 · 第一轮预演（2026-10-22）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：mini-deerflow `57106b7`（`automation/tool-07`，**无代码改动**）
+- 当前状态：**验收环境已就绪，第一轮浏览器预演已完成；4 项里 2 项达标、2 项发现问题（已记录，未修）**
+- 更新时间：2026-10-22
+- 依据：用户指示「TOOL-07 进入用户最终验收，你只需体验四件事」「体验发现的问题先记录」
+
+**本轮性质**
+
+- 本轮**不改生产代码**，只新增验收辅助物：
+  - `scripts/tool07_acceptance_server.py`（验收用后端：复用生产 `create_app()` + 全部生产路由，只把模型换成脚本化 `_AcceptanceModel`，harness 用自带 `FakeLLMClient` → **不联网、不计费**）
+  - `frontend/e2e/tool07-acceptance.mjs`、`frontend/e2e/tool07-acceptance2.mjs`（Playwright 驱动脚本，截图落在 `tool07-acceptance-shots/`）
+- 浏览器预演由 Claude Code 用**真实 Chromium** 驱动完成（不是 jsdom 夹具），但**不等于**用户本人的业务验收。
+
+**四项体验的实测结果**
+
+| 项 | 结论 | 实测证据 |
+|----|------|----------|
+| 1. 派发 | **通过** | 普通会话问「这个仓库是做什么的」→ 只读回答，**未派发任何工具**；项目会话问「写一个 hello.c」→ 事件流出现 `tool.started project_execute` → 真实 harness 子进程写出 `hello.c` |
+| 2. 进度 | **部分通过（发现问题 F2）** | 「查看任务 → 过程」页签时间线完整可读（Run 开始 → 模型开始 → Token 流式 → 模型完成 → 工具开始 project_execute → 工具完成 → 执行结果 → Run 完成，带时间戳）；但**聊天主视图运行中没有任何"正在执行什么"的提示** |
+| 3. 停止 | **通过** | 点「停止当前任务」→ 提示「已取消当前任务 / 后端已取消该 Run 并回收执行进程，项目锁已释放」；工作区当时**只有 `.git`、没有 `hello.c`**（被取消的轮次确实什么都没写）；随后同一会话**再次执行成功**并产出 `hello.c` |
+| 4. 结果 | **部分通过（发现问题 F1 / F3）** | 变化页签列出「1 个本轮变更文件 / A hello.c」、验证页签如实显示「未运行 / 本轮执行器运行完成，但未运行验证命令」、过程页签事件齐全；但**新增文件没有 diff 正文**（显示 `+0 −0`），且面板顶部挂着「交互原型 · 模拟数据」标签 |
+
+**补充的自动化旁证（HTTP/SSE 层，与人工验收分开记录）**
+
+- 停止链路：stop → 终态耗时 **6.9s**（假 LLM 单次 15s，说明进程树是被**真杀**而非等它自己跑完）；结束后**无残留 harness 进程**；被取消轮次的工作区**无产物**。
+- 取消轮的 `run.result` 内容诚实：`{"ok": false, "status": "stopped", "error": "收到停止请求，已终止执行进程", "files_written": [], "changes": {"files": []}}` —— 不会谎报成功。
+- 取消后再执行 → `run.completed`，工作区出现 `hello.c`。
+- 浏览器控制台错误：**无**。
+
+**本轮发现的问题（只记录，不在本轮修）**
+
+| 编号 | 问题 | 位置 | 影响 |
+|------|------|------|------|
+| **F1** | **新增文件不产出 `unified_diff`**：`changes.files` 里 `status: "added"` 的条目只有 `path`/`status`，没有 diff 正文，前端只能数出 `+0 −0` | 后端 `src/mini_deerflow/project_tools.py::_collect_changes`（仅 `status == "modified"` 才调 `_compute_diff`） | 验收项 4「diff 清楚准确」**不达标**；新建文件的改动内容看不到 |
+| **F2** | **聊天主视图没有运行中提示**：`AgentChatPanel.tsx:265` 的 `RunEventPanel` 被 `{false && ...}` 硬关闭，运行中主视图只剩输入框按钮变成「停止」 | `frontend/src/features/threads/AgentChatPanel.tsx` | 验收项 2「能看懂正在执行什么」**只在打开「查看任务 → 过程」后成立** |
+| **F3** | **面板顶部常驻「交互原型 · 模拟数据」标签**：`showDemoTag={panelOpen}`，只要打开任务面板就显示，而面板里装的是**真实** harness 结果 | `frontend/src/app/App.tsx:100` + `TopBar.tsx:55` | 验收项 4「结果清楚准确」**存在自相矛盾**：真实结果被标成演示数据 |
+| **F4** | 回复文案说「结果见下方结果区」，实际结果在**另一个面板**（查看任务），不是下方 | 验收脚本 `_AcceptanceModel` 的回答文案（仅验收环境） | 措辞与实际位置不符（仅影响验收环境，不影响生产） |
+
+**F1/F2/F3 的处置：**
+
+- 本轮**不修**：用户明确「体验发现的问题先记录；验收通过后，再由你明确决定是否合并」。修 F1 会改后端 `project_tools.py` 的结果契约（`changes.files[].unified_diff`），属于**新一轮改动**，需要独立复审。
+- 因此 **TOOL-07 暂不宣告"验收通过"**：验收项 2、4 存在上述待决问题，**等用户决定**是"先修 F1/F2/F3 再验"还是"接受现状并合并"。
+
+**本轮未做 / 限制**
+
+- 未改任何生产代码；未跑全量回归（按指示不重复跑全量）
+- 未合并、未 push（合并由用户决定）
+- harness 运行在 `FakeLLMClient` 上：**总是**创建 `hello.c`、**不跑**任何验证命令 → 验收项 4 的「验证结果」显示「未运行」是假 LLM 的真实行为，**不是**产品缺陷
+- 验收用项目建在 `~/.mini-deerflow/workspaces/<project_id>/workspace`（生产同款路径）
+- 未做：桌面/窄屏响应式人工体验、真实付费 Provider 体验（按约束不调用真实付费模型）
+
+**下一步**
+
+- 等用户本人做最终业务验收（环境已在运行：后端 `http://127.0.0.1:8123`、前端 `http://localhost:5173`）
+- 等用户就 F1/F2/F3 给出处置决定；**合并仍由用户明确授权**
+
+---
+
+### TOOL-07 验收缺陷返修：F1 / F2 / F3（2026-10-22）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：mini-deerflow `57106b7`（`automation/tool-07`）→ 本轮修复提交（见下方「提交」）
+- 当前状态：**READY_FOR_REVIEW** —— F1/F2/F3 已修并验证；新增验收缺陷 F5 已记录未修；**未合并**，等待独立复审与用户决定
+- 更新时间：2026-10-22
+- 依据：用户指示「先修再验，F1/F2/F3 都修，不接受现状作为最终验收通过」「修复后集中验证这三条消费链，再用同一验收环境复测」「验证未运行继续如实保留，不为好看伪造验证命令」
+
+**本轮改动范围（只做 F1/F2/F3）**
+
+| 缺陷 | 改动 | 文件 |
+|------|------|------|
+| **F1** 新增文件无 diff | 后端 `_diff_snapshots` 的 added 分支补 `unified_diff` / `diff_truncated`；`_compute_diff` 修正换行拼接（`"".join` → `"
+".join`）并支持 `fromfile`/`tofile`；前端适配器计数改为**按实际渲染的 diff 行**统计，`parseUnifiedDiff` 改用 hunk 状态机解析 | `src/mini_deerflow/project_tools.py`；`frontend/src/features/inspector/realTaskAdapter.ts`、`types.ts`、`TaskInspector.tsx`、`TaskInspector.module.css` |
+| **F2** 主视图无进度 | 新增 `runProgress.ts`（纯函数，从真实 SSE 事件推导当前阶段/工具）+ `RunStatusLine.tsx`，在聊天区输入框上方渲染**一行**轻量状态；明细仍在「查看任务 → 过程」页签 | `frontend/src/features/threads/runProgress.ts`、`RunStatusLine.tsx`、`RunStatusLine.module.css`、`AgentChatPanel.tsx` |
+| **F3** 真实结果标模拟数据 | `TaskAdapter` 增加 `dataSource: 'real' \| 'mock'`；`realTaskAdapter='real'`、`mockTaskAdapter='mock'`；顶栏标签改为 `showDemoTag={数据来源 === 'mock'}`，**去掉与 `panelOpen` 的绑定** | `frontend/src/features/inspector/types.ts`、`realTaskAdapter.ts`、`mockTaskAdapter.ts`、`frontend/src/app/App.tsx` |
+
+**F1 的关键判断（用户指出、已落实）**
+
+- 缺口在 `_diff_snapshots` 的 **added 分支**：只给 `path`/`status`，没有 `unified_diff` → 前端「变化」页签显示 `hello.c +0 −0`，看不到新增内容。
+- **`_compute_diff` 的换行拼接是真缺陷**：`difflib.unified_diff(..., lineterm="")` 的控制行（`---`/`+++`/`@@`）**不带结尾换行**，原来的 `"".join` 把文件头、hunk 头和首行内容粘成一行 —— 前端按行解析时整段 diff 丢失。所以**只补字段不够**，必须同时改成 `"
+".join` 逐行拼接。
+- 未另造协议：沿用既有 `unified_diff` + `diff_truncated` 两个字段；`diff_truncated` 现在**在前端可见**（变化页签显示「diff 正文过长，已截断显示」）。
+
+**验证证据**
+
+| 范围 | 结果 |
+|------|------|
+| 后端新增测试 `tests/test_project_diff.py` | **6 passed**（新增文件带完整 diff / 文件头与首行不粘连 / 修改文件按行分隔 / 超长截断置标记 / 二进制不给 diff） |
+| 前端全量 vitest | **42 files / 483 tests passed**（上轮 40 files / 463 tests；本轮 +2 文件 +20 用例） |
+| 前端 oxlint | **0 errors**（9 warnings 全为既有，与上轮同源） |
+| 前端 tsc | 仍失败于**完全相同的 2 处既有错误**（`realTaskAdapter.ts:90` 缺 `run_id_marker`、`:333` `buildTaskResult` 未使用）—— 本轮**未修**：两处都在 F1/F2/F3 之外，且后者属既有死代码（按规则不擅自删除）。**无新增类型错误** |
+| 后端全量 pytest | **22 failed / 3554 passed / 1 skipped**（基线 `57106b7` worktree 实跑：22 failed / 3548 passed / 1 skipped）→ **按测试名集合比对：NEW = 0、FIXED = 0**，多出的 6 passed 即本轮新增用例 |
+| 浏览器复测（真实 Chromium + 真实 harness 子进程，假 LLM 不联网不计费） | 四项全部通过：派发（讨论只读 / 编码派发）、进度（主视图显示「正在执行工具：project_execute」）、停止（「已取消当前任务」+ 工作区无产物 + 随后再次执行成功）、结果（变化页签 `hello.c +6 −0` 且**完整显示 6 行新增内容**、验证页签「未运行」如实保留、过程页签时间线完整） |
+| 浏览器控制台 | **无错误** |
+
+**修复前后对比（真实浏览器实测）**
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 变化页签 | `A hello.c +0 −0`，无 diff 正文 | `A hello.c +6 −0`，逐行显示 `#include <stdio.h>` … `}` |
+| 主视图运行中 | 只有输入框按钮变「停止」 | 显示「正在执行工具：project_execute」 |
+| 顶栏 | 打开面板即挂「交互原型 · 模拟数据」 | 不再出现（数据来源为 real） |
+
+**新增发现的问题（记录，本轮未修）**
+
+| 编号 | 问题 | 位置 | 说明 |
+|------|------|------|------|
+| **F5** | **无 Run 时「任务结果」面板显示「运行中」假状态** | `frontend/src/features/inspector/realTaskAdapter.ts::mapStreamStatus`（`'idle'` 落到 default → `'running'`） | 刷新页面后，面板标题同时出现「运行中」和「thread: xxx · 尚未建立 Run」，**自相矛盾**。修它需要决定「没有 Run 时任务状态该显示什么」——`TaskStatus` 里没有 idle 语义，属于**产品决策**，故本轮只记录不擅自决定 |
+| — | `deleted` 分支同样没有 diff 正文 | `project_tools.py::_diff_snapshots` | 用户本轮只点名 added 分支；删除的文件在「变化」页签仍只显示 `D` 标记与 `−1`。**同源缺陷，留作下一轮候选** |
+
+**本轮未做 / 限制**
+
+- 未合并、未 push（合并由用户决定；新 SHA 需再走独立复审）
+- 未跑真实付费 Provider（按项目约束）
+- 验收环境用 harness 自带 `FakeLLMClient`：**总是**创建 `hello.c`、**不跑**验证命令 → 「验证：未运行」是假 LLM 的真实行为，**如实保留，未伪造验证命令**
+- 2 处既有 tsc 错误未修（见上表），刻意保持与基线一致
+
+**下一步**
+
+- 用户就 F5 与「deleted 分支无 diff」给出处置决定
+- 新 SHA 提交后走**独立复审**；通过后再由用户决定是否合并

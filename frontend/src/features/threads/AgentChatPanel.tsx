@@ -31,6 +31,7 @@ import type { ApiError } from '../../shared/api/client'
 import { MessageList } from './MessageList'
 import { MessageComposer } from './MessageComposer'
 import { RunEventPanel } from './RunEventPanel'
+import { RunStatusLine } from './RunStatusLine'
 import { ErrorNotice } from '../../shared/ui/ErrorNotice'
 import { SSEContext } from '../../app/SSEContext'
 import { ingestRealTaskData, ingestProjectExecuteResult } from '../inspector/realTaskAdapter'
@@ -343,6 +344,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
             ariaLabel="取消失败提示"
           />
         )}
+
+        {/* 轻量运行状态：依据真实 SSE 事件显示"当前在做什么"（明细在「查看任务 → 过程」） */}
+        {isRunning && <RunStatusLine events={events} />}
 
         {/* 消息输入 */}
         <MessageComposer

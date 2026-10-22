@@ -579,6 +579,7 @@ def create_project_read_tools(
 SNAPSHOT_FILE_LIMIT = 10 * 1024 * 1024  # 10MB，单文件大小限制
 SNAPSHOT_DIR_LIMIT = 10000  # 目录深度限制
 SNAPSHOT_TOTAL_LIMIT = 50 * 1024 * 1024  # 50MB，总采集字节限制
+DIFF_MAX_LINES = 100  # diff 最多展示的行数（超出置 diff_truncated）
 TEXT_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh", ".bat", ".ps1", ".html", ".css", ".sql", ".xml", ".svg", ".c", ".cpp", ".h", ".hpp", ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".r", ".m", ".lua", ".pl", ".pm", ".ex", ".exs", ".erl", ".hrl", ".clj", ".cljs", ".hs", ".fs", ".fsx", ".vb", ".cs", ".fs"}
 
 
@@ -675,6 +676,16 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
         if after_meta.get("type") == "binary":
             entry["reason"] = "binary file"
             entry["diff"] = None
+        else:
+            # 文本文件：给出完整 diff（新增文件 before 为空，即 /dev/null → 新文件）
+            diff_result = _compute_diff(
+                "",
+                after_meta.get("content", ""),
+                fromfile="/dev/null",
+                tofile=f"b/{path}",
+            )
+            entry["unified_diff"] = diff_result.get("unified", "")
+            entry["diff_truncated"] = diff_result.get("truncated", False)
         files.append(entry)
 
     # 删除文件（仅在 after 快照完整时判定）
@@ -712,7 +723,12 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
             before_content = before_meta.get("content", "")
             after_content = after_meta.get("content", "")
             if before_content != after_content:
-                diff_result = _compute_diff(before_content, after_content)
+                diff_result = _compute_diff(
+                    before_content,
+                    after_content,
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                )
                 files.append({
                     "path": path,
                     "status": "modified",
@@ -744,20 +760,40 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
     return {"files": files, "after_incomplete_deleted": after_incomplete_deleted}
 
 
-def _compute_diff(before: str, after: str) -> dict:
+def _compute_diff(
+    before: str,
+    after: str,
+    *,
+    fromfile: str = "",
+    tofile: str = "",
+) -> dict:
     """计算文本 diff，返回统一格式。
 
-    实现 Unified Diff 格式：只显示前 100 行 diff。
+    实现 Unified Diff 格式：只显示前 DIFF_MAX_LINES 行 diff。
+
+    换行必须显式处理：`difflib.unified_diff` 的控制行（--- / +++ / @@）在
+    `lineterm=""` 时**不带**结尾换行，直接 `"".join` 会把文件头、hunk 头和
+    首行内容粘成一行 —— 前端按行解析时整段 diff 都会丢失。因此这里用
+    `"\n".join` 逐行拼接。
     """
     try:
         import difflib
-        before_lines = before.splitlines(keepends=True)
-        after_lines = after.splitlines(keepends=True)
+        before_lines = before.splitlines()
+        after_lines = after.splitlines()
         diff = list(difflib.unified_diff(
-            before_lines, after_lines, lineterm="", n=3
+            before_lines,
+            after_lines,
+            fromfile=fromfile,
+            tofile=tofile,
+            lineterm="",
+            n=3,
         ))
-        unified = "".join(diff[:100])
-        return {"unified": unified, "truncated": len(diff) > 100}
+        truncated = len(diff) > DIFF_MAX_LINES
+        unified = "\n".join(diff[:DIFF_MAX_LINES])
+        if truncated:
+            # 用 "\" 开头：diff 工具惯例的元信息行，前端解析时跳过
+            unified += "\n\\ ... diff 已截断"
+        return {"unified": unified, "truncated": truncated}
     except Exception:
         return {"unified": "[diff failed]", "truncated": False}
 

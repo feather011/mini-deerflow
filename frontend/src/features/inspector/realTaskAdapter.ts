@@ -165,6 +165,8 @@ export function clearRealTaskData(): void {
 
 /** 生产路径使用的 TaskAdapter：从模块级缓存读真实数据 */
 export const realTaskAdapter: TaskAdapter = {
+  // 生产路径的数据来自真实 SSE / 真实 harness 结果，不是演示数据
+  dataSource: 'real',
   getTask(threadId: string | null): TaskResult | null {
     if (!threadId) return null
     return cache.get(threadId) ?? null
@@ -257,50 +259,72 @@ function buildChangedFilesFromResult(result: ProjectExecuteResult): ChangedFile[
   if (!changes || changes.length === 0) return []
 
   return changes.map((f) => {
-    const added =
-      f.status === 'added'
-        ? (f.unified_diff?.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).length ?? 0)
+    const diff = parseUnifiedDiff(f.unified_diff ?? '')
+    // 计数以**实际渲染出来的 diff 行**为准，避免计数与展示不一致
+    // （例如新增文件此前没有 diff 正文，计数恒为 +0）。
+    const hasDiff = diff.length > 0
+    const added = hasDiff ? diff.filter((l) => l.type === 'add').length : 0
+    const removed = hasDiff
+      ? diff.filter((l) => l.type === 'remove').length
+      : f.status === 'deleted'
+        ? 1
         : 0
-    const removed =
-      f.status === 'modified'
-        ? (f.unified_diff?.split('\n').filter((l) => l.startsWith('-') && !l.startsWith('---')).length ?? 0)
-        : f.status === 'deleted'
-          ? 1
-          : 0
 
     return {
       path: f.path,
       change: f.status === 'added' ? 'A' : f.status === 'modified' ? 'M' : 'D',
       added,
       removed,
-      diff: parseUnifiedDiff(f.unified_diff ?? ''),
+      diff,
+      diff_truncated: f.diff_truncated === true,
     }
   })
 }
 
+/**
+ * 解析 unified diff 文本为可渲染的行。
+ *
+ * 头判定必须是**状态机**：`--- ` / `+++ ` 只有在进入 hunk 之前才是文件头；
+ * 进入 hunk 之后同样以 `--- ` / `+++ ` 开头的是**内容行**
+ * （例如被删除的一行内容是 `-- 注释`）。用 startsWith 判定会把这类内容行
+ * 误当文件头丢掉。
+ */
 function parseUnifiedDiff(diff: string): DiffLine[] {
   if (!diff) return []
   const lines = diff.split('\n')
   const result: DiffLine[] = []
   let oldLine = 0
   let newLine = 0
+  // 是否已进入 hunk（进入后不再把 --- / +++ 当文件头）
+  let inHunk = false
 
   for (const raw of lines) {
-    if (raw.startsWith('---') || raw.startsWith('+++') || raw.startsWith('@@')) {
-      // 解析 @@ 行中的行号
-      const m = raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
-      if (m?.[1] && m?.[2]) {
-        oldLine = parseInt(m[1]!, 10)
-        newLine = parseInt(m[2]!, 10)
+    if (!inHunk) {
+      if (raw.startsWith('@@')) {
+        // 解析 @@ 行中的行号（格式不标准时仍进入 hunk，别把正文全丢掉）
+        const m = raw.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+        if (m?.[1] && m?.[2]) {
+          oldLine = parseInt(m[1]!, 10)
+          newLine = parseInt(m[2]!, 10)
+        }
+        inHunk = true
       }
+      // 文件头（--- / +++）与 hunk 前的其它行：不渲染
+      continue
+    }
+
+    if (raw.startsWith('\\')) {
+      // 元信息行（如 "\ ... diff 已截断"）：跳过
       continue
     }
     if (raw.startsWith('+')) {
       result.push({ type: 'add', old_line: null, new_line: newLine++, text: raw.slice(1) })
     } else if (raw.startsWith('-')) {
       result.push({ type: 'remove', old_line: oldLine++, new_line: null, text: raw.slice(1) })
-    } else if (raw.length > 0) {
-      result.push({ type: 'context', old_line: oldLine++, new_line: newLine++, text: raw })
+    } else {
+      // 上下文行：unified diff 里以空格开头；渲染时会再补一个空格，这里去掉
+      const text = raw.startsWith(' ') ? raw.slice(1) : raw
+      result.push({ type: 'context', old_line: oldLine++, new_line: newLine++, text })
     }
   }
   return result

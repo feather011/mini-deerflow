@@ -279,3 +279,156 @@ describe('realTaskAdapter 重新进入 thread', () => {
     expect(realTaskAdapter.getTask('thread-R2')?.files).toEqual([])
   })
 })
+
+// ---- 变化文件：diff 正文与计数（F1） ----
+
+describe('realTaskAdapter 变化文件 diff', () => {
+  it('新增文件带 unified_diff 时：计数按 diff 正文行数，且 diff 行可渲染', () => {
+    ingestRealTaskData('thread-D1', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d1',
+      title: 'D1',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'hello.c',
+            status: 'added',
+            unified_diff:
+              '--- /dev/null\n+++ b/hello.c\n@@ -0,0 +1,2 @@\n+#include <stdio.h>\n+int main(){return 0;}',
+            diff_truncated: false,
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-D1', result)
+
+    const file = realTaskAdapter.getTask('thread-D1')?.files[0]
+    expect(file?.change).toBe('A')
+    expect(file?.added).toBe(2)
+    expect(file?.removed).toBe(0)
+    expect(file?.diff).toHaveLength(2)
+    expect(file?.diff[0]?.type).toBe('add')
+    expect(file?.diff[0]?.text).toBe('#include <stdio.h>')
+    expect(file?.diff[1]?.new_line).toBe(2)
+  })
+
+  it('修改文件：added / removed 计数与 diff 正文一致', () => {
+    ingestRealTaskData('thread-D2', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d2',
+      title: 'D2',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'a.py',
+            status: 'modified',
+            change: 'content_changed',
+            unified_diff:
+              '--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n line1\n-line2\n+CHANGED\n line3',
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-D2', result)
+
+    const file = realTaskAdapter.getTask('thread-D2')?.files[0]
+    expect(file?.change).toBe('M')
+    expect(file?.added).toBe(1)
+    expect(file?.removed).toBe(1)
+    expect(file?.diff.map((l) => l.type)).toEqual([
+      'context',
+      'remove',
+      'add',
+      'context',
+    ])
+    // 上下文行不带 diff 的前导空格（渲染时由组件补一个）
+    expect(file?.diff[0]?.text).toBe('line1')
+  })
+
+  it('hunk 内的 "--- "/"+++ " 内容行不被误当文件头丢掉', () => {
+    ingestRealTaskData('thread-D3', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d3',
+      title: 'D3',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'x.md',
+            status: 'modified',
+            unified_diff:
+              '--- a/x.md\n+++ b/x.md\n@@ -1,2 +1,2 @@\n---- old heading\n+++ new heading',
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-D3', result)
+
+    const file = realTaskAdapter.getTask('thread-D3')?.files[0]
+    // 两行都在（removed 1 行、added 1 行），没有因为 "---"/"+++" 前缀被吞掉
+    expect(file?.diff).toHaveLength(2)
+    expect(file?.removed).toBe(1)
+    expect(file?.added).toBe(1)
+    expect(file?.diff[0]?.text).toBe('--- old heading')
+    expect(file?.diff[1]?.text).toBe('++ new heading')
+  })
+
+  it('diff 被截断时透出 diff_truncated 标记', () => {
+    ingestRealTaskData('thread-D4', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d4',
+      title: 'D4',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'big.py',
+            status: 'added',
+            unified_diff: '--- /dev/null\n+++ b/big.py\n@@ -0,0 +1,1 @@\n+x = 1',
+            diff_truncated: true,
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-D4', result)
+    expect(realTaskAdapter.getTask('thread-D4')?.files[0]?.diff_truncated).toBe(true)
+  })
+
+  it('没有 diff 正文时计数不谎报（新增文件 added 为 0）', () => {
+    ingestRealTaskData('thread-D5', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d5',
+      title: 'D5',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: { files: [{ path: 'bin.dat', status: 'added', reason: 'binary file' }] },
+    })
+    ingestProjectExecuteResult('thread-D5', result)
+
+    const file = realTaskAdapter.getTask('thread-D5')?.files[0]
+    expect(file?.added).toBe(0)
+    expect(file?.removed).toBe(0)
+    expect(file?.diff).toEqual([])
+  })
+})
