@@ -3100,3 +3100,59 @@ cd frontend && npx tsc -p tsconfig.app.json --noEmit
 **下一步**
 
 - 独立复审本提交；**合并由用户决定**，复审通过前不宣告修复通过。
+---
+
+### TOOL-07 独立复审通过（code_review_passed）· 等待用户最终业务验收与合并决定（2026-10-23）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：`b0163a35972e86a2620650aac32f6a9316f523b7`（`automation/tool-07`，已推送 origin）
+- 当前状态：**code_review_passed** —— 独立复审通过，**findings 为空**；F1 / F6 均关闭；**未合并**
+- 更新时间：2026-10-23
+- 依据：独立复审评论 [`6354597221`](https://github.com/feather011/mini-deerflow/pull/6#issuecomment-6354597221)（head `b0163a3`，结论 **code_review_passed**）
+
+**复审结论**
+
+| 项 | 复审结论 |
+|---|---|
+| **F1** 多段 hunk | **关闭**。每个后续 `@@` 块头都重设行号并跳过；hunk 内 `---`/`+++` 内容仍保留。上轮真实子进程结果经生产适配器/面板消费，第二处修改现在准确显示**第 25 行**（不再是第 10 行），无块头伪正文；正常新增文件展示保持通过 |
+| **F6** 冷挂载恢复 | **关闭**。先建立当前 thread 任务、后恢复 `last_run_result`。上轮失败的**非 StrictMode 冷挂载**探针现在保留文件正文与 `not_run`；回归同时覆盖面板展示、新 run 清空、会话隔离。恢复不依赖开发环境 effect 重放 |
+| findings | **空**（无阻断项） |
+| F2 / F3 / F5、此前 R1～R7、C4 既有 5 项 stdio 证据 | 保持**关闭**，本轮未重开 |
+| `deleted` diff | 继续按明确决定**暂缓**；不要求先修旧 MCP 整套 |
+
+**复审方独立执行的证据（与作者证据分开记录）**
+
+| 范围 | 结果 |
+|------|------|
+| 相关仓库测试 3 文件 91 项 + 上轮独立消费探针 4 项 | **95 passed**，exit 0（React/DOM 19.3.1，`--maxWorkers=1 --testTimeout=15000`） |
+| `npm run typecheck` | `tsconfig.app` / `tsconfig.node` / `tsconfig.e2e` **三份配置均 exit 0** |
+| 上轮两个失败探针 | 均**转为通过**（多 hunk 第二处 `new_line=25`、无块头伪正文；非 StrictMode 冷挂载保留 `hello.c` 与 `not_run`）；**未回滚生产源码** |
+| 外部 CI | 当前 SHA `check_runs=[]`、`workflow_runs=[]`、`commit statuses=[]` —— **不宣称 CI 或全量全绿** |
+
+**作者证据（复审方本轮未独立重跑）**
+
+- 前端全量 42 files / 506 tests passed、`npm run typecheck` exit 0、`oxlint` 0 error / 8 warning。
+- Chromium 刷新脚本 `node e2e/tool07-refresh-check.mjs` exit 0（5/5）：刷新后仍显示 `hello.c +6 −0`、6 行 diff 正文完整、验证页签如实「未运行」。
+- 真实子进程产出的两段 hunk 与后端 `_compute_diff` **逐字节一致**（`PYTHONPATH=src python` 核对）。
+- 后端全量 22 failed / 3554 passed / 1 skipped 与基线 `57106b7` 的失败名集合比对 NEW=0、FIXED=0（沿用此前记录）。
+- 复审方**未独立**做：Chromium/桌面窄屏人工体验、Windows Job Object、真实 harness 仓库子进程、真实/付费 Provider、前后端完整回归、严格 lockfile 的 `npm ci` 干净安装。
+
+**当前状态与边界**
+
+- TOOL-07 代码审查**结束**，本工具模块开发**到此停止**。
+- **代码审查通过 ≠ 用户最终业务验收，也不是合并授权。**
+- **未合并**：合并是用户的明确决定，本会话不自行 merge / push / 切分支。
+- **不启动** Skills / Guard / 沙箱等后续模块；不追加或清零历史返修额度。
+- 遗留且**明确暂缓**：`deleted` 分支无 diff 正文（下一轮候选）。
+
+**验收环境（仍在运行，供用户做最终业务验收）**
+
+- 前端 `http://localhost:5173`；后端 `http://127.0.0.1:8123`（生产 `create_app()` + 全部生产路由，仅模型换成脚本化的 `_AcceptanceModel`；harness 走自带 `FakeLLMClient`，**真实子进程、真实文件写入、零网络、不计费**）。
+- 验收环境脚本已入库：`scripts/tool07_acceptance_server.py`、`frontend/e2e/tool07-acceptance.mjs`、`tool07-acceptance2.mjs`、`tool07-refresh-check.mjs`。
+- 验收用项目/线程数据已清理（`/api/projects` 与 `/api/threads` 均为空）。
+
+**下一步**
+
+- 等用户做**最终业务验收**（派发 / 进度 / 停止 / 结果 四项）。
+- 等用户明确决定**是否合并**；合并前不宣告通过。
