@@ -30,6 +30,12 @@ interface MessageComposerProps {
   hasPendingRestore?: boolean
   /** 用户点击"恢复原消息" */
   onRestore?: () => void
+  /** 是否显示"停止"按钮（当前有正在运行的 run） */
+  canStop?: boolean
+  /** 取消请求已发出、等待后端确认 */
+  isStopping?: boolean
+  /** 点击"停止"：请求后端取消当前任务（真取消，非仅断流） */
+  onStop?: () => void
 }
 
 export function MessageComposer({
@@ -40,6 +46,9 @@ export function MessageComposer({
   isSubmitting,
   hasPendingRestore,
   onRestore,
+  canStop,
+  isStopping,
+  onStop,
 }: MessageComposerProps) {
   // 受控模式：父组件传入 value 时使用外部值，否则内部管理
   const [internalValue, setInternalValue] = useState('')
@@ -141,14 +150,28 @@ export function MessageComposer({
           )}
         </div>
       </div>
-      <button
-        type="submit"
-        className={styles.sendBtn}
-        disabled={!canSend}
-        aria-label="发送消息"
-      >
-        {isPending ? '运行中…' : '发送'}
-      </button>
+      <div className={styles.actionRow}>
+        {(canStop || isStopping) && onStop && (
+          <button
+            type="button"
+            className={styles.stopBtn}
+            onClick={onStop}
+            disabled={isStopping}
+            aria-label="停止当前任务"
+            title="停止当前任务（后端会取消执行并回收子进程）"
+          >
+            {isStopping ? '正在停止…' : '停止'}
+          </button>
+        )}
+        <button
+          type="submit"
+          className={styles.sendBtn}
+          disabled={!canSend}
+          aria-label="发送消息"
+        >
+          {isPending ? '运行中…' : '发送'}
+        </button>
+      </div>
     </form>
   )
 }

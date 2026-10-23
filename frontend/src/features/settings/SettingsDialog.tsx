@@ -1,12 +1,9 @@
 /**
- * SettingsDialog — 设置对话框（WM-FE1 子任务 C）
- *
- * 演示态：四个分组页签 + 表单行（输入框 / 开关 / 下拉），
- * 所有交互只改变组件本地状态：不发任何请求、不校验 Key、
- * 不验证连接；「保存」只弹出本地提示，不暗示已保存到后端。
+ * SettingsDialog — 设置对话框（TOOL-05：MCP 标签页替换为真实管理）
  */
 import { useState } from 'react'
 import type { KeyboardEvent, JSX } from 'react'
+import { MCPSettings } from './MCPSettings'
 import styles from './SettingsDialog.module.css'
 
 type SettingsTab = '模型' | '上下文与记忆' | '工具与MCP' | '权限与日志'
@@ -25,9 +22,6 @@ interface SettingsState {
   historyCompaction: boolean
   projectMemory: boolean
   showBudget: boolean
-  webSearch: boolean
-  fileGit: boolean
-  notesTools: boolean
   workspaceOnly: boolean
   showOpLog: boolean
   autoCommit: boolean
@@ -41,9 +35,6 @@ const INITIAL_STATE: SettingsState = {
   historyCompaction: true,
   projectMemory: true,
   showBudget: true,
-  webSearch: false,
-  fileGit: false,
-  notesTools: false,
   workspaceOnly: true,
   showOpLog: true,
   autoCommit: false,
@@ -190,34 +181,7 @@ export function SettingsDialog(props: {
           </>
         )
       case '工具与MCP':
-        return (
-          <>
-            <SwitchRow
-              id="settings-web-search"
-              label="网页检索"
-              desc="主 Agent · 待接入"
-              checked={state.webSearch}
-              onChange={(v) => update('webSearch', v)}
-            />
-            <SwitchRow
-              id="settings-file-git"
-              label="文件与 Git"
-              desc="执行 Agent · 示例配置"
-              checked={state.fileGit}
-              onChange={(v) => update('fileGit', v)}
-            />
-            <SwitchRow
-              id="settings-notes-tools"
-              label="笔记与资料"
-              desc="主 Agent · 待接入"
-              checked={state.notesTools}
-              onChange={(v) => update('notesTools', v)}
-            />
-            <p className={styles.hint}>
-              两个 Agent 按职责获得工具，不默认共享全部权限。
-            </p>
-          </>
-        )
+        return <MCPSettings />
       case '权限与日志':
         return (
           <>

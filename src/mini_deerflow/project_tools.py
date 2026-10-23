@@ -579,6 +579,7 @@ def create_project_read_tools(
 SNAPSHOT_FILE_LIMIT = 10 * 1024 * 1024  # 10MB，单文件大小限制
 SNAPSHOT_DIR_LIMIT = 10000  # 目录深度限制
 SNAPSHOT_TOTAL_LIMIT = 50 * 1024 * 1024  # 50MB，总采集字节限制
+DIFF_MAX_LINES = 100  # diff 最多展示的行数（超出置 diff_truncated）
 TEXT_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh", ".bat", ".ps1", ".html", ".css", ".sql", ".xml", ".svg", ".c", ".cpp", ".h", ".hpp", ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".r", ".m", ".lua", ".pl", ".pm", ".ex", ".exs", ".erl", ".hrl", ".clj", ".cljs", ".hs", ".fs", ".fsx", ".vb", ".cs", ".fs"}
 
 
@@ -675,6 +676,16 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
         if after_meta.get("type") == "binary":
             entry["reason"] = "binary file"
             entry["diff"] = None
+        else:
+            # 文本文件：给出完整 diff（新增文件 before 为空，即 /dev/null → 新文件）
+            diff_result = _compute_diff(
+                "",
+                after_meta.get("content", ""),
+                fromfile="/dev/null",
+                tofile=f"b/{path}",
+            )
+            entry["unified_diff"] = diff_result.get("unified", "")
+            entry["diff_truncated"] = diff_result.get("truncated", False)
         files.append(entry)
 
     # 删除文件（仅在 after 快照完整时判定）
@@ -712,7 +723,12 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
             before_content = before_meta.get("content", "")
             after_content = after_meta.get("content", "")
             if before_content != after_content:
-                diff_result = _compute_diff(before_content, after_content)
+                diff_result = _compute_diff(
+                    before_content,
+                    after_content,
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                )
                 files.append({
                     "path": path,
                     "status": "modified",
@@ -744,20 +760,40 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
     return {"files": files, "after_incomplete_deleted": after_incomplete_deleted}
 
 
-def _compute_diff(before: str, after: str) -> dict:
+def _compute_diff(
+    before: str,
+    after: str,
+    *,
+    fromfile: str = "",
+    tofile: str = "",
+) -> dict:
     """计算文本 diff，返回统一格式。
 
-    实现 Unified Diff 格式：只显示前 100 行 diff。
+    实现 Unified Diff 格式：只显示前 DIFF_MAX_LINES 行 diff。
+
+    换行必须显式处理：`difflib.unified_diff` 的控制行（--- / +++ / @@）在
+    `lineterm=""` 时**不带**结尾换行，直接 `"".join` 会把文件头、hunk 头和
+    首行内容粘成一行 —— 前端按行解析时整段 diff 都会丢失。因此这里用
+    `"\n".join` 逐行拼接。
     """
     try:
         import difflib
-        before_lines = before.splitlines(keepends=True)
-        after_lines = after.splitlines(keepends=True)
+        before_lines = before.splitlines()
+        after_lines = after.splitlines()
         diff = list(difflib.unified_diff(
-            before_lines, after_lines, lineterm="", n=3
+            before_lines,
+            after_lines,
+            fromfile=fromfile,
+            tofile=tofile,
+            lineterm="",
+            n=3,
         ))
-        unified = "".join(diff[:100])
-        return {"unified": unified, "truncated": len(diff) > 100}
+        truncated = len(diff) > DIFF_MAX_LINES
+        unified = "\n".join(diff[:DIFF_MAX_LINES])
+        if truncated:
+            # 用 "\" 开头：diff 工具惯例的元信息行，前端解析时跳过
+            unified += "\n\\ ... diff 已截断"
+        return {"unified": unified, "truncated": truncated}
     except Exception:
         return {"unified": "[diff failed]", "truncated": False}
 
@@ -800,6 +836,12 @@ def create_project_execute_tool(
         stop_event: threading.Event | None = None
         if cancellation_token is not None:
             stop_event = CancellationToStopEvent(cancellation_token)
+
+        # 事件观察回调（可选）：把 harness 的协议事件原样透传给上层。
+        # 由调用方通过上下文提供（生产链路暂不提供 → None → 无额外行为）；
+        # 验收测试用它被动观察执行过程，不去抢读 harness 的 stdout 管道。
+        raw_on_event = getattr(context, "on_event", None) if context is not None else None
+        on_event = raw_on_event if callable(raw_on_event) else None
 
         # 仓库占用检查（与 ProjectService.delete 共用同一锁实例）
         project_lock = get_lock(project_id) if get_lock else None
@@ -872,6 +914,7 @@ def create_project_execute_tool(
                 task_id=run_id,
                 repo_path=str(repo_path),
                 prompt=prompt,
+                on_event=on_event,
                 stop_event=stop_event,
             )
 
@@ -885,36 +928,7 @@ def create_project_execute_tool(
             changes["snapshot_complete"] = after_complete
 
             if result.status == STATUS_COMPLETED:
-                # 从 tool_events 提取 bash 命令记录
-                # command: 优先用 full_command（500 字符），否则 args_preview（200 字符截断）
-                # exit_code: 从 bash 输出 "[exit N] output" 格式解析
-                # has_output: 是否有命令输出（不等于"验证通过"）
-                verification: list[dict] = []
-                bash_count = 0
-                for e in result.tool_events:
-                    if e.get("name") == "bash":
-                        bash_count += 1
-                        output = e.get("output", "")
-                        command_preview = e.get("command_preview") or e.get("args_preview", "")
-                        # 解析 exit_code：bash 输出格式 "[exit N] output"
-                        exit_code: int | None = None
-                        if output.startswith("[exit "):
-                            end = output.find("]", 7)
-                            if end > 0:
-                                try:
-                                    exit_code = int(output[6:end])
-                                except ValueError:
-                                    pass
-                        verification.append({
-                            "command": command_preview,
-                            "command_truncated": e.get("command_truncated", False),
-                            "output": output,
-                            "output_truncated": e.get("output_truncated", False),
-                            "exit_code": exit_code,
-                            "duration_s": e.get("duration_s"),
-                            "has_output": bool(output),
-                        })
-
+                verification = _build_verification(result)
                 body = {
                     "ok": True,
                     "status": "completed",
@@ -940,7 +954,7 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
                     "error": result.error or "任务被停止",
                     "tool_events": [
@@ -957,7 +971,7 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
                     "error": f"执行超时（{runner._timeout_seconds}s），任务已被终止",
                     "tool_events": [
@@ -986,7 +1000,7 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
                     "error": result.error or f"执行失败（{result.status}）",
                     "tool_events": [
@@ -1039,6 +1053,42 @@ def create_project_execute_tool(
         handler=_as_tool_result("execute", _execute),
         needs_context=True,
     )
+
+
+def _build_verification(result) -> list[dict]:
+    """从 harness 的 tool_events 抽出 bash 命令记录。
+
+    R2 修复：所有终态（completed / stopped / timeout / failed）共用
+    同一段事件转换，未完成的命令不再被伪报为空。模型/UI 可以看到
+    "已经跑过什么/还没跑过什么"——这是 cancelled mid-task 的关键反馈。
+    """
+    verification: list[dict] = []
+    for e in result.tool_events:
+        if e.get("name") != "bash":
+            continue
+        output = e.get("output", "")
+        command_preview = (
+            e.get("command_preview") or e.get("args_preview", "")
+        )
+        # 解析 exit_code：bash 输出格式 "[exit N] output"
+        exit_code: int | None = None
+        if output.startswith("[exit "):
+            end = output.find("]", 7)
+            if end > 0:
+                try:
+                    exit_code = int(output[6:end])
+                except ValueError:
+                    pass
+        verification.append({
+            "command": command_preview,
+            "command_truncated": e.get("command_truncated", False),
+            "output": output,
+            "output_truncated": e.get("output_truncated", False),
+            "exit_code": exit_code,
+            "duration_s": e.get("duration_s"),
+            "has_output": bool(output),
+        })
+    return verification
 
 
 def _require_thread_id(context: object) -> str:

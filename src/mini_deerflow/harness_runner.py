@@ -51,6 +51,12 @@ STDERR_TAIL_BYTES = 16 * 1024
 TOOL_EVENT_OUTPUT_CHARS = 2000
 TOOL_EVENTS_IN_RESULT = 30
 
+# 进程树回收参数
+# 宽限期：先发终止信号，等这么久还没退出就强制恢复
+TERMINATE_GRACE_SECONDS = 3.0
+# 强制恢复后的等待上限
+TERMINATE_KILL_SECONDS = 3.0
+
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_STOPPED = "stopped"
@@ -94,44 +100,255 @@ def _parse_protocol_line(line: str) -> dict:
     return payload
 
 
-def _terminate_process_tree(process: subprocess.Popen) -> None:
-    """杀整棵进程树（镜像 sandbox_command 的方案：Windows taskkill /T /F）。"""
-    if process.poll() is not None:
-        return
-    pid = process.pid
-    try:
-        if sys.platform == "win32":
-            system_root = os.environ.get("SystemRoot")
-            taskkill = Path(system_root) / "System32" / "taskkill.exe" if system_root else None
-            if taskkill and taskkill.exists():
-                subprocess.run(
-                    [str(taskkill), "/PID", str(pid), "/T", "/F"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    shell=False,
-                    timeout=5,
-                )
-                return
-            process.kill()
-        else:
-            import signal
+def _posix_group_alive(pgid: int) -> bool:
+    """进程组是否还有成员（含已忽略 SIGTERM 的后代）。
 
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except Exception:  # noqa: BLE001 - 尽力而为，失败走最终 fallback
-        pass
+    组内成员全部退出后进程组才被回收；组长的僵尸态仍算成员，
+    因此调用方需要先 reap 组长再判断。
+    """
     try:
-        process.wait(timeout=5)
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _posix_pgid(process: subprocess.Popen) -> int | None:
+    """取子进程所在进程组 id；不可安全定位时返回 None。
+
+    `start_new_session=True` → 子进程是会话/进程组组长，pgid == pid。
+    根进程已退出时 `getpgid()` 会失败，此时仍按 pgid == pid 处理：
+    进程组在成员全部退出前不会被回收，pgid 也不会被复用。
+
+    返回 None 表示"不能安全地整组操作"（子进程与宿主同组），
+    此时绝不能 killpg——否则会把宿主进程一起杀掉。
+    """
+    try:
+        pgid = os.getpgid(process.pid)
+    except (ProcessLookupError, OSError):
+        return process.pid
+    try:
+        if pgid == os.getpgid(0):
+            return None
+    except OSError:
+        return None
+    return pgid
+
+
+def _terminate_posix_group(process: subprocess.Popen) -> None:
+    """POSIX：整组终止 → 宽限等待 → 强制恢复。
+
+    根进程退出 **不等于** 进程组退出：后代可能忽略 SIGTERM 而继续运行。
+    因此宽限期结束后必须复查整组是否真的消失，必要时用 SIGKILL 强制恢复。
+    """
+    import signal
+
+    pgid = _posix_pgid(process)
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+    # 宽限期：等根进程退出（同时把它 reap 掉，否则僵尸仍算组成员）
+    try:
+        process.wait(timeout=TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    if pgid is None:
+        return
+    # 整组复查：仍存活的成员（含忽略 SIGTERM 的后代）强制回收
+    if _posix_group_alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=TERMINATE_KILL_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        deadline = time.monotonic() + TERMINATE_KILL_SECONDS
+        while time.monotonic() < deadline and _posix_group_alive(pgid):
+            time.sleep(0.05)
+
+
+def _taskkill_tree(pid: int) -> None:
+    """Windows 兜底：taskkill /T /F 递归终止进程树。"""
+    system_root = os.environ.get("SystemRoot")
+    taskkill = Path(system_root) / "System32" / "taskkill.exe" if system_root else None
+    if not (taskkill and taskkill.exists()):
+        return
+    try:
+        subprocess.run(
+            [str(taskkill), "/PID", str(pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001 - 尽力而为
+        pass
+
+
+def _create_kill_on_close_job(process: subprocess.Popen) -> int | None:
+    """Windows：把子进程放进 Job Object（进程组的等价物）。
+
+    Job 内的后代自动继承成员身份；关闭 Job 句柄（KILL_ON_JOB_CLOSE）
+    即可一次性杀掉整棵树——包括根进程已退出、后代被孤儿化的情况
+    （taskkill /T 依赖 PPID 链，根进程一死就找不到后代了）。
+
+    创建/绑定失败返回 None，调用方退回 taskkill 路径。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        class _BasicLimit(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IOCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class _ExtendedLimit(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimit),
+                ("IoInfo", _IOCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _ExtendedLimit()
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        info.BasicLimitInformation.LimitFlags = 0x2000
+        # JobObjectExtendedLimitInformation
+        if not kernel32.SetInformationJobObject(
+            job, 9, ctypes.byref(info), ctypes.sizeof(info)
+        ):
+            kernel32.CloseHandle(job)
+            return None
+        if not kernel32.AssignProcessToJobObject(
+            job, wintypes.HANDLE(int(process._handle))
+        ):
+            kernel32.CloseHandle(job)
+            return None
+        return int(job)
+    except Exception:  # noqa: BLE001 - 拿不到 Job 就退回 taskkill
+        return None
+
+
+def _close_kill_job(job: int | None) -> None:
+    """关闭 Job 句柄：KILL_ON_JOB_CLOSE 会杀掉 Job 内所有进程。"""
+    if job is None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle(wintypes.HANDLE(int(job)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen, job: int | None = None
+) -> None:
+    """回收整棵进程树：宽限终止 → 有界等待 → 强制恢复。
+
+    关键点：**根进程退出不等于整组退出**。后代可能忽略 SIGTERM，
+    根进程先死时 taskkill / killpg 也定位不到它们。因此：
+      1) 先对整组发终止信号；
+      2) 有界宽限等待；
+      3) 整组仍存活 → 强制恢复（Windows 关闭 Job / POSIX SIGKILL）；
+      4) 根进程一定要被 reap。
+    """
+    if job is not None:
+        # Windows Job：一次关闭即杀掉组内所有进程（含已孤儿化的后代）
+        _close_kill_job(job)
+    elif sys.platform == "win32":
+        _taskkill_tree(process.pid)
+    else:
+        _terminate_posix_group(process)
+    # 兜底：根进程必须被回收（否则留下僵尸，且调用方拿不到退出码）
+    try:
+        process.wait(timeout=TERMINATE_KILL_SECONDS)
     except subprocess.TimeoutExpired:
         try:
             process.kill()
-            process.wait(timeout=3)
+            process.wait(timeout=TERMINATE_KILL_SECONDS)
         except Exception:  # noqa: BLE001
             pass
 
 
+class _RunState:
+    """**单次 run** 的执行上下文：进程句柄 / Job 句柄 / 回收标记。
+
+    为什么不能放在 Runner 实例上：生产装配只建**一个** HarnessRunner
+    （`runtime.py`），而项目锁只互斥**同一个 project_id** —— 不同项目
+    的任务会并发跑在同一个 Runner 上。实例级状态会让 A 的收口把
+    "已回收"标记和 Job 句柄留给 B：B 的取消要么被跳过（进程树残留、
+    继续写工作区、继续占锁），要么取到 A 的句柄（跨运行误杀）。
+
+    因此这三样东西必须按**每一次 run** 归属。
+    """
+
+    __slots__ = ("process", "job", "terminated")
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen | None = None
+        self.job: int | None = None
+        self.terminated = False
+
+
 class HarnessRunner:
-    """驱动一次 harness 非交互执行；同一实例可顺序复用。"""
+    """驱动一次 harness 非交互执行；同一实例可顺序复用。
+
+    **并发**：同一实例可被多个项目并发使用（生产装配只建一个 Runner），
+    因此每次 run 的进程句柄 / Job 句柄 / 回收标记都放在 `_RunState` 里，
+    不放在实例属性上。
+    """
 
     def __init__(
         self,
@@ -139,11 +356,21 @@ class HarnessRunner:
         python_exe: str | None = None,
         timeout_seconds: float = 600.0,
         max_tool_calls: int = 50,
+        env_file: str | None = None,
     ) -> None:
         self._harness_root = Path(harness_root).resolve() if harness_root else None
         self._python_exe = python_exe or sys.executable
         self._timeout_seconds = timeout_seconds
         self._max_tool_calls = max_tool_calls
+        # 测试隔离：优先用测试传入的 .env 文件路径
+        self._env_file = env_file
+        # 测试注入：直接注入环境变量到子进程（无需 .env 文件）
+        self._extra_env: dict[str, str] = {}
+        # 最近一次 run() 启动的子进程句柄；终态后 poll() 应非 None，
+        # 供调用方（及验收测试）核查进程树确实被回收。
+        # **仅供诊断**：并发时它可能指向另一轮 run，真正用于回收的句柄
+        # 存在每次 run 自己的 `_RunState` 里。
+        self._last_process: subprocess.Popen | None = None
 
     @property
     def is_configured(self) -> bool:
@@ -152,6 +379,44 @@ class HarnessRunner:
             self._harness_root is not None
             and (self._harness_root / "harness" / "noninteractive.py").exists()
         )
+
+    def set_extra_env(self, env: dict[str, str]) -> None:
+        """设置注入子进程的环境变量（覆盖同名变量）。
+
+        测试隔离用：在调用 run() 前设置 mock LLM URL，
+        之后每次 run() 都会注入这些变量，无需 .env 文件。
+        """
+        self._extra_env = dict(env)
+
+    def build_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
+        """构造子进程环境（run() 用同一份逻辑）。
+
+        单独暴露是为了让调用方/验收能**核查隔离是否真的生效**：
+        测试场景下父进程的真实 API 凭证必须不在子进程环境里。
+        """
+        env = dict(os.environ)
+        # 清除 MCP 代理配置：harness 必须直连真实 API，不能走 127.0.0.1:15721
+        env.pop("ANTHROPIC_BASE_URL", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        env["PYTHONPATH"] = str(self._harness_root) + os.pathsep + env.get("PYTHONPATH", "")
+        env["HARNESS_NONINTERACTIVE"] = "1"
+        # 测试隔离：仅当测试注入了 .env 文件时才设置 HARNESS_ENV_FILE。
+        # 此时也要清除真实 API 凭证，防止父进程把 key 传给子进程。
+        # 生产场景（self._env_file=None）不设置此变量，harness 走默认行为。
+        if self._env_file:
+            # 清除真实 API 凭证——测试子进程只能从测试 .env 文件读测试 key
+            env.pop("MINIMAX_API_KEY", None)
+            env.pop("MINIMAX_OPENAI_BASE_URL", None)
+            env.pop("MINIMAX_MODEL", None)
+            env.pop("MIMO_API_KEY", None)
+            env.pop("HARNESS_MIMO_BASE_URL", None)
+            env.pop("HARNESS_MIMO_API_KEY", None)
+            env["HARNESS_ENV_FILE"] = self._env_file
+        # 测试注入：set_extra_env() 设置的环境变量直接覆盖同名变量
+        env.update(self._extra_env)
+        if extra_env:
+            env.update(extra_env)
+        return env
 
     def run(
         self,
@@ -177,18 +442,11 @@ class HarnessRunner:
                 error="执行器未配置（缺少 harness 根目录）",
             )
 
-        env = dict(os.environ)
-        # 清除 MCP 代理配置：harness 必须直连真实 API，不能走 127.0.0.1:15721
-        env.pop("ANTHROPIC_BASE_URL", None)
-        env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        env["PYTHONPATH"] = str(self._harness_root) + os.pathsep + env.get("PYTHONPATH", "")
-        env["HARNESS_NONINTERACTIVE"] = "1"
-        # 让 harness 加载 mini-deerflow 的 .env（包含 MINI_MAX 配置）
-        env["HARNESS_ENV_FILE"] = str(Path(__file__).parent.parent.parent / ".env")
-        if extra_env:
-            env.update(extra_env)
+        env = self.build_env(extra_env)
 
         prompt_file: str | None = None
+        # 本次 run 独占的执行上下文（并发安全的关键）
+        state = _RunState()
         try:
             fd, prompt_file = tempfile.mkstemp(suffix=".txt", prefix="harness-prompt-")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -204,6 +462,18 @@ class HarnessRunner:
             ]
 
             try:
+                # R1：进程组隔离（让 taskkill /T /F / killpg 精确定向回收）
+                #   - POSIX: start_new_session=True → 新会话组长
+                #   - Windows: CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW
+                # DETACHED_PROCESS 让子进程脱离父 console，CREATE_NO_WINDOW
+                # 抑制启动时一闪而过的命令行窗口。
+                creationflags = 0
+                if sys.platform == "win32":
+                    creationflags = (
+                        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                        | getattr(subprocess, "DETACHED_PROCESS", 0)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    )
                 process = subprocess.Popen(
                     argv,
                     cwd=str(repo_path),
@@ -212,6 +482,8 @@ class HarnessRunner:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     shell=False,
+                    start_new_session=True,
+                    creationflags=creationflags or 0,
                     # bufsize=1 + 文本模式：按行读协议流
                     text=True,
                     encoding="utf-8",
@@ -225,19 +497,60 @@ class HarnessRunner:
                     error=f"启动失败: {exc}",
                 )
 
+            # 留下进程句柄供调用方核查回收结果：终态后 process.poll()
+            # 必须非 None，证明子进程真的退出（而不是仅仅"报告了终态"）。
+            self._last_process = process
+            state.process = process
+
+            # R1：Windows 上把子进程放进 Job Object —— 进程组的等价物。
+            # 后代自动继承成员身份，关闭 Job 即整棵树消失（含根进程先死、
+            # 后代被孤儿化的情况：taskkill /T 依赖 PPID 链，根进程一死
+            # 就定位不到后代了）。创建失败时退回 taskkill /T /F 路径。
+            # 句柄存在**本次 run 自己的 state** 里：并发时不与别的运行串。
+            state.job = _create_kill_on_close_job(process)
+
             return self._supervise(
-                process, task_id, on_event=on_event, stop_event=stop_event
+                process, state, task_id, on_event=on_event, stop_event=stop_event
             )
         finally:
+            # 兜底：若 _supervise 提前抛出，本次 run 的 Job 里的后代也不能留下
+            self._close_job(state)
             if prompt_file:
                 try:
                     os.unlink(prompt_file)
                 except OSError:
                     pass
 
+    def _close_job(self, state: _RunState) -> None:
+        """关闭**本次 run** 的 Job 句柄：残留后代（孤儿）随之被杀。"""
+        job = state.job
+        state.job = None
+        if job is not None:
+            _close_kill_job(job)
+
+    def _terminate_tree(self, state: _RunState) -> None:
+        """回收**本次 run** 的整棵进程树（幂等，仅对本次 run 生效）。
+
+        根进程退出 **不代表** 整组退出：后代可能忽略 SIGTERM 而继续运行，
+        根进程先死时也定位不到后代。因此必须在根进程退出后复查整组。
+
+        回收标记与 Job 句柄都取自本次 run 的 `state`，**不使用实例状态**：
+        否则并发时 A 的收口会把 B 的回收跳过（进程树残留）或让 B 取到
+        A 的 Job 句柄（跨运行误杀）。
+        """
+        if state.terminated:
+            return
+        state.terminated = True
+        job = state.job
+        state.job = None
+        process = state.process
+        if process is not None:
+            _terminate_process_tree(process, job=job)
+
     def _supervise(
         self,
         process: subprocess.Popen,
+        run_state: _RunState,
         task_id: str,
         *,
         on_event=None,
@@ -338,7 +651,7 @@ class HarnessRunner:
         while True:
             if stop_event is not None and stop_event.is_set():
                 stopped = True
-                _terminate_process_tree(process)
+                self._terminate_tree(run_state)
                 break
             try:
                 exit_code = process.wait(timeout=0.2)
@@ -346,8 +659,12 @@ class HarnessRunner:
             except subprocess.TimeoutExpired:
                 if time.monotonic() >= deadline:
                     timed_out = True
-                    _terminate_process_tree(process)
+                    self._terminate_tree(run_state)
                     break
+
+        # 根进程退出 ≠ 整组退出：可能仍有孤儿后代存活（还会占着 stdout 管道）。
+        # 统一再回收一次整组，确保不残留子进程、管道也能正常关闭。
+        self._terminate_tree(run_state)
 
         if exit_code is None:
             try:

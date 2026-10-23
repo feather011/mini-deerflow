@@ -21,6 +21,12 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any
 
+from mini_deerflow.mcp_errors import MCPError
+
+
+class MCPConfigError(MCPError):
+    """MCP 配置非法（包括工具分类声明未知枚举名）。"""
+
 # ---------------------------------------------------------------------------
 # ToolSource
 # ---------------------------------------------------------------------------
@@ -143,12 +149,12 @@ class ToolMetadata:
         """是否有外部副作用（默认需要本次确认）。"""
         if self.uncategorized:
             return True
-        # READS_SESSION / READS_PROJECT / RUNS_COMMAND（受控委派路径）不算危险副作用
+        # 会话内部读写不算危险副作用；RUNS_COMMAND 由 evaluate_tool_access 中 project_execute 例外覆盖
         return bool(self.side_effects - {
             ToolSideEffect.NONE,
             ToolSideEffect.READS_SESSION,
+            ToolSideEffect.WRITES_SESSION,
             ToolSideEffect.READS_PROJECT,
-            ToolSideEffect.RUNS_COMMAND,
         })
 
 
@@ -234,6 +240,9 @@ class ToolAccessDecision:
 
     reason: str
     """简短说明（面向用户或日志）。"""
+
+    metadata: dict = field(default_factory=dict)
+    """扩展元数据（如 CONFIRM 时挂载的 pending request_id）。"""
 
     @classmethod
     def allow(cls, reason: str = "allowed") -> "ToolAccessDecision":
@@ -352,6 +361,20 @@ class ToolResult:
 # ---------------------------------------------------------------------------
 
 
+def _is_authorized_read_only_web(metadata: ToolMetadata) -> bool:
+    """R1 收窄的「默认已授权豁免」条件。
+
+    仅当工具是 TOOL-06 web_search / web_read，且**唯一**所需能力是 NETWORK_READ
+    时，才视为「已授权的网络只读工具」——policy.requires_confirmation=False
+    时不需要弹确认。其他工具（命令执行、文件写入、API 写）按 metadata
+    默认判定走原逻辑。
+    """
+    if metadata.name not in ("web_search", "web_read"):
+        return False
+    required = metadata.capabilities
+    return required == frozenset({ToolCapability.NETWORK_READ})
+
+
 def evaluate_tool_access(
     metadata: ToolMetadata | None,
     policy: "ToolPolicy | None",
@@ -424,7 +447,26 @@ def evaluate_tool_access(
         )
 
     # 6. 已授权但需要确认（策略覆盖 > 元数据默认值）
-    if policy.requires_confirmation or metadata.requires_confirmation():
+    #
+    # - policy.requires_confirmation=True → 强制 CONFIRM
+    # - policy.requires_confirmation=False 且工具是「网络只读 web_*」+ 仅需
+    #   NETWORK_READ 能力 → 视为「已授权豁免」，不弹确认
+    # - project_execute 走受控派发例外（policy=False 时直接派发）
+    # - 其余工具按 metadata.requires_confirmation() 判定
+    if policy.requires_confirmation:
+        needs_confirm = True
+    elif metadata.name == "project_execute":
+        # 受控执行路径：policy.requires_confirmation=False 时直接派发
+        needs_confirm = False
+    elif _is_authorized_read_only_web(metadata):
+        # R1 收紧：仅对已授权的网络只读 web 工具豁免
+        needs_confirm = False
+    elif metadata.requires_confirmation():
+        # 默认走 metadata 自身判定（命令执行、项目写入等仍要弹确认）
+        needs_confirm = True
+    else:
+        needs_confirm = False
+    if needs_confirm:
         return ToolAccessDecision.confirm(
             f"工具 {metadata.name} 有外部副作用，需要本次确认",
         )
@@ -526,7 +568,7 @@ PROJECT_GREP_METADATA = ToolMetadata(
     side_effects=frozenset({ToolSideEffect.READS_PROJECT}),
 )
 
-# project_execute（受控委派，有确认机制）
+# project_execute（受控委派，RUNS_COMMAND 覆盖执行语义）
 PROJECT_EXECUTE_METADATA = ToolMetadata(
     name="project_execute",
     source=ToolSourceKind.LOCAL,
@@ -563,6 +605,31 @@ SANDBOX_RUN_COMMAND_METADATA = ToolMetadata(
     source=ToolSourceKind.LOCAL,
     capabilities=frozenset({ToolCapability.COMMAND_EXECUTE}),
     side_effects=frozenset({ToolSideEffect.RUNS_COMMAND}),
+)
+
+
+# TOOL-06：网络只读工具
+#
+# - `web_search` 与 `web_read` 共享 `NETWORK_READ` 能力。
+# - side_effects 标 `READS_NETWORK`（非项目操作，普通会话亦可调用）。
+# - 不授予 `EXTERNAL_SERVICE_READ`（那是给接入可控外部服务留的——搜索/读取是
+#   模型触发的不可信数据源，不能获得"调用外部服务"的更强信任）。
+# - requires_confirmation() 默认 True（READS_NETWORK 不在豁免集合），
+#   但默认策略（`default_policy_for_web`）会把它显式置 False：已启用且已授权
+#   的只读搜索/读取默认无需逐次确认。策略要求显式置位，避免「以为禁用确认」与
+#   「实际是元数据豁免」混在一起。
+WEB_SEARCH_METADATA = ToolMetadata(
+    name="web_search",
+    source=ToolSourceKind.LOCAL,
+    capabilities=frozenset({ToolCapability.NETWORK_READ}),
+    side_effects=frozenset({ToolSideEffect.READS_NETWORK}),
+)
+
+WEB_READ_METADATA = ToolMetadata(
+    name="web_read",
+    source=ToolSourceKind.LOCAL,
+    capabilities=frozenset({ToolCapability.NETWORK_READ}),
+    side_effects=frozenset({ToolSideEffect.READS_NETWORK}),
 )
 
 
@@ -634,6 +701,83 @@ def default_policy_for_sandbox() -> ToolPolicy:
     )
 
 
+def default_policy_for_web() -> ToolPolicy:
+    """TOOL-06：网络只读工具默认策略。
+
+    - 默认启用（已启用的搜索/读取不需要每次确认）
+    - 主 Agent 可见（MINI_SUBAGENT 暂不直接做网络读取，避免子代理扩大外部依赖；
+      如需委派，由用户/策略显式授权）
+    - `requires_confirmation=False`：已授权的只读调用不弹确认；
+      若用户/策略希望强制逐次确认，把 `policy.requires_confirmation` 置 True 即可。
+    """
+    return ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=False,
+    )
+
+
+# TOOL-03 R2：MCP 工具元数据按可信配置分类
+# 字符串 → 枚举映射；未知字符串 → MCPToolStateError（避免默认分类导致过度权限）
+_TOOL_CAPABILITY_BY_NAME: dict[str, ToolCapability] = {c.name: c for c in ToolCapability}
+_TOOL_SIDE_EFFECT_BY_NAME: dict[str, ToolSideEffect] = {s.name: s for s in ToolSideEffect}
+
+
+def make_mcp_tool_metadata(
+    name: str,
+    declared_capabilities: frozenset[str] = frozenset(),
+    declared_side_effects: frozenset[str] = frozenset(),
+) -> ToolMetadata:
+    """构造一个 MCP 工具的 ToolMetadata。
+
+    TOOL-03 R2：按可信配置分类。
+    - `declared_capabilities` / `declared_side_effects` 均为空 → uncategorized，
+      评估时默认拒绝（不要"无副作用 echo 默认通过"）。
+    - 任一非空 → 按声明构造元数据。
+    """
+    if not declared_capabilities and not declared_side_effects:
+        # 未声明 → 分类不可信 → uncategorized=True 触发默认拒绝
+        return ToolMetadata(
+            name=name,
+            source=ToolSourceKind.MCP,
+            capabilities=frozenset(),
+            side_effects=frozenset(),
+            uncategorized=True,
+        )
+
+    try:
+        caps = frozenset(_TOOL_CAPABILITY_BY_NAME[c] for c in declared_capabilities)
+    except KeyError as exc:
+        raise MCPConfigError(
+            f"MCP 工具 {name} 声明未知 capability: {exc.args[0]!r}"
+        ) from None
+    try:
+        sides = frozenset(_TOOL_SIDE_EFFECT_BY_NAME[s] for s in declared_side_effects)
+    except KeyError as exc:
+        raise MCPConfigError(
+            f"MCP 工具 {name} 声明未知 side_effect: {exc.args[0]!r}"
+        ) from None
+
+    return ToolMetadata(
+        name=name,
+        source=ToolSourceKind.MCP,
+        capabilities=caps,
+        side_effects=sides,
+    )
+
+
+def default_policy_for_mcp_tool() -> ToolPolicy:
+    """MCP 工具默认策略：默认 disabled，由用户显式启用并按主体授权。
+
+    区别于 sandbox_* 的"主 Agent 默认 deny"——MCP 工具需要用户在
+    管理页中分别授权每个主体，不在代码里预设。
+    """
+    return ToolPolicy(
+        enabled=False,
+        allowed_principals=frozenset(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 策略注册表（用于 lookup）
 # ---------------------------------------------------------------------------
@@ -651,6 +795,9 @@ BUILTIN_TOOL_METADATA: dict[str, ToolMetadata] = {
     "sandbox_read_file": SANDBOX_READ_FILE_METADATA,
     "sandbox_write_file": SANDBOX_WRITE_FILE_METADATA,
     "sandbox_run_command": SANDBOX_RUN_COMMAND_METADATA,
+    # TOOL-06：网络只读工具
+    "web_search": WEB_SEARCH_METADATA,
+    "web_read": WEB_READ_METADATA,
 }
 
 
@@ -670,4 +817,8 @@ def default_policy_for(name: str) -> ToolPolicy | None:
         return default_policy_for_subagent()
     if name.startswith("sandbox_"):
         return default_policy_for_sandbox()
+    if name in ("web_search", "web_read"):
+        return default_policy_for_web()
+    if name.startswith("mcp__"):
+        return default_policy_for_mcp_tool()
     return None

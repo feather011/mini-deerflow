@@ -100,6 +100,9 @@ export function ingestRealTaskData(
       },
       files: [],
       events,
+      // 必须记录：下一轮 ingest 用它判断"是否开始了新 run"，
+      // 缺省会变成 undefined，使任何 runId 都被误判成新 run 而清空已有结果。
+      run_id_marker: data.runId,
     })
     return
   }
@@ -165,6 +168,8 @@ export function clearRealTaskData(): void {
 
 /** 生产路径使用的 TaskAdapter：从模块级缓存读真实数据 */
 export const realTaskAdapter: TaskAdapter = {
+  // 生产路径的数据来自真实 SSE / 真实 harness 结果，不是演示数据
+  dataSource: 'real',
   getTask(threadId: string | null): TaskResult | null {
     if (!threadId) return null
     return cache.get(threadId) ?? null
@@ -185,9 +190,14 @@ function mapStreamStatus(status: StreamStatus | null): TaskStatus {
       return 'stopped'
     case 'timed_out':
       return 'timeout'
+    // 还没有任何 Run：不得显示"运行中"（产品口径：暂无运行）。
+    // idle 是流的初始状态，null 表示根本没有流信息 —— 两者都等同于无 Run。
     case 'idle':
+    case null:
+      return 'no_run'
     case 'connecting':
     case 'streaming':
+      return 'running'
     default:
       return 'running'
   }
@@ -257,77 +267,90 @@ function buildChangedFilesFromResult(result: ProjectExecuteResult): ChangedFile[
   if (!changes || changes.length === 0) return []
 
   return changes.map((f) => {
-    const added =
-      f.status === 'added'
-        ? (f.unified_diff?.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).length ?? 0)
+    const diff = parseUnifiedDiff(f.unified_diff ?? '')
+    // 计数以**实际渲染出来的 diff 行**为准，避免计数与展示不一致
+    // （例如新增文件此前没有 diff 正文，计数恒为 +0）。
+    const hasDiff = diff.length > 0
+    const added = hasDiff ? diff.filter((l) => l.type === 'add').length : 0
+    const removed = hasDiff
+      ? diff.filter((l) => l.type === 'remove').length
+      : f.status === 'deleted'
+        ? 1
         : 0
-    const removed =
-      f.status === 'modified'
-        ? (f.unified_diff?.split('\n').filter((l) => l.startsWith('-') && !l.startsWith('---')).length ?? 0)
-        : f.status === 'deleted'
-          ? 1
-          : 0
 
     return {
       path: f.path,
       change: f.status === 'added' ? 'A' : f.status === 'modified' ? 'M' : 'D',
       added,
       removed,
-      diff: parseUnifiedDiff(f.unified_diff ?? ''),
+      diff,
+      diff_truncated: f.diff_truncated === true,
     }
   })
 }
 
+/**
+ * 解析 unified diff 文本为可渲染的行。
+ *
+ * 头判定必须是**状态机**：`--- ` / `+++ ` 只有在进入 hunk 之前才是文件头；
+ * 进入 hunk 之后同样以 `--- ` / `+++ ` 开头的是**内容行**
+ * （例如被删除的一行内容是 `-- 注释`）。用 startsWith 判定会把这类内容行
+ * 误当文件头丢掉。
+ *
+ * **多段 hunk**：一次修改可能产生多个 `@@` 块（改动点相隔超过上下文行数时，
+ * difflib 会拆成多段）。每个块头都要**重新设定行号并跳过** —— 否则第二个块头
+ * 会被当成一行正文，后面的行号也会接着上一段累加，全是错的。
+ */
 function parseUnifiedDiff(diff: string): DiffLine[] {
   if (!diff) return []
   const lines = diff.split('\n')
   const result: DiffLine[] = []
   let oldLine = 0
   let newLine = 0
+  // 是否已进入 hunk（进入后不再把 --- / +++ 当文件头）
+  let inHunk = false
+
+  // 块头格式：@@ -旧行[,旧行数] +新行[,新行数] @@
+  const applyHunkHeader = (raw: string): void => {
+    const m = raw.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+    if (m?.[1] && m?.[2]) {
+      oldLine = parseInt(m[1]!, 10)
+      newLine = parseInt(m[2]!, 10)
+    }
+    // 格式不标准时保留当前行号（尽力而为），但仍要跳过块头本身
+  }
 
   for (const raw of lines) {
-    if (raw.startsWith('---') || raw.startsWith('+++') || raw.startsWith('@@')) {
-      // 解析 @@ 行中的行号
-      const m = raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
-      if (m?.[1] && m?.[2]) {
-        oldLine = parseInt(m[1]!, 10)
-        newLine = parseInt(m[2]!, 10)
+    if (!inHunk) {
+      if (raw.startsWith('@@')) {
+        applyHunkHeader(raw)
+        inHunk = true
       }
+      // 文件头（--- / +++）与 hunk 前的其它行：不渲染
+      continue
+    }
+
+    // 已在 hunk 中：又遇到块头 → 新的一段 hunk，重设行号并跳过块头
+    if (raw.startsWith('@@')) {
+      applyHunkHeader(raw)
+      continue
+    }
+
+    if (raw.startsWith('\\')) {
+      // 元信息行（如 "\ ... diff 已截断"）：跳过
       continue
     }
     if (raw.startsWith('+')) {
       result.push({ type: 'add', old_line: null, new_line: newLine++, text: raw.slice(1) })
     } else if (raw.startsWith('-')) {
       result.push({ type: 'remove', old_line: oldLine++, new_line: null, text: raw.slice(1) })
-    } else if (raw.length > 0) {
-      result.push({ type: 'context', old_line: oldLine++, new_line: newLine++, text: raw })
+    } else {
+      // 上下文行：unified diff 里以空格开头；渲染时会再补一个空格，这里去掉
+      const text = raw.startsWith(' ') ? raw.slice(1) : raw
+      result.push({ type: 'context', old_line: oldLine++, new_line: newLine++, text })
     }
   }
   return result
-}
-
-function buildTaskResult(threadId: string, data: RealTaskDataInput): TaskResult {
-  // 已废弃：原实现每次都重建 task 并把 files/validation 重置为空，
-  // 导致「重新进入 thread」或「SSE 重连」时把上一次 run.result 的成果清空。
-  // 保留以避免外部测试引用；新逻辑在 ingestRealTaskData 内联处理。
-  const status = mapStreamStatus(data.streamStatus)
-  return {
-    thread_id: threadId,
-    run_label: data.runId
-      ? `run-${data.runId.slice(0, 4)} · 归属当前会话`
-      : `thread: ${threadId} · 尚未建立 Run`,
-    title: data.title,
-    status,
-    validation: {
-      status: 'not_run',
-      command: null,
-      output: null,
-      note: '执行器输出尚未通过 run.result 事件推送。',
-    },
-    files: [], // 默认空；run.result 事件触发更新
-    events: data.events.map(convertToTimelineEvent),
-    run_id_marker: data.runId,
-  }
 }
 
 // ---- 工具：把 SSE RunEvent 转为 TaskEvent 时间线条目 ----

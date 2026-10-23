@@ -1,0 +1,148 @@
+.mcp {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  font-size: 14px;
+}
+
+.section {
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.sectionTitle {
+  font-weight: 600;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: #333;
+}
+
+.serverRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.serverRow:last-child {
+  border-bottom: none;
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.dotRunning {
+  background: #2a7d2a;
+}
+
+.dotStopped {
+  background: #aaa;
+}
+
+.dotFailed {
+  background: #b30;
+}
+
+.serverName {
+  font-family: monospace;
+  font-size: 13px;
+  flex: 1;
+}
+
+.serverMeta {
+  font-size: 12px;
+  color: #666;
+}
+
+.toolRow {
+  display: grid;
+  grid-template-columns: 2fr 1fr 3fr;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid #f0f0f0;
+  font-size: 13px;
+}
+
+.toolRow:last-child {
+  border-bottom: none;
+}
+
+.toolName {
+  font-family: monospace;
+  word-break: break-all;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.principals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.principalPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: #e8eef5;
+  border: 1px solid #b8c5d8;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.principalPillGranted {
+  background: #d8e8d8;
+  border-color: #4a7d2a;
+  color: #1f5c1f;
+}
+
+.principalPillPending {
+  opacity: 0.6;
+}
+
+.btn {
+  padding: 2px 6px;
+  font-size: 11px;
+  border: 1px solid #aaa;
+  border-radius: 3px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.btn:hover {
+  background: #f0f0f0;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btnRevoke {
+  color: #b30;
+  border-color: #b30;
+}
+
+.error {
+  color: #b30;
+  font-size: 12px;
+}
+
+.empty {
+  font-size: 12px;
+  color: #888;
+  font-style: italic;
+}
