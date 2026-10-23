@@ -1,10 +1,12 @@
 /**
  * AgentChatPanel 组件测试（20D + UX-1 状态分离）
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
 import { AgentChatPanel } from './AgentChatPanel'
+import { TaskInspector } from '../inspector/TaskInspector'
+import { clearRealTaskData, realTaskAdapter } from '../inspector/realTaskAdapter'
 import type { StreamStatus } from './useAgentStream'
 import type { ThreadDetail } from '../../shared/types/threads'
 
@@ -12,7 +14,8 @@ import type { ThreadDetail } from '../../shared/types/threads'
 const mockUseAgentStream = vi.hoisted(() => vi.fn(() => ({
   status: 'idle' as StreamStatus,
   events: [],
-  runId: null,
+  // runId 需要能容纳字符串（冷启动时为 null，新 run 时有值）
+  runId: null as string | null,
   errorMessage: null,
   requestId: null,
   terminalEvent: null,
@@ -405,5 +408,133 @@ describe('AgentChatPanel', () => {
     render(<AgentChatPanel thread={emptyThread} />)
 
     expect(screen.getByText('已取消当前任务')).toBeInTheDocument()
+  })
+})
+
+/**
+ * F6：冷挂载 / 刷新后恢复已保存的执行结果。
+ *
+ * 场景：用户跑完一轮真实执行（project_execute），刷新页面。此时
+ * - 流是 idle、没有事件、runId 为 null（刷新后没有正在跑的 Run）
+ * - thread.last_run_result 带着上一轮的真实结果 JSON
+ *
+ * 缺陷：恢复 last_run_result 的 effect 排在「建立本会话任务」的 effect
+ * 之前，而 `ingestProjectExecuteResult` 在缓存没有该 thread 条目时直接
+ * 返回 —— 冷挂载时先恢复就会把保存的结果丢掉，文件与 diff 全部消失。
+ *
+ * 这些用例**不依赖 StrictMode 的 effect 重放**（开发模式下重放会掩盖顺序
+ * 问题），用的是普通挂载。
+ */
+describe('AgentChatPanel 冷挂载恢复已保存结果', () => {
+  const persistedResult = JSON.stringify({
+    ok: true,
+    status: 'completed',
+    files_written: ['hello.c'],
+    changes: {
+      files: [
+        {
+          path: 'hello.c',
+          status: 'added',
+          unified_diff:
+            '--- /dev/null\n+++ b/hello.c\n@@ -0,0 +1,3 @@\n+#include <stdio.h>\n+int main(void){return 0;}\n+}',
+        },
+      ],
+    },
+  })
+
+  const threadWithPersisted: ThreadDetail = {
+    thread_id: 't-restore',
+    messages: [{ role: 'user', content: '写一个 hello.c' }],
+    last_run_result: persistedResult,
+  }
+
+  beforeEach(() => {
+    clearRealTaskData()
+  })
+
+  afterEach(() => {
+    clearRealTaskData()
+  })
+
+  it('冷挂载（流 idle、无事件、runId=null）后文件结果不丢', () => {
+    render(<AgentChatPanel thread={threadWithPersisted} />)
+
+    const files = realTaskAdapter.getTask('t-restore')?.files
+    expect(files).toHaveLength(1)
+    expect(files?.[0]?.path).toBe('hello.c')
+    expect(files?.[0]?.change).toBe('A')
+    expect(files?.[0]?.added).toBe(3)
+    expect(files?.[0]?.diff).toHaveLength(3)
+  })
+
+  it('冷挂载后 diff 正文保留（消费链：面板里能看到具体内容）', () => {
+    render(<AgentChatPanel thread={threadWithPersisted} />)
+
+    render(
+      <TaskInspector
+        open
+        onClose={vi.fn()}
+        threadId="t-restore"
+        adapter={realTaskAdapter}
+      />,
+    )
+
+    expect(screen.getByText('hello.c')).toBeInTheDocument()
+
+    const rows = Array.from(document.querySelectorAll('[data-line-type]'))
+    // 每行含新旧行号两列 + 正文；只取正文那一段做断言
+    const texts = rows.map((r) => (r.lastElementChild?.textContent ?? '').trim())
+    expect(rows).toHaveLength(3)
+    expect(texts).toEqual([
+      '+#include <stdio.h>',
+      '+int main(void){return 0;}',
+      '+}',
+    ])
+  })
+
+  it('冷挂载后验证状态保留（不谎报通过，也不谎报未推送）', () => {
+    render(<AgentChatPanel thread={threadWithPersisted} />)
+
+    const validation = realTaskAdapter.getTask('t-restore')?.validation
+    expect(validation?.status).toBe('not_run')
+    expect(validation?.command).toBeNull()
+    expect(validation?.output).toBeNull()
+  })
+
+  it('开始新 run 时才清空上一轮结果（新 run 正确重置）', () => {
+    const { rerender } = render(<AgentChatPanel thread={threadWithPersisted} />)
+    expect(realTaskAdapter.getTask('t-restore')?.files).toHaveLength(1)
+
+    // 新一轮 run：runId 出现且与旧值不同
+    mockUseAgentStream.mockReturnValue({
+      ...mockUseAgentStream(),
+      status: 'streaming' as const,
+      runId: 'run-new',
+    })
+    rerender(<AgentChatPanel thread={threadWithPersisted} />)
+
+    expect(realTaskAdapter.getTask('t-restore')?.files).toEqual([])
+  })
+
+  it('跨会话隔离：另一个会话的保存结果不串到本会话', () => {
+    const otherThread: ThreadDetail = {
+      thread_id: 't-other',
+      messages: [{ role: 'user', content: '别的会话' }],
+      last_run_result: JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: { files: [{ path: 'other.c', status: 'added', unified_diff: '--- /dev/null\n+++ b/other.c\n@@ -0,0 +1,1 @@\n+int x;' }] },
+      }),
+    }
+
+    render(
+      <>
+        <AgentChatPanel thread={threadWithPersisted} />
+        <AgentChatPanel thread={otherThread} />
+      </>,
+    )
+
+    expect(realTaskAdapter.getTask('t-restore')?.files[0]?.path).toBe('hello.c')
+    expect(realTaskAdapter.getTask('t-other')?.files[0]?.path).toBe('other.c')
   })
 })

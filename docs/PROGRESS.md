@@ -3030,3 +3030,73 @@ cd frontend && npx tsc -p tsconfig.app.json --noEmit
 
 - 独立复审本提交（对应 PR #6 最新 head）。
 - **合并由用户决定**；复审通过前不宣告修复通过。
+---
+
+### TOOL-07 第二轮独立复审返修：F1 多段 hunk / F6 冷挂载恢复（2026-10-23）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：`a742668`（上一轮 head）→ 本轮提交
+- 当前状态：**READY_FOR_REVIEW** —— F1/F6 已修并验证；已关闭项未重做；**未合并**
+- 更新时间：2026-10-23
+- 依据：独立复审评论 [`6342238913`](https://github.com/feather011/mini-deerflow/pull/6#issuecomment-6342238913)（head `a742668`，结论 **changes_requested**）
+
+**复审结论与本轮处置**
+
+| 复审结论 | 处置 |
+|---|---|
+| F2 / F3 / F5 已关闭；三份 TypeScript 配置检查通过 | **不重做**，本轮未触碰相关代码 |
+| **F1 剩余**：多段 diff 只识别首个 `@@`，后续块头进入正文、行号错误 | **本轮修** |
+| **F6**：冷启动先恢复结果、后创建任务缓存，刷新后文件结果丢失 | **本轮修** |
+| `deleted` 分支无 diff | **继续暂缓**（用户与复审均明确不要求本轮修） |
+| 入库刷新脚本只打印结论，未做失败断言 | **本轮补** |
+
+**F1：多段 hunk 解析**
+
+- 根因：`parseUnifiedDiff` 只在进入**第一个** hunk 前识别 `@@`；之后遇到 `@@ -22,7 +22,7 @@` 会落到"上下文行"分支，被当成一行正文渲染，后面的行号接着上一段累加。
+- 复现（与复审一致）：30 行文件改第 2、25 行 → 后端产出**两个**合法 hunk；旧解析器把第二个块头当正文，`CHANGED_AT_25` 的 `new_line` 显示为 **10**（应为 25）。
+- 修复：进入 hunk 后**每遇合法 `@@` 块头都重设 old/new 行号并跳过块头**；`--- `/`+++ ` 在首个 hunk 之后仍按**内容行**处理（原有规则保留）。
+- 夹具可信度：前端测试用的两段 hunk 字符串与后端 `_compute_diff` 对同一 30 行文件的**实际产出逐字节一致**（已用 `PYTHONPATH=src python` 核对）。
+
+**F6：冷挂载 / 刷新恢复**
+
+- 根因：`AgentChatPanel` 里"恢复 `last_run_result`"的 effect 排在"建立本会话任务"的 effect **之前**；而 `ingestProjectExecuteResult` 在缓存没有该 thread 条目时**直接返回** → 冷挂载时先恢复，恢复内容被丢弃。
+- 修复：把"建立本会话任务"的 effect 排到前面，恢复 effect 排到后面。**不改** `ingestProjectExecuteResult` 的早退语义（那是"未建立任务数据时忽略"的既定契约）。
+- 同 run 不清空 / 新 run 正确重置 / 跨会话隔离三条语义保持不变，并补了组件级回归。
+
+**测试（未放宽断言）**
+
+| 文件 | 新增 |
+|------|------|
+| `frontend/src/features/inspector/realTaskAdapter.test.ts` | F1 适配器层 6 条：块头不成正文、第二 hunk 行号准确（`CHANGED_AT_25` → 25）、第一 hunk 行号正确、第二 hunk 上下文行号连续、计数覆盖两 hunk、hunk 内 `--- `/`+++ ` 仍是内容行 |
+| `frontend/src/features/inspector/TaskInspector.test.tsx` | F1 **消费链** 4 条：无块头伪正文、第二处修改行号显示 25、第一处显示 2、计数 `+2 −2` |
+| `frontend/src/features/threads/AgentChatPanel.test.tsx` | F6 冷挂载 5 条：冷挂载后文件不丢、**diff 正文在面板里可见**、验证状态保留、新 run 才清空、跨会话隔离 |
+| `frontend/e2e/tool07-refresh-check.mjs` | 补**失败断言**（此前只打印结论）：5 项检查，任一失败即 `process.exit(1)` |
+
+- 冷挂载用例**不依赖 StrictMode 的 effect 重放**（用普通挂载）——复审指出重放会掩盖顺序问题。
+- 测试夹具 `mockUseAgentStream` 的 `runId` 类型由 `null` 放宽为 `string | null`（仅为让"新 run"用例能赋字符串值，未改任何断言）。
+
+**验证证据（本轮实际执行）**
+
+| 范围 | 命令 | 结果 |
+|------|------|------|
+| 前端类型检查 | `npm run typecheck` | **exit 0**（三份配置全过） |
+| 前端全量单测 | `npx vitest run` | **42 files / 506 tests passed**（上一提交 491，**+15**） |
+| 前端 lint | `npx oxlint src` | exit 0，0 error / 8 warning（与上轮同数） |
+| 判别力 · F1 | 独立脚本对比旧/新解析器（**未改仓库源码**） | 旧：`CHANGED_AT_25.new_line=10`、伪块头 1 行；新：`new_line=25`、伪块头 0 行 |
+| 判别力 · F6 | 临时夹具复刻两种 effect 顺序（**未改仓库源码**，用完即删） | 旧顺序（先恢复后建立）→ files 为空；新顺序 → files 保留 1 项 |
+| 浏览器实测 | `node e2e/tool07-refresh-check.mjs`（真实 Chromium + 真实 harness 子进程，假 LLM 不联网不计费） | **exit 0，5/5 通过**：刷新后仍显示 `hello.c +6 −0`、6 行 diff 正文完整、验证页签仍如实「未运行」且不谎报「通过」 |
+| 后端 | 本轮**未改后端** | 未重跑（`ea4b2ca` 的后端证据仍有效） |
+
+**限制**
+
+- F1 的浏览器端证据未取：harness 的 `FakeLLMClient` 固定只创建 `hello.c`，造不出"30 行文件改第 2、25 行"的两段 hunk 场景。该路径由**适配器层 + 组件消费层**回归覆盖，且夹具与后端实际产出逐字节一致。
+- 浏览器实测覆盖的是 F6 的刷新路径（同一验收环境、真实子进程、零网络）。
+- 判别力用**独立对照脚本 / 临时夹具**给出，未做"回滚仓库源码再跑同一份测试"——分类器拦截该做法，且与项目"不回滚代码"的规矩冲突。
+- 未跑真实付费 Provider（按项目约束）。
+- `deleted` 分支无 diff 正文仍**未修**（明确暂缓），下一轮候选。
+- 本轮未跑后端全量 pytest（未改后端）。
+
+**下一步**
+
+- 独立复审本提交；**合并由用户决定**，复审通过前不宣告修复通过。

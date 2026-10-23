@@ -536,3 +536,125 @@ describe('realTaskAdapter 变化文件 diff', () => {
     expect(file?.diff).toEqual([])
   })
 })
+
+// ---- F1：多段 hunk ----
+
+/**
+ * 真实场景：30 行文件改第 2 行与第 25 行，difflib 会拆成**两个** hunk
+ * （改动点相隔超过上下文行数 3）。第二个块头 `@@ -22,7 +22,7 @@` 若被当成
+ * 正文行，后面的行号会接着第一段累加 —— CHANGED_AT_25 会显示成第 10 行。
+ */
+const TWO_HUNK_DIFF = [
+  '--- a/demo.txt',
+  '+++ b/demo.txt',
+  '@@ -1,5 +1,5 @@',
+  ' line1',
+  '-line2',
+  '+CHANGED_AT_2',
+  ' line3',
+  ' line4',
+  ' line5',
+  '@@ -22,7 +22,7 @@',
+  ' line22',
+  ' line23',
+  ' line24',
+  '-line25',
+  '+CHANGED_AT_25',
+  ' line26',
+  ' line27',
+  ' line28',
+].join('\n')
+
+describe('realTaskAdapter 多段 hunk 解析', () => {
+  const ingestTwoHunk = (threadId: string) => {
+    ingestRealTaskData(threadId, {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-two-hunk',
+      title: '两段 hunk',
+    })
+    ingestProjectExecuteResult(
+      threadId,
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: {
+          files: [{ path: 'demo.txt', status: 'modified', unified_diff: TWO_HUNK_DIFF }],
+        },
+      }),
+    )
+    return realTaskAdapter.getTask(threadId)?.files[0]
+  }
+
+  it('块头不会被当成正文行渲染', () => {
+    const file = ingestTwoHunk('thread-H1')
+    expect(file?.diff.some((l) => l.text.startsWith('@@'))).toBe(false)
+    expect(file?.diff.map((l) => l.text)).not.toContain('@@ -22,7 +22,7 @@')
+  })
+
+  it('第二个 hunk 的行号按块头重设（CHANGED_AT_25 是第 25 行，不是第 10 行）', () => {
+    const file = ingestTwoHunk('thread-H2')
+    const changed25 = file?.diff.find((l) => l.text === 'CHANGED_AT_25')
+    expect(changed25?.new_line).toBe(25)
+    expect(changed25?.type).toBe('add')
+
+    const removed25 = file?.diff.find((l) => l.text === 'line25')
+    expect(removed25?.old_line).toBe(25)
+    expect(removed25?.type).toBe('remove')
+  })
+
+  it('第一个 hunk 的行号同样正确', () => {
+    const file = ingestTwoHunk('thread-H3')
+    const changed2 = file?.diff.find((l) => l.text === 'CHANGED_AT_2')
+    expect(changed2?.new_line).toBe(2)
+    const removed2 = file?.diff.find((l) => l.text === 'line2')
+    expect(removed2?.old_line).toBe(2)
+  })
+
+  it('上下文行在第二个 hunk 内的行号连续', () => {
+    const file = ingestTwoHunk('thread-H4')
+    const ctx22 = file?.diff.find((l) => l.text === 'line22')
+    expect(ctx22?.old_line).toBe(22)
+    expect(ctx22?.new_line).toBe(22)
+    const ctx28 = file?.diff.find((l) => l.text === 'line28')
+    expect(ctx28?.old_line).toBe(28)
+    expect(ctx28?.new_line).toBe(28)
+  })
+
+  it('计数覆盖两个 hunk 的全部改动', () => {
+    const file = ingestTwoHunk('thread-H5')
+    expect(file?.added).toBe(2)
+    expect(file?.removed).toBe(2)
+  })
+
+  it('hunk 内的 `--- `/`+++ ` 仍是内容行，不被当成文件头丢掉', () => {
+    // 被删掉的一行内容是 `-- 注释`：去掉首个 '-' 后是 '- 注释'，
+    // 渲染时仍要能看到
+    ingestRealTaskData('thread-H6', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-h6',
+      title: 'H6',
+    })
+    ingestProjectExecuteResult(
+      'thread-H6',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: {
+          files: [
+            {
+              path: 'c.txt',
+              status: 'modified',
+              unified_diff:
+                '--- a/c.txt\n+++ b/c.txt\n@@ -1,3 +1,3 @@\n line1\n--- 注释\n+++ 新增行\n line3',
+            },
+          ],
+        },
+      }),
+    )
+    const file = realTaskAdapter.getTask('thread-H6')?.files[0]
+    expect(file?.diff.some((l) => l.text === '-- 注释')).toBe(true)
+    expect(file?.diff.some((l) => l.text === '++ 新增行')).toBe(true)
+  })
+})

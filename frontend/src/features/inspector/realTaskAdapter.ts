@@ -296,6 +296,10 @@ function buildChangedFilesFromResult(result: ProjectExecuteResult): ChangedFile[
  * 进入 hunk 之后同样以 `--- ` / `+++ ` 开头的是**内容行**
  * （例如被删除的一行内容是 `-- 注释`）。用 startsWith 判定会把这类内容行
  * 误当文件头丢掉。
+ *
+ * **多段 hunk**：一次修改可能产生多个 `@@` 块（改动点相隔超过上下文行数时，
+ * difflib 会拆成多段）。每个块头都要**重新设定行号并跳过** —— 否则第二个块头
+ * 会被当成一行正文，后面的行号也会接着上一段累加，全是错的。
  */
 function parseUnifiedDiff(diff: string): DiffLine[] {
   if (!diff) return []
@@ -306,18 +310,29 @@ function parseUnifiedDiff(diff: string): DiffLine[] {
   // 是否已进入 hunk（进入后不再把 --- / +++ 当文件头）
   let inHunk = false
 
+  // 块头格式：@@ -旧行[,旧行数] +新行[,新行数] @@
+  const applyHunkHeader = (raw: string): void => {
+    const m = raw.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+    if (m?.[1] && m?.[2]) {
+      oldLine = parseInt(m[1]!, 10)
+      newLine = parseInt(m[2]!, 10)
+    }
+    // 格式不标准时保留当前行号（尽力而为），但仍要跳过块头本身
+  }
+
   for (const raw of lines) {
     if (!inHunk) {
       if (raw.startsWith('@@')) {
-        // 解析 @@ 行中的行号（格式不标准时仍进入 hunk，别把正文全丢掉）
-        const m = raw.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
-        if (m?.[1] && m?.[2]) {
-          oldLine = parseInt(m[1]!, 10)
-          newLine = parseInt(m[2]!, 10)
-        }
+        applyHunkHeader(raw)
         inHunk = true
       }
       // 文件头（--- / +++）与 hunk 前的其它行：不渲染
+      continue
+    }
+
+    // 已在 hunk 中：又遇到块头 → 新的一段 hunk，重设行号并跳过块头
+    if (raw.startsWith('@@')) {
+      applyHunkHeader(raw)
       continue
     }
 

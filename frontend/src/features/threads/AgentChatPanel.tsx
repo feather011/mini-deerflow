@@ -116,13 +116,10 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
   }, [isTerminal]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // 26：从 API 响应恢复最近一次 run.result（页面刷新后仍显示 diff）
-  useEffect(() => {
-    const persisted = thread.last_run_result
-    if (persisted && typeof persisted === 'string' && persisted.trim().startsWith('{')) {
-      ingestProjectExecuteResult(thread.thread_id, persisted)
-    }
-  }, [thread.thread_id, thread.last_run_result])
-
+  //
+  // 注意：这个 effect 必须排在下面「建立本会话任务」的 effect **之后**。
+  // `ingestProjectExecuteResult` 在缓存里没有该 thread 的条目时会直接返回，
+  // 冷启动（刷新页面）时若先恢复、后建立，保存的结果就被丢弃了。
   useEffect(() => {
     ingestRealTaskData(thread.thread_id, {
       streamStatus,
@@ -146,6 +143,13 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [thread.thread_id, streamStatus, events, runId])
+
+  useEffect(() => {
+    const persisted = thread.last_run_result
+    if (persisted && typeof persisted === 'string' && persisted.trim().startsWith('{')) {
+      ingestProjectExecuteResult(thread.thread_id, persisted)
+    }
+  }, [thread.thread_id, thread.last_run_result])
 
   // 同步 SSE 状态到提交状态
   useEffect(() => {
