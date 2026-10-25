@@ -3156,3 +3156,590 @@ cd frontend && npx tsc -p tsconfig.app.json --noEmit
 
 - 等用户做**最终业务验收**（派发 / 进度 / 停止 / 结果 四项）。
 - 等用户明确决定**是否合并**；合并前不宣告通过。
+
+---
+
+### TOOL-07 人工验收返修：普通会话入口 / 取消后重试 / 「知道了」可关闭（2026-10-23）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：`6abcd25`（`automation/tool-07`，本轮**尚未提交**）
+- 当前状态：**IN_PROGRESS** —— 人工验收返修第 4 轮；**不合并**、不启动后续模块
+- 更新时间：2026-10-23
+- 依据：用户本轮验收反馈的三项（普通会话固定回复 / 取消后重试状态残留 / 「知道了」关不掉）
+- 范围声明：**只处理这三项**，此前已通过的 diff / 权限 / 进程回收**不重做**
+
+**先做的三项核查（用户要求：不能只改一句回复来伪装修好）**
+
+| 核查点 | 实际结果 |
+|---|---|
+| 实际启动命令 | 当前在跑的后端是 `python scripts/tool07_acceptance_server.py --port 8123 --fake-llm-delay 15`（PID 36472）；生产入口是 `uvicorn mini_deerflow.api.app:app`（`app.py:437` 的模块级 `app = create_app()`） |
+| 前端代理目标 | `vite.config.ts` 的 `/api` 代理只读 `process.env.VITE_API_TARGET`（**仅 shell**，不读 `.env.local`）；`src/shared/api/config.ts` 的 `API_BASE_URL` 读 `import.meta.env.VITE_API_BASE_URL`，本机 `.env.local` 里该值为**空串** → 两者指不同来源；且 `SSE_BASE_URL === API_BASE_URL`，空串时 **SSE 也走 Vite 代理**，与 `streamClient.ts` 注释「SSE 不走代理，避免缓冲」相矛盾 |
+| 后端模型装配 | `create_app()` → `_default_runtime_factory()` → `load_model_settings()` → `create_model()`；`create_model()` 对**未知 provider / 真实 provider 缺 Key 已 fail-closed**；但 `MINI_DEERFLOW_MODEL_PROVIDER` **默认值就是 fake**，配置缺失时静默落到 `FakeModel.decide()` 的固定文案 |
+
+**设计约束（改动前先确认，避免破坏既有 20 个测试文件与容器验收）**
+
+- `fake` 必须继续是合法 provider：`tests/conftest.py` 的 autouse fixture 显式钉死 `MINI_DEERFLOW_MODEL_PROVIDER=fake`；`scripts/compose_persistence_check.py` 在 provider=fake 下真的发聊天（`计算 (17 + 25) * 3`）做容器部署验收。
+- 因此「正常模式 fail-closed」的判定条件取**「是否显式配置」**，而不是「provider 是否为 fake」：**用户显式写 `=fake` 视为有意的测试选择；完全没配置才是缺失**。`app.py` 模块级 `load_dotenv()` 已在 import 时把 `.env` 并入 `os.environ`，因此检查 `os.environ[PROVIDER_VAR]` 即可同时覆盖「系统环境变量」与「`.env`」两层。
+
+**下一步**：先补两个已复现缺陷的失败测试（取消后重试状态残留、「知道了」关不掉），再改代码、跑相关回归、最后重做浏览器体验。本轮**不合并**。
+
+
+---
+
+### TOOL-07 人工验收返修第 4 轮实施完成：三项缺陷已修（2026-10-23）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：基线 `6abcd25`（`automation/tool-07`）；本轮**尚未提交**（用户既定：不自动 commit / push / 合并）
+- 当前状态：**READY_FOR_REVIEW** —— 三项均已实现并通过自动化 + 浏览器验证；**未合并**、不启动后续模块
+- 更新时间：2026-10-23
+- 范围：**只处理用户点名的三项**；此前已通过的 diff / 权限 / 进程回收**未重做**
+
+#### 第 1 项：普通会话恢复正常聊天入口
+
+**根因（不是"回复写错了"，是配置链断了）**
+
+`MINI_DEERFLOW_MODEL_PROVIDER` 的**代码默认值是 fake**，而 `FakeModel.decide()`
+只按关键词返回固定文案。配置缺失时 `create_model()` 静默返回 FakeModel ——
+界面看起来"能聊天"，实际毫无对话能力。这正是人工验收截图里的固定回答。
+
+**三项核查的实际结论**
+
+| 核查点 | 结论 |
+|---|---|
+| 实际启动命令 | 验收环境在跑 `scripts/tool07_acceptance_server.py`（模型换成 `_AcceptanceModel`）；生产入口是 `uvicorn mini_deerflow.api.app:app`（`app.py` 的模块级 `app = create_app()`） |
+| 前端代理目标 | `vite.config.ts` 只读 `process.env.VITE_API_TARGET`（**不读 .env 文件**），`src/shared/api/config.ts` 读 `import.meta.env.VITE_API_BASE_URL` —— **两个不同的变量、两个不同的来源**；而 `SSE_BASE_URL === API_BASE_URL`，旧配置留空时 SSE 实际走 Vite 代理，与 `streamClient.ts` 注释「SSE 不走代理，避免缓冲」直接矛盾 |
+| 后端模型装配 | `create_app()` → `_default_runtime_factory()` → `load_model_settings()` → `create_model()`；`create_model()` 对未知 provider / 真实 provider 缺 Key **本来就 fail-closed**，漏的只是"**完全没配置**"这一档 |
+
+**处置**
+
+- 后端：`app.py::_require_configured_model_provider()` —— 正常模式**完全没配置** provider 时抛 `ModelConfigError`，启动失败并说明后果（"fake 只会重复固定回复"）。**显式**写 `=fake` 仍然合法（测试套件的 autouse fixture 与容器部署验收都这么写），因此不破坏既有 20 个测试文件与 `scripts/compose_persistence_check.py`。
+- 生产入口实测装配：`provider=minimax / MiniMax-M3 / https://api.minimaxi.com/anthropic / api_key 已配置` → `AnthropicCompatModel`（**构造不发网络请求**）。仓库 `.env` 本来就配好了，无需新增任何 provider 代码、**不自动调用付费 Provider**。
+- 验收脚本 `scripts/tool07_acceptance_server.py`：启动横幅首行即 **`!! 脚本模型，只用于流程验收 —— 不具备正常聊天能力 !!`**，并注明它"连续问不同问题只会得到同一段回答，这是入口用途不是缺陷"，同时指向生产入口。文档字符串同步说明。
+- 前端代理目标：`vite.config.ts` 改用 Vite 的 `loadEnv(mode, cwd, 'VITE_')` 读 `VITE_API_TARGET`，与 `config.ts` **同键同源**；`config.ts` 删掉一段死代码（`vitestEnv` 与 `viteEnv` 同值、永远不生效）。`.env.example` 改为 `VITE_API_TARGET` 并写清"必须给绝对地址"。
+
+**一处必须记录的取舍**：SSE 要不走代理（否则被缓冲、进度推不出来），前端就必须跨源直连后端，而跨源要后端开 CORS。验收后端已开；生产入口默认 `cors_origins=None`，因此 `.env.local` 注释里写明"切到 8000 时需在后端 `.env` 补 `MINI_DEERFLOW_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173`"。这是**显式化的部署要求**，不是静默行为。
+  （**更正**：本条上一版误写成 `CORS_ORIGINS=`。正确变量名带 `MINI_DEERFLOW_` 前缀，见 `src/mini_deerflow/api/config.py::_get_env`；`frontend/.env.local` 与 `frontend/.env.example` 已同步改正。）
+
+#### 第 2 项：取消后重试按每次运行重新初始化（`useAgentStream.ts`）
+
+三个根因全部修掉：
+
+1. `CONNECTING` 只在 `runId.then(...)` 里 dispatch（等响应头）→ 改为**点击发送立即 dispatch**，不等响应头。
+2. `CONNECTING` 不清 `events` / `terminalEvent` → 改为**每轮清空**事件、终态、累积文本、错误、requestId。
+3. 没有运行世代标记 → 新增 `runGenerationRef`：每次 `start()` 递增，所有 `onEvent` / `onTerminal` / `onError` / `runId.then` 先比对世代号，**迟到的上一轮回调一律丢弃**，不覆盖新一轮状态。
+
+`AgentChatPanel.tsx` 侧：`processedResultSeq` 在 `handleSend` 里**按运行归零** —— 每轮 run 的 sequence 都从 0/1 重新计数，游标不清零会让本轮 `run.result`（sequence=1）因"不大于上一轮游标 30"被整段跳过，文件和 diff 不更新。
+
+另：`RunStatusLine` 新增可选 `status`，在"已发起连接但还没有任何事件"的窗口如实显示 **「正在建立连接…」**（此前该窗口什么都不显示，用户无从判断是否已发出）。
+
+#### 第 3 项：「知道了」让提示确实能关闭（`AgentChatPanel.tsx`）
+
+- 新增独立状态 `dismissedCancelRunId`，**键取 runId**（绑定到产生它的那一次运行）。
+- 点击「知道了」→ `setDismissedCancelRunId(cancelNoticeKey)`，提示立即消失。
+- 关闭**只改可见性**：不动 `streamStatus` / `cancelState`（后端取消事实不变）、不触发重试、不取消其它任务。
+- 新一轮 run 拿到新 runId → 上一轮的关闭状态自然失效 → 新一轮被取消会**重新显示**自己的通知。
+- **没有**把任务状态强行改成"完成"来隐藏提示。
+
+#### 先补失败测试，再修复
+
+| 文件 | 先失败的用例（修复前） | 修复后 |
+|---|---|---|
+| `frontend/src/features/threads/useAgentStream.test.tsx` | 新增 6 条：立即 connecting、清空上一轮、旧连接迟到的事件 / 取消终态 / 错误均不得覆盖新运行、取消→重发→连接→本轮完成 | 25 passed |
+| `frontend/src/features/threads/AgentChatPanel.test.tsx` | 新增 5 条：第二轮小序号 `run.result` 必须被 ingest、点「知道了」提示消失、关闭不改后端取消事实且不自动重试、新一轮再取消显示自己的通知、关闭不影响其它提示 | 34 passed |
+| `tests/test_model_factory.py` | 新增 5 条：未配置 provider 时生产入口报错、报错点明后果、显式 fake 仍可用、显式真实 provider 正常启动、注入 runtime_factory 的入口不受影响 | 30 passed |
+| `frontend/src/shared/api/config.test.ts` | 改用 `VITE_API_TARGET` 注入（与 vite proxy 同键），并补「新旧键同时存在以新名为准」「绝对 base 时 SSE 直连」两条 | 11 passed |
+
+修复前实测失败：`useAgentStream` 6 failed / 19 passed；`AgentChatPanel` 5 failed / 26 passed；后端 2 failed / 28 passed。
+
+**两处既有断言因本轮修复而调整（已如实记录，不放宽）**
+
+- `useAgentStream.test.tsx`「初始状态为 idle」：原用例 `autoStart` 默认 true 且 `message='hi'`，本轮修复后它会**立刻**进入 connecting（这正是"不等待响应头"的要求）。改为 `autoStart: false` —— 它本来断言的就是"还没发消息时"的初始状态。
+- `useAgentStream.test.tsx`「取消→重发→连接→本轮完成」：终态后 `events` 含 `run.started` + `run.completed` 两条（原断言 1 条）。改为断言**事件类型序列**，比原来的长度断言更严（能区分"第一轮事件残留"）。
+
+#### 验证证据（本轮实际执行）
+
+| 范围 | 命令 | 结果 |
+|------|------|------|
+| 前端类型检查 | `npm run typecheck` | **exit 0**（三份配置全过） |
+| 前端全量单测 | `npx vitest run` | **42 files / 521 tests passed**（上一提交 506，**+15**） |
+| 前端 lint | `npx oxlint src` | exit 0，**0 error / 8 warning**（与上轮同数） |
+| 后端定向 | `pytest tests/test_model_factory.py tests/test_model_config.py tests/test_api_health.py tests/test_api_lifespan.py tests/test_api_errors.py tests/test_api_runs_stream.py tests/test_phase23_persistence.py -q` | **159 passed** |
+| 后端全量 | `pytest -q` | **22 failed / 3559 passed / 1 skipped / 42 subtests**（上一轮 3554 passed，**+5**；22 个失败名与基线 `57106b7` 一致，属既有 MCP / budget 基线失败，**非本轮引入**） |
+| 生产入口装配 | `PYTHONPATH=src python` 调 `_default_runtime_factory()` | `AnthropicCompatModel` / `MiniMax-M3` / `https://api.minimaxi.com/anthropic` / key 已配置（**构造零网络**） |
+| 浏览器 · 本轮新脚本 | `node e2e/tool07-retry-dismiss-check.mjs` | **exit 0，12/12 通过**：取消提示出现 → 点「知道了」消失 → **人为推迟响应头 8 秒**后重发，旧提示立即退出且显示「正在建立连接…」 → 重试完成显示 `hello.c` + 6 行 diff → 刷新后仍在 → 再次执行并取消，**新提示正常出现**且也能关掉 |
+| 浏览器 · 上轮脚本回归 | `node e2e/tool07-refresh-check.mjs` | **exit 0，5/5 通过**（F6 刷新保持未回归） |
+
+**浏览器脚本的新增**：`frontend/e2e/tool07-retry-dismiss-check.mjs` —— 用 `page.route` 只对**第一次** SSE 人为推迟 8 秒响应头，复现"故意延迟响应头"；任一断言失败即 `process.exit(1)`。
+
+#### 限制（如实记录）
+
+- **「旧连接迟到一个取消事件」没有浏览器证据**：浏览器里旧 fetch 被 `AbortController` 真正取消，构造不出这个竞态；该不变量由 `useAgentStream.test.tsx`「旧连接迟到的取消终态不得覆盖新运行状态」精确覆盖，浏览器只覆盖它**可观察到的后果**（新一轮开始后旧提示不复活、状态停在连接中）。脚本头部已写明这一分工。
+- 第 1 项的**真实付费 Provider 聊天没有执行**（按项目约束"不主动调用真实付费模型"）。已验证的是：生产入口装配出真实模型、缺配置时明确报错、验收脚本横幅明确标注脚本模型。要看到"正常模型给出相关回答"需要用户明确授权后自行发起一次真实对话。
+- 后端全量的 22 个失败是既有基线（MCP stdio 与 budget 相关），本轮**未触碰**这些模块；比基线多出的 5 个通过数即本轮新增的后端用例。
+- 未跑 Playwright `.spec.ts` 全套（只跑了两个 `.mjs` 验收脚本）；前端**未改** `e2e/*.spec.ts` 覆盖的逻辑。
+- 本轮**未提交、未推送、未合并**。
+
+#### 附带修掉的两个真实缺陷
+
+- `config.ts` 的 `vitestEnv` 是死代码（与 `viteEnv` 同值、永远不生效）。
+- `config.test.ts` 原先用**旧名** `VITE_API_BASE_URL` 注入，等于测的不是生产真正走的那条优先级链；改为与 vite proxy 同键的 `VITE_API_TARGET`，并新增"新旧键同时存在以新名为准"一条，把"代理与 SSE 必须指向同一个后端"钉成回归。
+
+#### 下一步
+
+- 等独立复审；**合并由用户决定**，复审通过前不宣告修复通过。
+
+
+---
+
+### TOOL-07 人工验收返修第 4 轮 · 复审前补充（第 5 轮记录，2026-10-23）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：基线 `6abcd25`（`automation/tool-07`）；本轮**仍未提交**（用户既定：不自动 commit / push / 合并）
+- 当前状态：**实现完成、作者自测完成，待独立复审和用户再次体验** —— **不记为验收通过**
+- 更新时间：2026-10-23
+- 范围：仍是那三项；**前几轮关闭项继续冻结**；合并待用户最终决定
+
+**用户本轮的三点处理（已照办）**
+
+| 要求 | 处置 |
+|---|---|
+| 两个测试项目先保留，用于复验取消、重试和刷新 | **保留**，未删除（本轮未做任何删除请求） |
+| 真实模型调用继续保持未验证，不追加付费调用 | **未追加任何付费调用**。装配成功 ≠ 真实聊天通过，两者在记录里分开写 |
+| 生产跨源配置需补连通证据（含预检），不调用模型、不全局放开 CORS | **已补**，见下「跨源连通证据」 |
+
+#### 跨源连通证据（新增脚本 `frontend/e2e/tool07-cors-check.mjs`）
+
+**为什么需要**：前端改用绝对地址后 SSE 与普通 API 都变成跨源直连，
+只在注释里写"记得配 CORS"不算证据。
+
+**两个夹具，全部从实际前端地址 `http://localhost:5173` 发起的浏览器请求**：
+
+| 夹具 | 是什么 | CORS 白名单 | 模型 |
+|---|---|---|---|
+| **A** | **生产入口** `uvicorn mini_deerflow.api.app:app`（真实 `create_app()` + 真实 `_add_cors` 中间件 + 生产默认 runtime factory） | `MINI_DEERFLOW_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173` —— **只放开实际前端地址，不是 `*`，不是全局放开** | 显式 `fake` → **不调用任何模型**，零额度、零外网 |
+| **B** | 前端当前实际指向的验收后端（8123） | 由 `scripts/tool07_acceptance_server.py` 放开 5173-5179 | 脚本模型 + harness 假 LLM（15s 延迟，Run 存活足够长以做真取消） |
+
+**实测结果（脚本 exit 0，全部通过）**：
+
+| 检查 | 结果 |
+|---|---|
+| 预检 OPTIONS · threads POST | 200，`ACAO=http://localhost:5173`，allow-methods `GET, POST, DELETE, OPTIONS`，allow-headers 含 `Content-Type` |
+| 预检 OPTIONS · SSE POST | 200，同上 |
+| 预检 OPTIONS · stop POST（强制带 `Content-Type`） | 200，同上 |
+| 预检 OPTIONS · files DELETE | 200，同上 |
+| 普通 API · GET /api/health | 200，body 可读，**实际响应带 ACAO** |
+| 普通 API · POST /api/threads | 201，body 可读，**实际响应带 ACAO** |
+| SSE · POST .../runs/stream | 200，事件流可读（`run.started` → `run.completed`），**`X-Run-ID` 响应头可读**（证明 `expose_headers` 生效） |
+| stop（夹具 A） | 404（该入口用 fake 模型，Run 瞬时结束，无活跃 Run），**响应可读 + 带 ACAO** → CORS 放行 |
+| stop（夹具 B，**有活跃 Run**） | **200**，响应体 `{"status":"stopped",...}` 可读 → 跨源成功取消 |
+
+**一个必须记下的技术事实**：`Access-Control-Allow-Origin` **永远不会**出现在
+JS 可见的 `response.headers` 里（浏览器只把 `Access-Control-Expose-Headers`
+列出的头暴露给 JS）。因此脚本分两层断言：
+- **浏览器层** = 跨源 fetch **没有被拦截**（resolve 而非 reject，body / `X-Run-ID` 可读）。被 CORS 拦截时 fetch 直接 reject。
+- **原始响应头层** = 用 CDP `Network.responseReceivedExtraInfo` 读浏览器收到的**原始**响应头（含 ACAO / allow-methods）。
+
+我第一版脚本曾把 ACAO 写成 JS 层断言，9 项全部失败 —— 那是**断言写错**（不是产品缺陷），已改正。
+
+**另一处纠正**：前端真实的 stop 请求是 **simple request**（只有
+`Accept: application/json`、没有 body → 浏览器不设 `Content-Type` → **不触发预检**）。
+脚本因此额外发一次「带 `Content-Type` 强制预检」的 stop，证明该路由在需要预检时同样放行。
+
+**仍未验证**：真实付费 Provider 的聊天（按用户指示保持未验证，不追加调用）。
+
+#### 22 项后端失败：逐项错误对比（不是只按名称认定）
+
+- 基线取 `6abcd25`（本轮改动的基线），用 `git worktree add --detach` 在**独立目录**跑同一套 pytest，
+  **不改动当前工作区、不切分支、不 stash**。
+- 基线工作树**不带 `.env`**（避免把凭据复制到临时目录）；`conftest.py` 的 autouse fixture
+  把 `MINI_DEERFLOW_MODEL_PROVIDER` 钉死为 `fake`，因此两次运行的 provider 一致，
+  `.env` 的有无不影响这 22 项的判定。
+- 两侧都用 `pytest -q --tb=line` 采集，逐条失败按「测试 ID + 断言行 + 错误消息」对齐比较。
+
+（逐项对比结果见下方「验证证据」表。）
+
+**顺带更正**：上一版记录里把 CORS 环境变量写成 `CORS_ORIGINS=`，**正确变量名是
+`MINI_DEERFLOW_CORS_ORIGINS`**（`src/mini_deerflow/api/config.py::_get_env` 会加
+`MINI_DEERFLOW_` 前缀）。`frontend/.env.local`、`frontend/.env.example` 与本记录均已改正。
+
+**下一节记录**：本轮验证证据汇总（含逐项失败对比结果）。
+
+---
+
+#### 本轮验证证据汇总（含 22 项逐项失败对比）
+
+**四次全量 pytest（`python -m pytest -q --tb=line`）**
+
+| 运行 | 代码与环境 | 结果 |
+|---|---|---|
+| **A** | 基线 `6abcd25`（独立 worktree，**无仓库 `.env`**） | 28 failed / 3548 passed / 1 skipped |
+| **B0** | 当前工作区（本轮首次全量） | 22 failed / 3559 passed / 1 skipped |
+| **B1** | 当前工作区（为做基线对比而复跑，代码与 B0 相同） | 23 failed / 3558 passed / 1 skipped |
+| **C** | 当前工作区，`--deselect tests/test_harness_runner_integration.py` | **22 failed** / 3545 passed / 1 skipped / 14 deselected |
+
+**A∩B1 = 22 项，逐项对比结果：断言位置与完整错误信息 22/22 完全一致。**
+另外 B1∩C 也是 **22/22 完全一致**，且 C 没有任何新增失败项。
+
+**对比方法（不是只按名称认定无回归；按复审意见对「配对」做了强制互校加固）**
+
+- 对齐键 = 「测试 ID + 断言位置（文件:行号）+ 完整错误信息」。
+- 完整错误信息取自 `--tb=line` 的 FAILURES 段标记行 `<绝对路径>.py:<行号>: <完整错误>`；
+  short test summary info 里的尾部是**截断**的（`mini_dee...`），**不能**作为对比依据。
+- 异常链续行（`During handling of the above exception...`）没有标记行，属噪声，已排除、不计入失败项。
+- **配对依据**：pytest 的 FAILURES 段与 short test summary 取的是**同一个有序列表**
+  `stats["failed"]`（按 report 到达顺序追加），所以「失败块 i ↔ FAILED 节点 i」在结构上成立；
+  但**数量相同并不保证配对正确**，因此配对之上强制加互校（下一条）。
+- **强制互校（任一条不通过即报错退出，不产出结论）**：
+  1. 标记行落在**测试文件**里 → 文件名必须与节点的测试文件一致；再用 `ast` 反查该行所属的
+     **测试函数**，必须与节点一致。任何一项不符 = 失败块被错配 → 退出。
+  2. 标记行落在**源码/标准库文件**里（`src/...`、`unittest/case.py`）→ 这是**合法的**
+     「错误位置在源码」情形，**不算错配**；但若该节点在 short summary 里有 reason
+     （pytest 用 `_format_trimmed` 对**同一条失败消息**做的截断前缀），
+     reason 必须是标记消息的前缀，否则 = 错配 → 退出。
+  3. 两侧「失败块数 == FAILED 节点数」不等 → 退出。
+- **与配对无关的检查**：比较两次运行的失败签名（文件:行号 + 完整错误）多重集 ——
+  当前出现、基线里没有的签名 = **新引入的失败**（必须为 0）；反向的差集 = 基线有、当前已通过。
+- **退出码承载结论（不再只是打印）**：`exit 0` 被严格限定为
+  「共有项逐条一致 **且** 当前没有任何基线里不存在的失败签名」；
+  任一条不满足 → 打印 `[FAIL]` 结论并 **exit 1**。
+  因此 `exit 0` 本身即可当作「失败集合完全一致」的证明，不必再人工读比较结果。
+- **如实标注的局限**：下表「关联方式」列逐行写明该项是靠哪种方式关联的。
+  其中「源码抛出点且 summary 无 reason」的一类**只能靠 pytest 的报告顺序关联**
+  （这类用例是 unittest 风格，断言位置落在标准库 `unittest/case.py`），
+  不假装它们经过逐字互校 —— 这一点在此明确记录，不掩盖。
+
+| # | 测试 | 基线断言位置 + 完整错误 | 当前断言位置 + 完整错误 | 关联方式 | 对比 |
+|---|---|---|---|---|---|
+| 1 | `tests/test_context_agent.py::test_summary_uses_separate_budget_from_decisions` | `test_context_agent.py:433` `assert 0 == 1` | `test_context_agent.py:433` `assert 0 == 1` | 测试文件+函数互校 | 一致 |
+| 2 | `tests/test_mcp.py::TestMCP集成::test_echo_add_调用` | `tools.py:254` `mini_deerflow.tools.ToolNotFoundError: 未知工具: mcp__test__echo` | `tools.py:254` `mini_deerflow.tools.ToolNotFoundError: 未知工具: mcp__test__echo` | 源码抛出点+reason 前缀互校 | 一致 |
+| 3 | `tests/test_mcp.py::TestMCP集成::test_optional_启动失败只记录并跳过` | `test_mcp.py:411` `AssertionError: assert () == ('good',)` | `test_mcp.py:411` `AssertionError: assert () == ('good',)` | 测试文件+函数互校 | 一致 |
+| 4 | `tests/test_mcp.py::TestMCP集成::test_shutdown_无残留子进程` | `test_mcp.py:423` `AssertionError: 应当确实拉起了子进程` | `test_mcp.py:423` `AssertionError: 应当确实拉起了子进程` | 测试文件+函数互校 | 一致 |
+| 5 | `tests/test_mcp.py::TestMCP集成::test_参数错误在发起前被拦截` | `tools.py:254` `mini_deerflow.tools.ToolNotFoundError: 未知工具: mcp__test__echo` | `tools.py:254` `mini_deerflow.tools.ToolNotFoundError: 未知工具: mcp__test__echo` | 源码抛出点+reason 前缀互校 | 一致 |
+| 6 | `tests/test_mcp.py::TestMCP集成::test_启动与工具发现` | `test_mcp.py:320` `assert 0 == 4` | `test_mcp.py:320` `assert 0 == 4` | 测试文件+函数互校 | 一致 |
+| 7 | `tests/test_mcp.py::TestMCP集成::test_工具失败_返回错误文本而非崩溃` | `tools.py:254` `mini_deerflow.tools.ToolNotFoundError: 未知工具: mcp__test__failing_tool` | `tools.py:254` `mini_deerflow.tools.ToolNotFoundError: 未知工具: mcp__test__failing_tool` | 源码抛出点+reason 前缀互校 | 一致 |
+| 8 | `tests/test_mcp.py::TestMCP集成::test_工具描述进入模型可见的_tool_specs` | `test_mcp.py:458` `assert 0 == 4` | `test_mcp.py:458` `assert 0 == 4` | 测试文件+函数互校 | 一致 |
+| 9 | `tests/test_mcp.py::TestMCP集成::test_调用超时` | `tools.py:254` `mini_deerflow.tools.ToolNotFoundError: 未知工具: mcp__test__wait` | `tools.py:254` `mini_deerflow.tools.ToolNotFoundError: 未知工具: mcp__test__wait` | 源码抛出点+reason 前缀互校 | 一致 |
+| 10 | `tests/test_mcp.py::TestRuntimeAgent调用链::test_agent_闭环可调用_mcp_工具` | `test_mcp.py:525` `assert False` | `test_mcp.py:525` `assert False` | 测试文件+函数互校 | 一致 |
+| 11 | `tests/test_mcp.py::TestRuntimeAgent调用链::test_runtime_启动时连接_关闭时清理` | `test_mcp.py:482` `AssertionError: assert 'mcp__test__echo' in {'calculator', 'history_read', 'history_search', 'task_note', 'web_read', 'web_search'}` | `test_mcp.py:482` `AssertionError: assert 'mcp__test__echo' in {'calculator', 'history_read', 'history_search', 'task_note', 'web_read', 'web_search'}` | 测试文件+函数互校 | 一致 |
+| 12 | `tests/test_mcp.py::TestSubagentAllowedTools::test_加入_mcp_工具后_policy_往返不变` | `test_mcp.py:591` `assert False` | `test_mcp.py:591` `assert False` | 测试文件+函数互校 | 一致 |
+| 13 | `tests/test_phase17_18_closing.py::TestBudgetAtomicConsume::test_budget_exceeded_does_not_trigger_retry` | `case.py:209` `AssertionError: BudgetExceededError not raised` | `case.py:209` `AssertionError: BudgetExceededError not raised` | 源码抛出点（summary 无 reason，仅顺序关联） | 一致 |
+| 14 | `tests/test_phase17_18_closing.py::TestBudgetAtomicConsume::test_model_keeps_failing_stops_at_model_limit` | `middleware.py:162` `RuntimeError: execute_with_retry 重试次数超过上限 1000` | `middleware.py:162` `RuntimeError: execute_with_retry 重试次数超过上限 1000` | 源码抛出点（summary 无 reason，仅顺序关联） | 一致 |
+| 15 | `tests/test_phase17_18_closing.py::TestBudgetAtomicConsume::test_tool_failure_still_consumes_tool_call` | `case.py:918` `AssertionError: 0 != 1` | `case.py:918` `AssertionError: 0 != 1` | 源码抛出点（summary 无 reason，仅顺序关联） | 一致 |
+| 16 | `tests/test_phase17_18_closing.py::TestMiddlewareInAgentRealPath::test_budget_exceeded_raises` | `case.py:209` `AssertionError: BudgetExceededError not raised` | `case.py:209` `AssertionError: BudgetExceededError not raised` | 源码抛出点（summary 无 reason，仅顺序关联） | 一致 |
+| 17 | `tests/test_phase17_18_closing.py::TestMiddlewareInAgentRealPath::test_retryable_model_failure_triggers_retry` | `case.py:918` `AssertionError: 0 != 2` | `case.py:918` `AssertionError: 0 != 2` | 源码抛出点（summary 无 reason，仅顺序关联） | 一致 |
+| 18 | `tests/test_phase21b_events.py::TestSSE事件::test_工具失败_发_tool_failed_且唯一终态为_run_failed` | `test_phase21b_events.py:207` `AssertionError: assert 'boom' in ['history_read', 'history_search', 'task_note', 'web_read', 'web_search']` | `test_phase21b_events.py:207` `AssertionError: assert 'boom' in ['history_read', 'history_search', 'task_note', 'web_read', 'web_search']` | 测试文件+函数互校 | 一致 |
+| 19 | `tests/test_subagent_allowed_tools.py::TestMCP工具限制::test_允许的_mcp_工具可以执行` | `test_subagent_allowed_tools.py:217` `AssertionError: assert 'ToolNotFoundError' is None` | `test_subagent_allowed_tools.py:217` `AssertionError: assert 'ToolNotFoundError' is None` | 测试文件+函数互校 | 一致 |
+| 20 | `tests/test_subagent_allowed_tools.py::TestMCP工具限制::test_白名单可同时放行本地与_mcp_工具` | `test_subagent_allowed_tools.py:247` `AssertionError: assert 'ToolNotFoundError' is None` | `test_subagent_allowed_tools.py:247` `AssertionError: assert 'ToolNotFoundError' is None` | 测试文件+函数互校 | 一致 |
+| 21 | `tests/test_subagent_allowed_tools.py::Test父子权限隔离::test_父_agent_不受子代理白名单影响` | `test_subagent_allowed_tools.py:339` `AssertionError: assert 'mcp__test__echo' in ['calculator', 'local_note']` | `test_subagent_allowed_tools.py:339` `AssertionError: assert 'mcp__test__echo' in ['calculator', 'local_note']` | 测试文件+函数互校 | 一致 |
+| 22 | `tests/test_tool_loop_21b.py::Test预算与步数::test_budget_耗尽时抛出` | `test_tool_loop_21b.py:478` `Failed: DID NOT RAISE <class 'mini_deerflow.middleware.BudgetExceededError'>` | `test_tool_loop_21b.py:478` `Failed: DID NOT RAISE <class 'mini_deerflow.middleware.BudgetExceededError'>` | 测试文件+函数互校 | 一致 |
+
+**共有 22 项，断言位置与完整错误信息逐条比对：22/22 完全一致。**
+
+**仅基线失败（当前已通过）——共 6 项，全部集中在 `tests/test_harness_runner_integration.py`：**
+
+| 测试 | 基线断言位置 + 完整错误 |
+|---|---|
+| `tests/test_harness_runner_integration.py::test_tool_calls_completed_字段正确` | `test_harness_runner_integration.py:567` `AssertionError: assert 'protocol_error' == 'completed'` |
+| `tests/test_harness_runner_integration.py::test_同一响应多个调用_全部计数` | `test_harness_runner_integration.py:679` `AssertionError: 同一响应多个调用应全部计数，期望 >= 1，实际 0` |
+| `tests/test_harness_runner_integration.py::test_正常完成_don_event_含_tool_calls` | `test_harness_runner_integration.py:343` `AssertionError: assert 'protocol_error' == 'completed'` |
+| `tests/test_harness_runner_integration.py::test_正常完成_exit_0` | `test_harness_runner_integration.py:331` `AssertionError: 期望 completed，实际 protocol_error: AuthenticationError: Error code: 401 - {'error': {'message': 'Invalid API Key', 'param': 'Please provide valid API Key', 'code': '401', 'type': 'invalid_key'}}` |
+| `tests/test_harness_runner_integration.py::test_正常调用_计数与seq跟随` | `test_harness_runner_integration.py:589` `AssertionError: assert 'protocol_error' == 'completed'` |
+| `tests/test_harness_runner_integration.py::test_非法参数_json解析失败也消耗计数` | `test_harness_runner_integration.py:702` `AssertionError: 非法参数也应计入 tool_calls，期望 >= 1，实际 0` |
+
+**仅当前失败（基线通过）——共 0 项：**
+
+| 测试 | 当前断言位置 + 完整错误 |
+|---|---|
+
+**与配对无关的检查**：两次运行的失败签名（文件:行号 + 完整错误）多重集 —— 基线 26 条唯一签名 / 28 项，当前 20 条唯一签名 / 22 项；仅基线有（当前已通过）6 条，仅当前有（**新引入**）0 条。
+
+#### 三处差异的成因（逐项查过代码与运行输出，不是推测）
+
+**1）仅基线失败的 6 项 —— 全在 `tests/test_harness_runner_integration.py`，与本轮改动无关**
+
+本轮 diff 不含 `harness_runner.py` / `project_tools.py` / 任何 harness 链路代码
+（`git diff --stat` 只有 12 个文件，见下节）。差异的真正来源是**基线 worktree 没有仓库根 `.env`**：
+
+- `tests/test_harness_runner_integration.py::_run_harness` 建 `HarnessRunner` 时**不传 `env_file`**，
+  而 `HarnessRunner.build_env()` 只在 `self._env_file` 存在时才 pop 真实凭证
+  —— 不传 `env_file` 时，子进程会继承父进程的 `MINIMAX_API_KEY`。
+- 该测试注入的是 `extra_env={"MIMO_BASE_URL": mock_url, "MIMO_API_KEY": "fake-key-for-test"}`，
+  但 harness 的 `load_config()` 读的是 **`HARNESS_MIMO_BASE_URL`**（不是 `MIMO_BASE_URL`），
+  并且**优先 `MINIMAX_API_KEY`**、其次才看 `MIMO_API_KEY`。
+- 于是：**基线（无 `.env`）** → 无 `MINIMAX_API_KEY` → 走 MIMO 分支 → base url 落回真实的
+  `https://api.xiaomimimo.com/v1`（mock 地址被忽略）→ 拿测试假 key 请求真实端点 → **401 Invalid API Key**
+  → 终态 `protocol_error` → 这 6 条断言失败。
+  **当前（有 `.env`）** → 父进程有 `MINIMAX_API_KEY` 与 `MINIMAX_OPENAI_BASE_URL=https://api.minimaxi.com/v1`
+  → 走 MiniMax 分支 → 真实端点 + 有效 key → 通过。
+
+**由此必须如实记录一件事**：在当前工作区跑全量套件时，这 6 个 harness 集成测试
+**向真实 MiniMax 端点发出了真实请求**（文件里的 mock server 实际从未被用到）。
+这是 `tests/test_harness_runner_integration.py` 的**既有测试隔离缺陷**
+（注入的变量名与 harness 读取的名字对不上，且没传 `env_file`），**不是本轮引入**，
+但它确实让本轮的全量运行产生了真实外网调用。
+**因此：这 6 项在当前工作区的「通过」不构成隔离回归证据** —— 它靠的是父进程的真实凭证
+加真实外网，而不是该文件里写的 mock server（mock server 实际从未被用到）。
+本轮**不做**付费聊天验证；
+该缺陷记入待办（修法：给 `HarnessRunner` 传 `env_file`，或把注入变量改成 `HARNESS_MIMO_BASE_URL`），
+**本轮未实现**（超出本轮范围）。
+为避免再次产生真实调用，本轮最后一次全量复跑（C）用 `--deselect` 排除了该文件。
+
+**2）仅当前失败的 1 项 —— `tests/test_tool07_demo_timeout.py::test_演示4b_真实子进程超时_隔离Provider`**
+
+该次运行的 captured stdout：
+
+```
+  [OK] 子进程环境已隔离：无真实凭证 + 指向独立测试 .env + 假 LLM
+  [OK] 真实 HarnessRunner 返回 ok=False（耗时 3.21s）
+  [OK] 真实终态为 timeout: 执行超时（3.0s），任务已被终止
+  [OK] 超时后子进程已被回收: pid=30032
+  [FAIL] 未观察到 harness 的 started 事件: []
+```
+
+隔离、超时、进程回收**都通过**，只有「没看到 harness 的 `started` 事件」这一条没过 ——
+即子进程在 3.0 秒被杀之前还没吐出第一条协议事件。
+`harness/noninteractive.py` 的 `started` 是在 `from harness.agent import agent_loop` **之后**才 emit 的，
+实测该导入约 **1.18s**，加上解释器启动，3.0s 预算只剩约 1 秒余量 → **是竞态，不是逻辑缺陷**。
+
+> **限制（如实记录，不掩盖）**：本轮**已观察到一次偶发失败**（4 次全量运行中的 1 次）。
+> 该用例**没有**被证明是稳定通过的 —— 只在单独跑（3/3）、6 路并发（6/6）、
+> 以及去掉 harness 集成文件的全量运行（C）里通过。
+> 复审时应把本项记为「**已观察到偶发失败**」，而不是「已修复且稳定」；
+> 真正的修法是给该演示放宽超时预算或减少子进程启动开销，本轮**未做**（超出本轮范围）。
+
+复现与证伪：
+
+| 场景 | 结果 |
+|---|---|
+| 单独跑该文件 | **3/3 通过** |
+| 6 路并发跑 | **6/6 通过** |
+| 全量套件去掉 harness 集成文件后（运行 C） | **通过**（C 的 22 项与 B1 的 22 项完全一致，无此项） |
+| 本轮首次全量（运行 B0） | 通过（当时就是 22 failed / 3559 passed） |
+
+即：只有「前面刚跑过 6 次真实 Provider 请求」的那一次全量运行里才出现一次偶发。
+它也**不在本轮改动的代码路径上**（本轮 diff 不含 harness / project_execute 相关文件）。
+
+**3）结论**
+
+- 22 项失败在多次运行中**稳定复现、逐条错误完全一致**，与基线无差异 → **本轮没有引入后端回归**。
+- 剩下的 7 项差异（6 项仅基线 + 1 项仅当前）都有明确的环境/时序成因，
+  且都不在本轮改动的代码路径上。
+
+#### 本轮验证证据一览
+
+| 验证项 | 命令 | 结果 |
+|---|---|---|
+| 前端单测 | `cd frontend && npx vitest run` | **42 文件 / 521 用例全通过** |
+| 前端类型 | `cd frontend && npm run typecheck` | **exit 0**（app / node / e2e 三个 config） |
+| 前端 lint | `cd frontend && npx oxlint src` | 0 error / 8 warning |
+| 后端定向回归 | `python -m pytest -q tests/test_model_factory.py tests/test_api_*.py` | **295 passed** |
+| 后端全量（基线 A / 当前 B1 / 当前 C） | 见上表 | 28 / 23 / 22 failed，**22 项逐条一致** |
+| 取消→重试→「知道了」 | `cd frontend && node e2e/tool07-retry-dismiss-check.mjs` | **exit 0，12/12 PASS** |
+| 刷新保持 | `cd frontend && node e2e/tool07-refresh-check.mjs` | **exit 0，5/5 PASS** |
+| 跨源连通（普通 API / SSE / stop / 预检） | `cd frontend && node e2e/tool07-cors-check.mjs` | **exit 0，全部 PASS** |
+
+**仍未验证**：真实付费 Provider 的聊天（按用户指示保持未验证，不追加调用）。
+
+**两个测试项目已按用户指示保留**（验收后端 8123 上，可直接复验取消/重试/刷新）：
+`83909b855238`（TOOL-07 取消重试验收）、`2fc029144125`（TOOL-07 刷新保持检查）。
+
+**本轮状态**：**复审返修完成（两项），作者自测完成，仍待独立复审和用户的再次体验**
+（**不是验收通过**；复审已明确「本次不能给出 code_review_passed」）。
+前几轮关闭项继续冻结；**本轮不提交、不推送、不合并**，合并待用户最终决定。
+
+---
+
+#### 复审返修记录（TOOL-07 复审包的两项返修；未提交、未推送、未合并）
+
+**返修项 1 —— CORS 验收脚本取用的会话 ID**
+
+复审意见：`frontend/e2e/tool07-cors-check.mjs` 夹具 B 取的是 `project_id`，
+「全部通过」的证据需要核对，并要求确认报告里实跑的脚本与附件是不是同一版本。
+
+**核对结果（事实）**：附件里的脚本与磁盘上的脚本**字节完全一致** ——
+`git hash-object frontend/e2e/tool07-cors-check.mjs` = `3fa85f8`，
+附件 diff 头也是 `index 0000000..3fa85f8`。夹具 B 取值本来就是
+`JSON.parse(thB.body).thread_id ?? ''`；复审引用的 `project_id ?? ''`
+是**紧邻其上的项目 ID 解析块**（`projId`，用作 `POST /api/threads` 的请求体字段），
+不是会话 ID。复审前那次实跑输出也印证：stream / stop 两个 URL 里都是线程 ID
+`133cc4fb5bf2`，stop 响应体为 `{"status":"stopped","thread_id":"133cc4fb5bf2"}`。
+若真把 `project_id` 拼进 `/runs/stream`，后端会返回 404 `未知线程: {id}`
+（`src/mini_deerflow/api/routes/runs_stream.py`），已实测确认。
+
+**但复审的实质关切成立**：只做「非空」检查，证明不了「拿到的确实是正确的会话 ID」。
+本轮据此**加固断言**（不加新功能，只加强证据）：
+- 使用的 ID **逐字等于**同一响应里的 `thread_id`，且**不等于**同一响应里的 `project_id`；
+- 断言 SSE 收到 `run.started`，且事件里的 `thread_id` 就是目标会话、
+  事件里的 `run_id` 与响应头 `X-Run-ID` 一致（证明收到的是**目标 Run** 的事件）；
+- 断言 stop 返回 200、响应体 `status == "stopped"`、且回显的 `thread_id` 就是目标会话。
+
+**重跑结果**（只重跑这一个**零付费模型**的脚本；夹具 A 显式 `MINI_DEERFLOW_MODEL_PROVIDER=fake`）：
+`cd frontend && node e2e/tool07-cors-check.mjs` → **exit 0，全部 PASS**。
+夹具 B 实测：`thread=c859ffb59bc8` / `project=901d1f7139bf`（两者不同）、
+`run.started 的 thread_id=c859ffb59bc8`、
+`run_id=run-b1051959e011` 与 `X-Run-ID` 一致、
+stop 返回 200 且响应体 `{"status":"stopped","thread_id":"c859ffb59bc8"}`。
+CDP 抓到 17 条原始响应，全部带 `ACAO=http://localhost:5173`；
+4 类预检（threads POST / SSE POST / stop POST / files DELETE）均 200 且放行 content-type。
+
+**返修项 2 —— 失败对比脚本的配对互校**
+
+复审意见：原 `compare_pytest.py::build()` 在文件名不一致时只打印提示，仍把错误信息配给当前测试 ID；
+用「测试节点来自 `expected_test.py`、错误标记来自 `wrong_test.py`」的最小探针验证，
+脚本仍然接受配对。
+
+**本轮修法**（见上文「对比方法」）：区分「错误位置合法地落在源码文件」与「失败块被错配」，
+配对之上加**强制互校**，互校不过就报错退出；另加一条**与配对无关的检查**
+（当前是否出现基线里不存在的失败签名）。新增自检探针脚本 `compare_pytest_selftest.py`。
+
+**退出码语义（按复审记录意见补强）**：原先多重集差异只打印、不据此失败退出，
+「脚本 exit 0」不能当作「失败完全一致」的证明。现已改为 ——
+`exit 0` 严格等价于「共有项逐条一致 **且** 当前无基线中不存在的失败签名」，
+否则打印 `[FAIL]` 结论并 **exit 1**。
+实测：A∩C → **exit 0**（22/22 一致、新引入 0 条）；
+A∩B1 → **exit 1**（新引入 1 条，即已记录的偶发超时用例）。
+
+**探针结果（6/6 通过）** —— 4 个必须报错的场景全部被拦下：
+「节点 expected_test.py / 标记 wrong_test.py」→ 文件名互校失败；
+「同文件但测试函数不符」→ 测试函数互校失败；
+「源码抛出点但 reason 前缀不符」→ reason 前缀互校失败；
+「块数与节点数不等」→ 数量不等，放弃对比。
+2 个必须放行的合法场景（测试文件+同函数、源码抛出点+reason 吻合）正常放行。
+
+**用已有日志重做对比**（**未再跑全量、未触发任何真实 Provider**）：
+
+| 对比 | 结果 |
+|---|---|
+| A∩C（基线 vs 当前「去 harness」运行） | 22 项逐条 **22/22 一致**；仅基线失败 6 项；**仅当前失败 0 项** |
+| A∩B1（基线 vs 当前全量） | 22 项逐条 **22/22 一致**；仅当前多 1 项 —— `test_tool07_demo_timeout.py::test_演示4b_真实子进程超时_隔离Provider`（上文已记录的**「已观察到偶发失败」**的时序竞态用例） |
+
+关联方式统计（基线 28 项）：「测试文件+函数互校」19 项、
+「源码抛出点 + reason 前缀互校」4 项、「源码抛出点且 summary 无 reason（仅顺序关联）」5 项。
+
+---
+
+#### 复审收尾项：stop 请求的迟到失败未隔离（TOOL-07 第 6 轮，2026-10-24）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：基线 `6abcd25`（`automation/tool-07`）；本轮**仍未提交、未推送、未合并**
+- 当前状态：**实现完成、作者自测完成，待独立复审** —— **不记为验收通过**
+- 更新时间：2026-10-24
+- 范围：**只收尾这一项**；配置、通知关闭与此前已通过项**保持冻结**；不重复跑全量
+
+**复审结论（本轮收到的独立复审）**
+
+完整补丁复审结果：原来的两个 UI 问题（重试残留取消提示、「知道了」无法关闭）已修好；
+但仍有一项阻断 —— **stop 请求的迟到失败没有隔离**。
+
+复审独立复现的两种情况（位置：`useAgentStream.ts` 的 `cancelRun()` 的 `catch`）：
+
+1. A 已取消、B 已开始；A 的 stop 请求随后失败，把 **B 的取消状态改成 `failed`**。
+2. 已收到 A 的 `run.cancelled`，随后 stop HTTP 请求失败，又把**已确认取消改成取消失败**。
+
+**根因**：运行世代检查（`runGenerationRef`）只保护了 SSE 回调
+（`onEvent` / `onTerminal` / `onError` / `runId.then`），
+**没有保护 `cancelRun()` 里那条独立的 HTTP 请求的 `catch`**。
+
+**修法（最小改动，只动 `cancelRun`）**
+
+- 发起 stop 时捕获本次运行世代（`const generation = runGenerationRef.current`）；
+  异步返回后**先核对世代号**，不一致直接返回 —— 旧运行不得修改新运行的状态**或守卫**
+  （`cancelRequestedRef` 这个「一次运行只发一次 stop」的守卫也不能被旧轮解除）。
+- 后端已用 `run.cancelled` 终态确认取消后，迟到的 HTTP 错误**不得覆盖该事实**：
+  `cancelStateRef.current === 'cancelled'` 时直接返回。
+- **正常分支保留**：当前任务尚未结束、取消确实失败时，仍然如实置 `failed` 并透出错误文案
+  （并解除守卫以允许重试）。由既有用例「取消失败（后端无正在运行的 Run）：如实报 failed」
+  与「取消失败后允许重试」覆盖 —— 本轮**没有**把它们关掉。
+
+**先补失败测试，再修复**
+
+新增 `useAgentStream.test.tsx` 的 `stop 请求的迟到失败必须被隔离` 三条用例。修复前实测：
+
+| 用例 | 修复前实测 |
+|---|---|
+| 旧运行的 stop 请求迟到失败，不得改写新运行的取消状态 | **FAIL** —— `expected 'failed' to be 'idle'` |
+| 已收到后端取消终态后，迟到的 stop 失败不得把已确认取消改成取消失败 | **FAIL** —— `expected 'failed' to be 'cancelled'` |
+| 旧运行的 stop 迟到失败，不得解除新运行的「只发一次」守卫 | **FAIL** —— `expected "vi.fn()" to be called 2 times, but got 3 times` |
+
+（修复前该文件 3 failed / 25 passed；修复后 **28 passed**。）
+
+**本轮验证证据（实际执行）**
+
+| 范围 | 命令 | 结果 |
+|---|---|---|
+| 定向单测 | `cd frontend && npx vitest run src/features/threads/useAgentStream.test.tsx` | 修复前 **3 failed / 25 passed** → 修复后 **28 passed** |
+| 相关回归（threads 全部） | `cd frontend && npx vitest run src/features/threads` | **18 文件 / 248 用例全通过** |
+| 前端类型 | `cd frontend && npm run typecheck` | **exit 0**（app / node / e2e 三个 config） |
+| 前端 lint | `cd frontend && npx oxlint src` | exit 0，**0 error / 8 warning**（与上轮同数，均为既有文件） |
+| 浏览器真实链路 | `cd frontend && node e2e/tool07-retry-dismiss-check.mjs` | **exit 0，12/12 PASS**（取消 → 「知道了」→ 延迟响应头重发 → 重试完成 → 刷新保留 → 再次取消并关闭） |
+
+**本轮未做（如实记录）**
+
+- **未跑全量**：后端全量不跑（用户本轮明确「不重复跑全量」），前端全量也未跑
+  （只跑了改动直接相关的 `src/features/threads` 18 个文件）。
+  因此本轮**没有**新的「后端 22 项逐条一致」证据 —— 后端代码本轮**一行未改**。
+- **未向旧 PR SHA 回写通过状态**；不提交、不推送、不合并。
+- 真实付费 Provider 聊天仍**未验证**，本轮未追加任何付费调用。
+
+**本轮状态**：**实现完成、作者自测完成，待独立复审和用户的再次体验**（**不是验收通过**）。
+前几轮关闭项继续冻结；合并待用户最终决定。
+
+---
+
+#### TOOL-07 第 6 轮收尾：复审通过 + 浏览器体验确认（2026-10-25）
+
+- 任务 ID：TOOL-07
+- 会话标识：claude-worker-20261020-2015
+- 目标版本：基线 `6abcd25`（`automation/tool-07`）；本轮**仍未提交、未推送、未合并**
+- 当前状态：**独立复审已通过**（本轮增量）—— **仍不是验收通过**
+- 更新时间：2026-10-25
+- 范围：只做「迟到 stop 失败」这一项的收尾与体验确认；不补测试、不跑全量
+
+**复审结论（复审方在隔离副本中独立验证）**
+
+- 「迟到 stop 失败」这项最小增量 **复审通过，可以关闭**。
+- 复审方独立验证：修复前三个探针全部失败、修复后全部通过；**相关检查合计 90 项通过**；
+  三份 TypeScript 配置检查通过；「当前运行取消失败时，错误展示与允许重试」的正常分支仍通过。
+- 复审方**明确说明**验证范围是「已审附件 ＋ 本次贴出的增量」，
+  **没有直接读取最终工作树**，也**未验证真实模型聊天或重新运行浏览器**。
+
+**浏览器体验确认（作者实跑，2026-10-25）**
+
+复审方要求的最后一步：再次体验「取消 → 知道了 → 重试 → 完成」，确认界面正常。
+
+`cd frontend && node e2e/tool07-retry-dismiss-check.mjs` → **exit 0，12/12 PASS**
+（验收后端 8123，脚本模型，零付费调用）：
+
+| 环节 | 结果 |
+|---|---|
+| 发送后立刻出现运行状态行 | PASS |
+| 后端确认取消后显示「已取消当前任务」 | PASS |
+| 点击「知道了」后当前提示消失 | PASS |
+| 重新发送后立即退出旧的「已取消」提示（人为推迟响应头 8 秒） | PASS |
+| 延迟响应头期间显示新任务「正在建立连接」 | PASS |
+| 重试完成后变化页签显示 hello.c | PASS |
+| 重试完成后 diff 正文已渲染（6 行） | PASS |
+| 刷新后变化页签仍显示 hello.c | PASS |
+| 刷新后 diff 正文仍渲染（6 行） | PASS |
+| 新一轮开始时没有残留的旧提示 | PASS |
+| 再次执行并取消：新的取消提示正常出现 | PASS |
+| 新提示的「知道了」同样能关闭 | PASS |
+
+本次产生的验收会话：`9decf8d8c332`（验收后端 8123 上，可直接人工复验）。
+此前保留的两个会话仍在：`83909b855238`（取消重试验收）、`2fc029144125`（刷新保持检查）。
+
+**本轮未做（如实记录）**
+
+- **未补测试、未跑全量**（复审方明确「不必继续补测试或跑全量」）。
+  因此本轮**没有**新的「后端 22 项逐条一致」证据 —— 后端代码本轮一行未改。
+- **真实付费 Provider 聊天仍未验证**：装配成功 ≠ 真实聊天通过，两者在记录里仍分开写。
+  要看「正常模型给出相关回答」需要用户明确授权后自行发起一次真实对话。
+- **不向旧 PR SHA 回写新的通过结论**（复审方明确要求）。
+- 本轮**不提交、不推送、不合并** —— 由用户最终决定。
+
+**当前状态**：三项产品修复的**代码侧**已完成并通过独立复审（含本轮增量）；
+**仍不是验收通过** —— 真实模型聊天未验证，提交 / 推送 / 合并待用户最终决定。
