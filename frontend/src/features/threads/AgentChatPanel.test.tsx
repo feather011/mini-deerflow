@@ -2,7 +2,7 @@
  * AgentChatPanel 组件测试（20D + UX-1 状态分离）
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import { userEvent } from '@testing-library/user-event'
 import { AgentChatPanel } from './AgentChatPanel'
 import { TaskInspector } from '../inspector/TaskInspector'
@@ -536,5 +536,180 @@ describe('AgentChatPanel 冷挂载恢复已保存结果', () => {
 
     expect(realTaskAdapter.getTask('t-restore')?.files[0]?.path).toBe('hello.c')
     expect(realTaskAdapter.getTask('t-other')?.files[0]?.path).toBe('other.c')
+  })
+})
+
+/**
+ * 人工验收返修 · 第 2 项：`processedResultSeq` 必须**按运行**重置。
+ *
+ * 复现的缺陷：第一轮 run.result 的 sequence 已经走到 30；第二轮后端重新
+ * 从 1 计数，`event.sequence > processedResultSeq.current` 恒为 false →
+ * 本轮结果被整段跳过，文件和 diff 都不更新。
+ */
+describe('AgentChatPanel 每轮重置 run.result 的处理序号', () => {
+  const thread: ThreadDetail = {
+    thread_id: 't-seq',
+    messages: [{ role: 'user', content: '第一轮' }],
+  }
+
+  const payload = (file: string) =>
+    JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: file,
+            status: 'added',
+            unified_diff: `--- /dev/null\n+++ b/${file}\n@@ -0,0 +1,1 @@\n+int ${file.length};`,
+          },
+        ],
+      },
+    })
+
+  const resultEvent = (sequence: number, file: string) => ({
+    run_id: 'run-x',
+    thread_id: 't-seq',
+    event_type: 'run.result' as const,
+    sequence,
+    timestamp: 1000,
+    answer: null,
+    error: null,
+    attempt: null,
+    operation: null,
+    tool_name: 'project_execute',
+    duration_seconds: null,
+    tool_result: payload(file),
+  })
+
+  beforeEach(() => {
+    clearRealTaskData()
+  })
+
+  afterEach(() => {
+    clearRealTaskData()
+  })
+
+  it('第二轮的 run.result 序号更小也必须被 ingest（不能因上一轮序号大而漏掉）', async () => {
+    const user = userEvent.setup()
+    const { rerender } = render(<AgentChatPanel thread={thread} />)
+
+    // 第一轮：sequence 已经走到 30
+    mockUseAgentStream.mockReturnValue({
+      ...mockUseAgentStream(),
+      status: 'streaming' as const,
+      runId: 'run-1',
+      events: [resultEvent(30, 'first.c')],
+    } as unknown as ReturnType<typeof mockUseAgentStream>)
+    rerender(<AgentChatPanel thread={thread} />)
+    expect(realTaskAdapter.getTask('t-seq')?.files.map((f) => f.path)).toEqual(['first.c'])
+
+    // 用户真实点击发送，开启第二轮
+    await user.type(screen.getByRole('textbox'), '再来一次')
+    await user.click(screen.getByRole('button', { name: '发送消息' }))
+
+    // 第二轮：后端 sequence 从 1 重新计数
+    mockUseAgentStream.mockReturnValue({
+      ...mockUseAgentStream(),
+      status: 'streaming' as const,
+      runId: 'run-2',
+      events: [resultEvent(1, 'second.c')],
+    } as unknown as ReturnType<typeof mockUseAgentStream>)
+    rerender(<AgentChatPanel thread={thread} />)
+
+    expect(realTaskAdapter.getTask('t-seq')?.files.map((f) => f.path)).toEqual(['second.c'])
+  })
+})
+
+/**
+ * 人工验收返修 · 第 3 项：「知道了」必须真的能把取消提示关掉。
+ *
+ * 复现的缺陷：`isCancelled` 是由 streamStatus / cancelState 派生的，
+ * `onDismiss` 只动提交状态与草稿，没有任何「已关闭」标记 → 点完按钮，
+ * 提示下一帧原样重新渲染。
+ */
+describe('AgentChatPanel 取消提示可关闭', () => {
+  const cancelledStream = (runId: string) =>
+    ({
+      ...mockUseAgentStream(),
+      status: 'cancelled' as const,
+      cancelState: 'cancelled' as const,
+      runId,
+    }) as unknown as ReturnType<typeof mockUseAgentStream>
+
+  const thread: ThreadDetail = { thread_id: 't1', messages: [] }
+
+  beforeEach(() => {
+    mockUseAgentStream.mockReturnValue(cancelledStream('run-a'))
+  })
+
+  it('后端确认取消时显示提示', () => {
+    render(<AgentChatPanel thread={thread} />)
+    expect(screen.getByText('已取消当前任务')).toBeInTheDocument()
+  })
+
+  it('点击「知道了」后当前提示消失', async () => {
+    const user = userEvent.setup()
+    render(<AgentChatPanel thread={thread} />)
+    expect(screen.getByText('已取消当前任务')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '知道了' }))
+
+    expect(screen.queryByText('已取消当前任务')).toBeNull()
+  })
+
+  it('关闭提示不改变后端取消事实（不谎称已完成，也不自动重试）', async () => {
+    const user = userEvent.setup()
+    const startMock = vi.fn()
+    mockUseAgentStream.mockReturnValue({
+      ...cancelledStream('run-a'),
+      start: startMock,
+    })
+    const { rerender } = render(<AgentChatPanel thread={thread} />)
+
+    await user.click(screen.getByRole('button', { name: '知道了' }))
+    expect(screen.queryByText('已取消当前任务')).toBeNull()
+
+    // 重新渲染时状态仍是 cancelled —— 提示不得自己复活
+    rerender(<AgentChatPanel thread={thread} />)
+    expect(screen.queryByText('已取消当前任务')).toBeNull()
+
+    // 没有被改成"完成"，也没有触发任何新的发送
+    expect(screen.queryByText('Agent 执行完成')).toBeNull()
+    expect(startMock).not.toHaveBeenCalled()
+  })
+
+  it('新一轮再次被取消时，显示它自己的通知', async () => {
+    const user = userEvent.setup()
+    const { rerender } = render(<AgentChatPanel thread={thread} />)
+
+    await user.click(screen.getByRole('button', { name: '知道了' }))
+    expect(screen.queryByText('已取消当前任务')).toBeNull()
+
+    // 第二次运行也以取消收场
+    mockUseAgentStream.mockReturnValue(cancelledStream('run-b'))
+    rerender(<AgentChatPanel thread={thread} />)
+
+    expect(screen.getByText('已取消当前任务')).toBeInTheDocument()
+  })
+
+  it('「知道了」只关当前运行的提示，不影响其它提示（取消失败提示仍在）', async () => {
+    const user = userEvent.setup()
+    mockUseAgentStream.mockReturnValue({
+      ...cancelledStream('run-a'),
+      cancelState: 'failed' as const,
+      cancelError: '后端没有正在运行的 Run（可能已结束）',
+    })
+    render(<AgentChatPanel thread={thread} />)
+
+    expect(screen.getByText('已取消当前任务')).toBeInTheDocument()
+    expect(screen.getByText('取消失败')).toBeInTheDocument()
+
+    await user.click(
+      within(screen.getByLabelText('已取消提示')).getByRole('button', { name: '知道了' }),
+    )
+
+    expect(screen.queryByText('已取消当前任务')).toBeNull()
+    expect(screen.getByText('取消失败')).toBeInTheDocument()
   })
 })

@@ -57,6 +57,11 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
   // 已处理的 run.result 事件序列号（防重复 ingest）
   const processedResultSeq = useRef<number>(0)
 
+  // 取消提示的「已关闭」标记，绑定到产生它的那一次运行。
+  // 键取 runId：新一轮 run 会拿到新的 runId，上一轮的关闭状态自然失效，
+  // 于是新一轮被取消时会重新显示它自己的通知。
+  const [dismissedCancelRunId, setDismissedCancelRunId] = useState<string | null>(null)
+
   // 消息提交状态
   const [submitStatus, setSubmitStatus] = useState<UserSubmitStatus>('idle')
 
@@ -203,6 +208,11 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
       createdAt: Date.now(),
     })
 
+    // 每轮 run 的 sequence 都从 0/1 重新计数，处理游标必须一起归零。
+    // 否则上一轮已经处理到 sequence=30，本轮的 run.result（sequence=1）
+    // 会因为「不大于游标」被整段跳过，文件和 diff 都不更新。
+    processedResultSeq.current = 0
+
     // 保存草稿快照（发送前），编辑区继续接受新草稿
     savePendingSent(message)
     start(message)
@@ -223,6 +233,12 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
   const canStop = isRunning && cancelState !== 'cancelling' && cancelState !== 'cancelled'
   const isStopping = cancelState === 'cancelling'
   const isCancelled = streamStatus === 'cancelled' || cancelState === 'cancelled'
+
+  // 取消提示是否要显示：只有「用户还没关掉这一轮的提示」时才显示。
+  // 关闭只改这一行的可见性，不改 streamStatus / cancelState，
+  // 因此后端的取消事实、任务历史都不受影响，也不会触发重试。
+  const cancelNoticeKey = runId ?? 'unknown-run'
+  const showCancelNotice = isCancelled && dismissedCancelRunId !== cancelNoticeKey
 
   /** 点击"停止"：请求后端取消当前任务（不是仅断流） */
   function handleStop() {
@@ -313,7 +329,7 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
         )}
 
         {/* 已取消：后端确认取消（子进程已回收、锁已释放） */}
-        {isCancelled && (
+        {showCancelNotice && (
           <ErrorNotice
             error={{ status: 0, code: 'RUN_CANCELLED', message: '' }}
             context="generic"
@@ -322,6 +338,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
             description="后端已取消该 Run 并回收执行进程，项目锁已释放。"
             dismissLabel="知道了"
             onDismiss={() => {
+              // 只隐藏本轮提示：不动 streamStatus / cancelState，
+              // 不重试、不取消其它任务；新一轮被取消会重新显示。
+              setDismissedCancelRunId(cancelNoticeKey)
               setSubmitStatus('submitted')
               setOptimisticMsg(null)
               clearPendingSent()
@@ -350,7 +369,7 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
         )}
 
         {/* 轻量运行状态：依据真实 SSE 事件显示"当前在做什么"（明细在「查看任务 → 过程」） */}
-        {isRunning && <RunStatusLine events={events} />}
+        {isRunning && <RunStatusLine events={events} status={streamStatus} />}
 
         {/* 消息输入 */}
         <MessageComposer

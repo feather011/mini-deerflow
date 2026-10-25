@@ -71,7 +71,7 @@ export interface StreamState {
 
 /** 流 Action */
 type StreamAction =
-  | { type: 'CONNECTING'; runId: string }
+  | { type: 'CONNECTING'; runId: string | null }
   | { type: 'EVENT'; event: RunEvent }
   | { type: 'TOKEN_CHUNK'; delta: string }
   | { type: 'TERMINAL'; event: RunEvent }
@@ -87,14 +87,18 @@ const MAX_EVENTS = 1000
 
 function streamReducer(state: StreamState, action: StreamAction): StreamState {
   switch (action.type) {
+    // 每一轮 run 都从干净状态开始：上一轮的事件、终态、错误与累积文本
+    // 一律不得留给本轮。否则「已取消 → 再次发送」时界面会一直停在
+    // 上一轮的终态上，直到后端响应头回来才切换。
     case 'CONNECTING':
       return {
         ...state,
         status: 'connecting',
         runId: action.runId,
+        events: [],
+        terminalEvent: null,
         errorMessage: null,
         requestId: null,
-        // 25C: 新 run 开始时重置累加文本
         currentText: '',
       }
 
@@ -200,6 +204,10 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
   // 本 hook 是否持有"正在运行的 run"（用 ref 而不是 reducer 状态：
   // reducer 的 connecting 要等 runId promise 兑现才更新，不适合做门禁）
   const runActiveRef = useRef(false)
+  // 运行世代：每次 start() 递增一次。
+  // 旧连接 abort 之后仍可能有已排队的回调抵达（事件、终态、错误），
+  // 这些回调携带的是**上一轮**世代号，必须被丢弃，不能覆盖新一轮状态。
+  const runGenerationRef = useRef(0)
 
   const applyCancelState = useCallback((next: CancelState) => {
     cancelStateRef.current = next
@@ -237,8 +245,18 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
     applyCancelState('idle')
     if (mountedRef.current) setCancelError(null)
 
+    // 本次运行的世代号。此后所有回调都先比对世代号，
+    // 迟到的上一轮回调一律丢弃。
+    const generation = runGenerationRef.current + 1
+    runGenerationRef.current = generation
+
+    // 立刻进入 connecting：不等后端响应头。
+    // 等响应头会让「取消 → 重新发送」在网络慢时长时间停在上一轮终态上。
+    dispatch({ type: 'CONNECTING', runId: null })
+
     const { runId, cancel } = connectAgentStream(threadId, effectiveMessage, {
       onEvent: (event) => {
+        if (runGenerationRef.current !== generation) return
         // 25C: model.token 事件分发到 TOKEN_CHUNK（累加到 currentText）
         if (event.event_type === 'model.token' && event.delta) {
           dispatch({ type: 'TOKEN_CHUNK', delta: event.delta })
@@ -247,6 +265,7 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
         }
       },
       onTerminal: (event) => {
+        if (runGenerationRef.current !== generation) return
         dispatch({ type: 'TERMINAL', event })
         runActiveRef.current = false
         if (event.event_type === 'run.cancelled') {
@@ -263,6 +282,7 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
         void queryClient.invalidateQueries({ queryKey: threadKeys.detail(threadId) })
       },
       onError: (error: StreamError) => {
+        if (runGenerationRef.current !== generation) return
         dispatch({
           type: 'ERROR',
           message: error.message,
@@ -271,8 +291,9 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
       },
     })
 
-    // 监听 runId 解析
+    // 响应头到达：补上 runId（世代号已变则忽略）
     runId.then((id) => {
+      if (runGenerationRef.current !== generation) return
       dispatch({ type: 'CONNECTING', runId: id })
     })
 
@@ -302,10 +323,24 @@ export function useAgentStream({ threadId, message, autoStart = true }: UseAgent
     cancelRequestedRef.current = true
     applyCancelState('cancelling')
     if (mountedRef.current) setCancelError(null)
+
+    // 记录本次取消所属的运行世代。stop 是一条独立的 HTTP 请求，
+    // 它返回时当前运行可能已经换过一轮 —— 与 SSE 回调一样，
+    // 迟到的一轮的结果不得改写新运行的状态与守卫。
+    const generation = runGenerationRef.current
+
     try {
       await stopAgentRun(threadId)
       // 后端已受理取消：保持 'cancelling'，等 run.cancelled 终态
     } catch (err) {
+      // 世代已变：这是上一轮迟到的失败。新一轮的取消状态与
+      // 「一次运行只发一次 stop」的守卫一律不动。
+      if (runGenerationRef.current !== generation) return
+
+      // 后端已经用 run.cancelled 终态确认了取消：迟到的 HTTP 失败
+      // 不得把这个既成事实改写成「取消失败」。
+      if (cancelStateRef.current === 'cancelled') return
+
       cancelRequestedRef.current = false
       const status = err instanceof ApiError ? err.status : 0
       const message =
