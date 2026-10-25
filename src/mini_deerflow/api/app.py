@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -46,7 +47,8 @@ from mini_deerflow.api.schemas.errors import (
     safe_message,
 )
 from mini_deerflow.mcp_config import load_mcp_config
-from mini_deerflow.model_config import load_model_settings
+from mini_deerflow.model_config import PROVIDER_VAR, load_model_settings
+from mini_deerflow.model_errors import ModelConfigError
 from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_config
 from mini_deerflow.thread_store import InMemoryThreadStore, SQLiteThreadStore
 from mini_deerflow.project_store import InMemoryProjectStore, SQLiteProjectStore
@@ -111,9 +113,44 @@ def build_web_host_policy(settings: ApiSettings) -> WebHostPolicy:
     )
 
 
+def _require_configured_model_provider() -> None:
+    """正常模式必须显式配置模型 provider，否则明确报错。
+
+    `MINI_DEERFLOW_MODEL_PROVIDER` 的**代码默认值是 fake**，而 FakeModel
+    只会重复固定文案。配置缺失时若放行，界面看起来"能聊天"，实际上
+    完全不具备正常对话能力 —— 这正是人工验收时看到的现象。
+    这里宁可启动失败，也不让正常模式悄悄退回固定回复。
+
+    拦的是**完全没配置**，不是 `provider=fake`：测试套件
+    （`tests/conftest.py` 的 autouse fixture）与容器部署验收
+    （`scripts/compose_persistence_check.py`）都**显式**写 fake，
+    那是它们有意的选择，必须继续可用。
+
+    本模块顶部的 `load_dotenv(...)` 已在 import 时把 `.env` 并入
+    `os.environ`，因此查 `os.environ` 同时覆盖「系统环境变量」与「`.env`」
+    两层，优先级也与 `load_model_settings()` 一致（环境变量 > .env）。
+    """
+    if (os.environ.get(PROVIDER_VAR) or "").strip():
+        return
+
+    raise ModelConfigError(
+        f"正常模式未配置 {PROVIDER_VAR}。\n"
+        "该变量的默认值是 fake，而 fake 只会重复固定回复，不具备正常聊天能力；"
+        "因此这里明确报错，而不是悄悄退回固定回复。\n"
+        "请配置真实 provider 之一：\n"
+        f"  {PROVIDER_VAR}=minimax 并设置 MINIMAX_API_KEY\n"
+        f"  {PROVIDER_VAR}=mimo    并设置 MIMO_API_KEY\n"
+        "若只想跑流程验收，请用测试入口 scripts/tool07_acceptance_server.py"
+        "（脚本模型，只用于流程验收）。"
+    )
+
+
 def _default_runtime_factory(
     settings: ApiSettings | None = None,
 ) -> "RuntimeContext":
+    # 先校验再装配：配置缺失时要立刻失败，不能先建出一堆资源再报错。
+    _require_configured_model_provider()
+
     # 与 CLI 一致注入默认工具（create_default_registry）。
     # 裸 ToolRegistry() 是空表，会导致任何 ToolCall 都以 ToolNotFoundError 失败。
     #

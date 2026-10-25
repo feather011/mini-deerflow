@@ -1,5 +1,9 @@
 """TOOL-07 用户验收环境（人工体验用）。
 
+**这是一个测试入口，不是正常聊天入口。** 它把生产模型换成了脚本化的
+`_AcceptanceModel`（见下方警告横幅），因此只能验证"流程"，不能验证对话质量。
+正常聊天请用生产入口 `uvicorn mini_deerflow.api.app:app`。
+
 目的：让验收人能在浏览器里真实体验四件事 —— **派发 / 进度 / 停止 / 结果**，
 并且 **全程不调用任何付费模型、不外网**。
 
@@ -23,7 +27,8 @@
 脚本会打印：后端地址、前端地址、要绑定的仓库路径、以及建议体验的 4 个动作。
 
 注意：这是**验收辅助脚本**，不属于生产入口，也不进运行时依赖；
-它的存在只是让"人工体验"不依赖付费模型。
+它的存在只是让"人工体验"不依赖付费模型。生产入口没有配置模型 provider 时
+会**明确报错**（`ModelConfigError`），不会退回这里的固定回复。
 """
 
 from __future__ import annotations
@@ -255,6 +260,11 @@ def main() -> int:
     import uvicorn
 
     _banner("TOOL-07 验收环境")
+    print("!! 脚本模型，只用于流程验收 —— 不具备正常聊天能力 !!")
+    print("   本入口用 _AcceptanceModel 替换了生产模型：它只按关键词返回固定文案，")
+    print("   连续问不同的问题也只会得到同一段回答。这**不是**缺陷，是这个入口的用途。")
+    print("   正常聊天请用生产入口：uvicorn mini_deerflow.api.app:app --port 8000")
+    print("")
     print(f"后端 API      : http://{args.host}:{args.port}")
     print(f"前端（另开终端）: cd frontend && npm run dev   → http://localhost:5173")
     print(f"要绑定的仓库  : {scratch}")
