@@ -3805,3 +3805,86 @@ A∩B1 → **exit 1**（新引入 1 条，即已记录的偶发超时用例）�
 
 **本轮状态**：代码已提交并推送，复审依据与浏览器结果已写入 PR #6；
 **仍不是验收通过**（真实模型聊天未验证），合并待用户最终决定。
+---
+
+#### FE-01：聊天消息 Markdown 渲染与排版优化（2026-10-29）
+
+- 任务 ID：FE-01-MARKDOWN
+- 会话标识：claude-worker-20261010-2015
+- 目标版本：基线 `9fa5216`（分支 `automation/tool-07`）
+- 当前状态：**代码已改、组件测试与浏览器 E2E 均通过、用户视觉验收通过；未推送**
+- 更新时间：2026-10-29
+- 范围：**只改前端**（`frontend/`）；不动后端、模型提示词、SSE 协议、消息存储、
+  去重逻辑与取消状态机
+
+**根因**
+
+`frontend/src/features/threads/MessageList.tsx` 的正文渲染是
+`message.content.split('
+').map(...)` + `<span>/<br/>` —— 纯文本。assistant 回复里的
+`#`、`**`、围栏代码块、表格全部以原始字符显示，模型的结构化输出没法看。
+
+**改动**
+
+| 文件 | 改动 |
+|---|---|
+| `frontend/src/features/threads/MarkdownMessage.tsx`（新增） | `react-markdown` + `remark-gfm` 统一渲染组件；`pre` 覆盖为「语言标签 + 复制按钮 + 可横向滚动代码区」；`table` 覆盖为横向滚动容器 |
+| `frontend/src/features/threads/MarkdownMessage.module.css`（新增） | 正文 72ch 行宽、行距 1.75、段落/标题间距、引用/表格/代码块样式；只用现有全局 CSS 变量 |
+| `frontend/src/features/threads/MessageList.tsx` | assistant 走 Markdown 渲染；user/tool/system 保留原文；流式、最终、历史共用同一组件 |
+| `frontend/src/features/threads/MessageList.module.css` | assistant 正文不再 `pre-wrap`（换行交给 Markdown 自己控制） |
+| `frontend/package.json` / `package-lock.json` | 新增 `react-markdown@10.1.0`、`remark-gfm@4.0.1` |
+| `frontend/src/features/threads/MarkdownMessage.test.tsx`（新增） | 7 条行为用例 |
+| `frontend/e2e/markdown.spec.ts`（新增） | Playwright 本地夹具验收 |
+
+**依赖选择**
+
+`react-markdown` + `remark-gfm`（不自行编写 Markdown 解析器）。安全默认值：
+**未启用** `rehype-raw` —— react-markdown v10 默认 `allowDangerousHtml: true`，
+其 `post()` 会把 `raw` 节点降级为 text，原始 HTML 因此按**纯文本**输出而不执行；
+URL 走默认 `defaultUrlTransform`，`javascript:` 等协议被清空；全程不使用
+`dangerouslySetInnerHTML`。未引入语法高亮/公式/Mermaid/代码运行/自动折叠。
+
+锁文件：直接依赖版本**零变更**（react 19.3.0 / vite 8.3.1 / vitest 5.0.2 /
+typescript 6.0.3 等逐个核对与 HEAD 一致）；其余变化是此前就缺失的
+`concurrently` / `cross-env` / `wait-on` / `@playwright/test` 条目补齐 +
+传递依赖去重。
+
+**验证证据**
+
+| 项 | 结果 |
+|---|---|
+| `npm test`（组件） | **43 文件 / 531 passed**（基线 524，本轮新增 7 条） |
+| `npm run typecheck` | **exit 0**（app / node / e2e 三个 tsconfig 全过） |
+| `npm run lint` | 与基线**完全一致**（仅既有 8 条告警，无新增） |
+| `npx playwright test e2e/markdown.spec.ts` | **5 passed**（桌面 / 刷新后历史 / 窄屏 / 流式 / 流式到完成） |
+| 浏览器断言 | 表格与长代码在**自身容器内**横向滚动；`documentElement.scrollWidth` 与 `.workspace-main` 的 `scrollWidth` 均未超出 `clientWidth`（桌面 1280×800 与窄屏 375×667） |
+| **用户视觉验收** | **通过**（2026-10-29）：用户在真实入口（后端 `127.0.0.1:8000` / provider=minimax，前端 `localhost:5173`）确认排版、复制、刷新恢复、窄屏滚动与危险链接处理均符合预期 |
+
+E2E 全部用 `page.route` 本地夹具（注入 `/api/threads/{id}` 与 SSE 事件流），
+**未调用任何真实 Provider**。
+
+**行为用例覆盖**（`MarkdownMessage.test.tsx`，均经真实入口 `MessageList` 渲染）
+
+1. assistant 消息含标题/列表/引用/表格/链接/代码块时正确展示
+2. 同样内容作为 user 消息时保留原文（不产生 `h1`/`ul`/`table`/`pre`）
+3. 分段追加 Markdown 后最终正文完整
+4. 流式中代码围栏未闭合时不报错、不丢内容
+5. 复制写入的是**原始代码**（不含语言标记、不含末尾换行），成功/失败都有反馈
+6. 原始 HTML 不被执行（`<script>`/`<img onerror>` 均不生成元素）
+7. 危险链接 `javascript:` 的 `href` 被清空，不成为可执行链接
+
+**明确未做**
+
+- 未改后端 / 模型提示词 / SSE 协议 / 取消状态机 / 消息存储与去重逻辑
+- 未顺手重构无关组件：`AgentChatPanel.tsx` 未改（它已把流式、最终、历史都汇到
+  `MessageList`，天然共用同一渲染组件）
+- 未做语法高亮、公式、Mermaid、代码运行按钮、自动折叠
+- 未跑后端全量测试（纯前端改动）
+- **未 commit / 未 push / 未 merge**（用户本轮明确要求）
+
+**已知限制**
+
+- 流式期间每来一个 token 都会重新解析整段 Markdown（`react-markdown` 同步渲染，
+  未做增量解析）。长回复在流式阶段有重复解析开销，首版未优化。
+- 复制按钮依赖 `navigator.clipboard`：非安全上下文下不可用，此时按钮如实显示
+  「复制失败」，不谎称已复制。
