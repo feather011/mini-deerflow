@@ -21,7 +21,7 @@ import { BackendStatusBar } from '../features/status'
 import { ThreadSidebar, ThreadWorkspace, useThread } from '../features/threads'
 import { FilePanel } from '../features/files'
 import { ProjectSidebar, ProjectDetail, ProjectFilePanel, useProjects } from '../features/projects'
-import { TaskInspector } from '../features/inspector'
+import { TaskInspector, realTaskAdapter } from '../features/inspector'
 import { ArtifactsDialog } from '../features/artifacts'
 import { SettingsDialog } from '../features/settings'
 import '../styles.css'
@@ -87,6 +87,11 @@ function WorkspacePage() {
   const title = useTopTitle(threadId ?? null)
   const projectId = useCurrentProjectId()
 
+  // 右侧辅助面板的数据来源：真实 harness 结果（realTaskAdapter）。
+  // 顶栏的「模拟数据」标识按**数据来源**决定，不与面板开合挂钩 ——
+  // 真实子进程产出的文件与 diff 不是模拟数据。
+  const auxDataSource = realTaskAdapter.dataSource
+
   return (
     <div className="workspace">
       {/* 顶部：顶栏 + 后端状态 */}
@@ -97,7 +102,7 @@ function WorkspacePage() {
           onOpenNav={() => setNavOpen(true)}
           onTogglePanel={() => setPanelOpen((v) => !v)}
           panelOpen={panelOpen}
-          showDemoTag={panelOpen}
+          showDemoTag={auxDataSource === 'mock'}
         />
         <BackendStatusBar />
       </div>
@@ -167,6 +172,7 @@ function WorkspacePage() {
             open
             onClose={() => setPanelOpen(false)}
             threadId={threadId ?? null}
+            adapter={realTaskAdapter}
           />
         ) : projectId ? (
           // 项目会话：显示项目工作区文件浏览

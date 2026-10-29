@@ -4,7 +4,7 @@
  * 覆盖：
  * - open=false 不渲染内容；× 按钮触发 onClose
  * - 头部：状态 pill 语义色、run 归属副标题、底部固定说明
- * - 六个任务状态 / 五个验证状态的文案与语义色映射
+ * - 七个任务状态 / 五个验证状态的文案与语义色映射
  * - 页签切换（变化/验证/过程，role=tablist + aria-selected）
  * - diff 渲染：add/remove/context 三色行 + 新旧行号
  * - 文件列表切换：点击文件显示对应 diff
@@ -22,7 +22,11 @@ import {
   TASK_STATUS_META,
   VALIDATION_STATUS_META,
   TaskInspector,
+  clearRealTaskData,
+  ingestProjectExecuteResult,
+  ingestRealTaskData,
   mockTaskAdapter,
+  realTaskAdapter,
 } from './index'
 
 function renderInspector(threadId: string | null) {
@@ -37,6 +41,49 @@ function renderInspector(threadId: string | null) {
   )
   return { ...view, onClose }
 }
+
+// ---- 无 Run：产品口径「暂无运行」，不得显示「运行中」----
+
+describe('TaskInspector 无 Run 状态', () => {
+  it('生产数据源下没有任何 Run 时，pill 显示「暂无运行」且页面无「运行中」', () => {
+    clearRealTaskData()
+    ingestRealTaskData('thread-no-run', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: '还没有派发过任务的会话',
+    })
+    try {
+      render(
+        <TaskInspector open onClose={vi.fn()} threadId="thread-no-run" />,
+      )
+      const pill = screen.getByTestId('task-status-pill')
+      expect(pill).toHaveTextContent('暂无运行')
+      expect(pill).toHaveAttribute('data-tone', 'neutral')
+      expect(screen.queryByText('运行中')).toBeNull()
+    } finally {
+      clearRealTaskData()
+    }
+  })
+
+  it('Run 正在跑时才显示「运行中」', () => {
+    clearRealTaskData()
+    ingestRealTaskData('thread-running', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-xyz',
+      title: '正在跑的会话',
+    })
+    try {
+      render(
+        <TaskInspector open onClose={vi.fn()} threadId="thread-running" />,
+      )
+      expect(screen.getByTestId('task-status-pill')).toHaveTextContent('运行中')
+    } finally {
+      clearRealTaskData()
+    }
+  })
+})
 
 // ---- open / 关闭 ----
 
@@ -95,8 +142,9 @@ describe('TaskInspector 头部与底部', () => {
     expect(footerText).toContain('不自动提交或推送')
   })
 
-  it('六个任务状态的文案与语义色映射齐全', () => {
+  it('七个任务状态的文案与语义色映射齐全', () => {
     expect(TASK_STATUS_META).toEqual({
+      no_run: { label: '暂无运行', tone: 'neutral' },
       running: { label: '运行中', tone: 'warning' },
       completed: { label: '已完成', tone: 'success' },
       failed: { label: '失败', tone: 'danger' },
@@ -340,5 +388,99 @@ describe('TaskInspector thread 隔离', () => {
     expect(screen.getByRole('tab', { name: '验证' })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByTestId('validation-pill')).toHaveTextContent('通过')
     expect(screen.queryByText(/discount\.py/)).toBeNull()
+  })
+})
+
+/**
+ * F1 消费链回归：两段 hunk 的 diff 经适配器到**展示**都必须正确。
+ *
+ * 审查复现：真实子进程改 30 行文件的第 2、25 行 → 后端产出两个合法 hunk；
+ * 旧解析器把第二个块头 `@@ -22,7 +22,7 @@` 当成正文行，
+ * CHANGED_AT_25 的行号显示成 10（实际应为 25）。
+ */
+describe('TaskInspector 多段 hunk 展示', () => {
+  const TWO_HUNK_DIFF = [
+    '--- a/demo.txt',
+    '+++ b/demo.txt',
+    '@@ -1,5 +1,5 @@',
+    ' line1',
+    '-line2',
+    '+CHANGED_AT_2',
+    ' line3',
+    ' line4',
+    ' line5',
+    '@@ -22,7 +22,7 @@',
+    ' line22',
+    ' line23',
+    ' line24',
+    '-line25',
+    '+CHANGED_AT_25',
+    ' line26',
+    ' line27',
+    ' line28',
+  ].join('\n')
+
+  const renderTwoHunk = () => {
+    clearRealTaskData()
+    ingestRealTaskData('thread-two-hunk', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-two-hunk',
+      title: '两段 hunk',
+    })
+    ingestProjectExecuteResult(
+      'thread-two-hunk',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: {
+          files: [{ path: 'demo.txt', status: 'modified', unified_diff: TWO_HUNK_DIFF }],
+        },
+      }),
+    )
+    return render(
+      <TaskInspector
+        open
+        onClose={vi.fn()}
+        threadId="thread-two-hunk"
+        adapter={realTaskAdapter}
+      />,
+    )
+  }
+
+  it('展示里没有块头伪正文（没有以 @@ 开头的行）', () => {
+    renderTwoHunk()
+    const rows = Array.from(document.querySelectorAll('[data-line-type]'))
+    expect(rows.length).toBeGreaterThan(0)
+    const texts = rows.map((r) => (r.lastElementChild?.textContent ?? '').trim())
+    expect(texts.some((t) => t.startsWith('@@'))).toBe(false)
+  })
+
+  it('第二处修改的行号显示为 25（不是接着上一段累加的 10）', () => {
+    renderTwoHunk()
+    const rows = Array.from(document.querySelectorAll('[data-line-type]'))
+    const row25 = rows.find(
+      (r) => (r.lastElementChild?.textContent ?? '').trim() === '+CHANGED_AT_25',
+    )
+    expect(row25).toBeTruthy()
+    // 行结构：旧行号、新行号、正文
+    const spans = row25!.querySelectorAll('span')
+    expect(spans[0]?.textContent).toBe('')
+    expect(spans[1]?.textContent).toBe('25')
+  })
+
+  it('第一处修改的行号显示为 2', () => {
+    renderTwoHunk()
+    const rows = Array.from(document.querySelectorAll('[data-line-type]'))
+    const row2 = rows.find(
+      (r) => (r.lastElementChild?.textContent ?? '').trim() === '+CHANGED_AT_2',
+    )
+    const spans = row2!.querySelectorAll('span')
+    expect(spans[1]?.textContent).toBe('2')
+  })
+
+  it('文件计数覆盖两段改动（+2 −2）', () => {
+    renderTwoHunk()
+    expect(screen.getByText('+2 −2')).toBeInTheDocument()
   })
 })
