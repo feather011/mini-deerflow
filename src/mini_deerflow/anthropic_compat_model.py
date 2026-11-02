@@ -29,13 +29,6 @@
 - 推送 `model.token` 事件（含增量文本 delta），由 RunEventMiddleware 透传到 Broker
 - `decide()` 保持不变（向后兼容）
 
-BACKEND-01-A 变更（system 协议修复）：
-- `role="system"` 的消息走 Anthropic 协议的**顶层 `system` 字段**，不再放进
-  `messages` 数组（协议要求 system 不在 messages 里）
-- 过去适配器把 system 当"不支持的角色"直接抛错 —— 结果是：只要线程里有
-  摘要 / 任务笔记 / 记忆 / Skill 上下文，请求在**发送前**就失败，那些
-  上下文**从来没有真的发给过模型**
-
 不做的事：
 - 不在日志、repr、异常消息中输出 API Key
 - 不在模块 import 期创建客户端或发起网络请求（客户端在 __init__ 创建，
@@ -58,7 +51,15 @@ from mini_deerflow.model_errors import (
     ModelServerError,
     ModelTimeoutError,
 )
-from mini_deerflow.models import FinalAnswer, Message, Model, ToolCall, ToolSpec
+from mini_deerflow.models import (
+    Decision,
+    FinalAnswer,
+    Message,
+    Model,
+    ToolCall,
+    ToolCalls,
+    ToolSpec,
+)
 
 # 与 mimo_smoke_test 保持一致的单轮回答上限
 DEFAULT_MAX_TOKENS = 1024
@@ -74,24 +75,13 @@ _PROVIDER_ROLES: dict[str, str] = {
 }
 
 
-def _paired_tool_indices(messages: list[Message]) -> set[int]:
-    """找出可还原为 tool_result 的 tool 消息下标。
-
-    判定条件：本条是 tool 且带 call_id，且**紧邻的上一条**是携带相同 call_id
-    的 assistant。两者缺一都不成对——供应商要求 tool_result 必须紧跟它的 tool_use。
-    """
-    paired: set[int] = set()
-    for index in range(1, len(messages)):
-        current = messages[index]
-        previous = messages[index - 1]
-        if (
-            current.role == "tool"
-            and current.tool_call_id
-            and previous.role == "assistant"
-            and previous.tool_call_id == current.tool_call_id
-        ):
-            paired.add(index)
-    return paired
+def _is_tool_use_assistant(message: Message) -> bool:
+    """这条 assistant 消息是不是一次 tool_use（而非普通文本回答）。"""
+    return (
+        message.role == "assistant"
+        and bool(message.tool_call_id)
+        and message.tool_name is not None
+    )
 
 
 def extract_system_prompt(messages: list[Message]) -> str | None:
@@ -116,13 +106,20 @@ def provider_messages_from(messages: list[Message]) -> list[dict[str, Any]]:
     `system=` 字段**，不在 `messages` 数组里，由 `extract_system_prompt`
     单独取出。
 
-    三种形态：
-    1. 携带 `tool_call_id` + `tool_name` 的 assistant
-       → `[{"type":"tool_use","id","name","input"}]`
-    2. 与上一条 assistant 成对的 tool
-       → `user` + `[{"type":"tool_result","tool_use_id","content"}]`
-    3. 其余（含历史里的孤立 tool 结果）
+    四种形态：
+    1. **一组连续的** tool_use assistant（每个带 `tool_call_id` + `tool_name`）
+       → **一个** assistant turn，内容是 N 个 tool_use 块
+    2. 与本组配对的 tool 结果（连续的 tool 消息，call_id 属于本组）
+       → **一个** user turn，内容是 N 个 tool_result 块
+    3. 孤立的 tool 结果（历史遗留、只落库没落 tool_use）
        → 普通文本消息
+    4. 其余 → 普通文本消息
+
+    为什么 1/2 要成组：供应商协议要求「一个 assistant turn 里的每个
+    tool_use，都要在**紧随其后**的 user turn 里有一个对应的 tool_result」。
+    一次响应给出 N 个 tool_use 时，就必须在**同一个** assistant turn
+    里放 N 个块、**同一个** user turn 里放 N 个结果；拆成 N 组会被判定为
+    「assistant turn 的 tool_use 没有对应结果」而拒收该轮请求。
 
     Raises:
         ModelError: 消息为空，或出现不支持的角色。
@@ -130,41 +127,61 @@ def provider_messages_from(messages: list[Message]) -> list[dict[str, Any]]:
     if not messages:
         raise ModelError("消息列表为空，无法调用模型")
 
-    paired = _paired_tool_indices(messages)
     converted: list[dict[str, Any]] = []
+    index = 0
+    total = len(messages)
 
-    for index, message in enumerate(messages):
-        # 1) 还原 tool_use（只带文本的 assistant 走普通分支）
-        if (
-            message.role == "assistant"
-            and message.tool_call_id
-            and message.tool_name is not None
-        ):
+    while index < total:
+        message = messages[index]
+
+        # 1) 一组连续的 tool_use assistant → 一个 assistant turn
+        if _is_tool_use_assistant(message):
+            group: list[Message] = []
+            while index < total and _is_tool_use_assistant(messages[index]):
+                group.append(messages[index])
+                index += 1
+
+            call_ids = {g.tool_call_id for g in group}
+
+            # 2) 紧随本组的 tool 结果 → 一个 user turn
+            results: list[Message] = []
+            while (
+                index < total
+                and messages[index].role == "tool"
+                and messages[index].tool_call_id in call_ids
+            ):
+                results.append(messages[index])
+                index += 1
+
             converted.append({
                 "role": "assistant",
-                "content": [{
-                    "type": "tool_use",
-                    "id": message.tool_call_id,
-                    "name": message.tool_name,
-                    "input": dict(message.tool_arguments or {}),
-                }],
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": g.tool_call_id,
+                        "name": g.tool_name,
+                        "input": dict(g.tool_arguments or {}),
+                    }
+                    for g in group
+                ],
             })
-            continue
-
-        # 2) 还原 tool_result（必须紧邻配对的 assistant）
-        if message.role == "tool" and index in paired:
-            converted.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": message.tool_call_id,
-                    "content": message.content,
-                }],
-            })
+            if results:
+                converted.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": r.tool_call_id,
+                            "content": r.content,
+                        }
+                        for r in results
+                    ],
+                })
             continue
 
         # 3) system 消息：跳过，由 extract_system_prompt 单独放进顶层字段
         if message.role == "system":
+            index += 1
             continue
 
         # 4) 普通文本消息（含孤立的历史 tool 结果）
@@ -172,6 +189,7 @@ def provider_messages_from(messages: list[Message]) -> list[dict[str, Any]]:
         if role is None:
             raise ModelError(f"不支持的消息角色: {message.role!r}")
         converted.append({"role": role, "content": message.content})
+        index += 1
 
     return converted
 
@@ -259,7 +277,7 @@ class AnthropicCompatModel:
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
-    ) -> ToolCall | FinalAnswer:
+    ) -> Decision:
         """请求模型给出决定；可能返回 FinalAnswer，也可能返回 ToolCall。
 
         Args:
@@ -267,7 +285,7 @@ class AnthropicCompatModel:
             tools: 当前允许调用的工具描述；None 表示本轮不提供工具。
 
         Returns:
-            FinalAnswer 或单个 ToolCall（带 provider 的 call_id）。
+            FinalAnswer，或单/多工具调用（带 provider 的 call_id）。
 
         Raises:
             ModelTimeoutError / ModelAuthError / ModelRateLimitError /
@@ -334,28 +352,29 @@ class AnthropicCompatModel:
         cls,
         response: Any,
         tools: list[ToolSpec] | None = None,
-    ) -> ToolCall | FinalAnswer:
+    ) -> Decision:
         """把供应商响应块解析为领域决策。
 
-        有 tool_use 就走工具分支（且只允许一个）；否则要求至少有一段可读文本。
+        有 tool_use 就走工具分支；**一次多个 tool_use 也支持**
+        （一次响应多个调用 → `ToolCalls`，Agent 会按顺序全部执行）。
         """
         blocks = getattr(response, "content", None) or []
         tool_use_blocks = [
             block for block in blocks if getattr(block, "type", None) == "tool_use"
         ]
 
-        if len(tool_use_blocks) > 1:
-            # 关键：不静默取第一个。丢掉的 tool_use 对模型来说是"已发出的调用"，
-            # 静默忽略会让模型以为工具执行了却拿不到结果。
-            raise ModelProtocolError(
-                f"模型一次返回了 {len(tool_use_blocks)} 个 tool_use；"
-                "当前只支持串行单工具调用，拒绝执行以免静默丢弃"
-            )
-
         if tool_use_blocks:
-            tool_call = cls._tool_call_from_block(tool_use_blocks[0])
-            cls._validate_arguments(tool_call, tools)
-            return tool_call
+            calls = tuple(
+                cls._tool_call_from_block(block) for block in tool_use_blocks
+            )
+            for tool_call in calls:
+                cls._validate_arguments(tool_call, tools)
+            if len(calls) == 1:
+                return calls[0]
+            # 一次响应多个调用：**不静默取第一个**（丢掉的 tool_use 对模型来说是
+            # "已发出的调用"，静默忽略会让模型以为工具执行了却拿不到结果）。
+            # 全部保留下来，由 Agent 逐个执行。
+            return ToolCalls(calls=calls)
 
         return FinalAnswer(content=cls._extract_text(response))
 
@@ -430,7 +449,7 @@ class AnthropicCompatModel:
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
-    ) -> Iterator[tuple[str, str | FinalAnswer | ToolCall]]:
+    ) -> Iterator[tuple[str, str | Decision]]:
         """流式 decide：逐 token 推送 SSE 事件 Ye。
 
         Args:
@@ -440,7 +459,7 @@ class AnthropicCompatModel:
         Yields:
             ("token", text) — 增量文本 token（用于前端逐字渲染）
             ("stop", stop_reason_str) — 流结束标记
-            ("decision", FinalAnswer | ToolCall) — 最终决策结果（最后 yield）
+            ("decision", Decision) — 最终决策结果（最后 yield）
 
         Raises:
             同 decide() 的异常。

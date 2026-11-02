@@ -20,7 +20,15 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from typing import TYPE_CHECKING, Callable
 
 from mini_deerflow.agent import Agent
-from mini_deerflow.models import FakeModel, FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.models import (
+    Decision,
+    FakeModel,
+    FinalAnswer,
+    Message,
+    Model,
+    ToolCall,
+    ToolCalls,
+)
 from mini_deerflow.tool_contracts import ExecutorPrincipal
 
 if TYPE_CHECKING:
@@ -262,7 +270,7 @@ class _CancellableModel:
         self._token = token
         self._budget = budget
 
-    def decide(self, messages: list[Message], tools=None) -> ToolCall | FinalAnswer:
+    def decide(self, messages: list[Message], tools=None) -> Decision:
         if self._token.is_cancelled():
             raise _CancelledError()
         # 在真正发起 model 调用前原子消费额度
@@ -402,62 +410,74 @@ class _BudgetAwareAgent:
                 self._store.save(thread)
                 return decision.content
 
-            if isinstance(decision, ToolCall):
-                # 工具调用前原子消费额度（成功/失败都计入）
-                try:
-                    self._budget.consume_tool_call()
-                except BudgetExceededError as e:
-                    raise _BudgetExhaustedError(str(e)) from e
+            if isinstance(decision, (ToolCall, ToolCalls)):
+                # 模型可能在**一次响应**里发起多个工具调用（ToolCalls）。
+                # 全部执行、全部回灌 —— 绝不静默丢弃其中任何一个。
+                # 执行是**串行**的：后一个工具要看到前一个的结果。
+                calls: tuple[ToolCall, ...] = (
+                    decision.calls if isinstance(decision, ToolCalls) else (decision,)
+                )
 
                 # 21B：与主 Agent 一致——先落 tool_use（带 call_id），
                 # 再落紧邻的 tool 结果，供下一轮 decide() 按 call_id 配对还原。
                 # 落库的 tool 消息不带 id，持久化形状与 21B 之前一致。
-                working_messages.append(Message(
-                    role="assistant",
-                    content=f"调用工具 {decision.name}，参数: {decision.arguments}",
-                    tool_call_id=decision.id,
-                    tool_name=decision.name,
-                    tool_arguments=dict(decision.arguments),
-                ))
+                # 一次响应多个调用时这 N 条 assistant 消息必须**连续**（重建时合成
+                # 同一个 assistant turn），N 条 tool 结果同样必须连续。
+                for call in calls:
+                    working_messages.append(Message(
+                        role="assistant",
+                        content=f"调用工具 {call.name}，参数: {call.arguments}",
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        tool_arguments=dict(call.arguments),
+                    ))
 
-                # 纵深防御第二层（执行限制）：模型可能凭上下文里的名字
-                # "凭记忆"伪造一个未授权工具（暴露限制挡不住这种情况），
-                # 所以执行前必须再校验一次，越权直接抛 ToolNotAllowedError。
-                ensure_tool_allowed(decision.name, self._allowed)
+                # 串行执行：后一个工具要看到前一个的结果
+                for call in calls:
+                    # 工具调用前原子消费额度（成功/失败都计入）
+                    try:
+                        self._budget.consume_tool_call()
+                    except BudgetExceededError as e:
+                        raise _BudgetExhaustedError(str(e)) from e
 
-                # TOOL-02 第三层：细粒度授权（MINI_SUBAGENT principal + 继承能力）
-                if self._tool_policy_registry is not None:
-                    from mini_deerflow.tool_authorization import check_tool_access
-                    authority = self._tool_policy_registry.get_authority(
+                    # 纵深防御第二层（执行限制）：模型可能凭上下文里的名字
+                    # "凭记忆"伪造一个未授权工具（暴露限制挡不住这种情况），
+                    # 所以执行前必须再校验一次，越权直接抛 ToolNotAllowedError。
+                    ensure_tool_allowed(call.name, self._allowed)
+
+                    # TOOL-02 第三层：细粒度授权（MINI_SUBAGENT principal + 继承能力）
+                    if self._tool_policy_registry is not None:
+                        from mini_deerflow.tool_authorization import check_tool_access
+                        authority = self._tool_policy_registry.get_authority(
+                            thread_id=thread_id,
+                            run_id=self._run_id,
+                            project_id=self._parent_project_id,
+                            granted_capabilities=self._parent_granted_capabilities,  # 子代理由父授权决定
+                            principal=ExecutorPrincipal.MINI_SUBAGENT,
+                        )
+                        auth_decision = check_tool_access(
+                            self._tool_policy_registry, call.name, authority
+                        )
+                        if auth_decision.is_denied or auth_decision.is_confirm:
+                            from mini_deerflow.tool_authorization import ToolAuthorizationError
+                            raise ToolAuthorizationError(auth_decision)
+
+                    # TOOL-02：构造执行上下文，包含父授权能力（供 subagent_submit handler 提取并传递）
+                    from mini_deerflow.middleware import ExecutionContext
+                    tool_ctx = ExecutionContext(
                         thread_id=thread_id,
                         run_id=self._run_id,
-                        project_id=self._parent_project_id,
-                        granted_capabilities=self._parent_granted_capabilities,  # 子代理由父授权决定
-                        principal=ExecutorPrincipal.MINI_SUBAGENT,
+                        granted_capabilities=self._parent_granted_capabilities,
+                        cancellation_token=self._token,
+                        budget=self._budget,
                     )
-                    auth_decision = check_tool_access(
-                        self._tool_policy_registry, decision.name, authority
+                    result = self._registry.execute(call.name, call.arguments, context=tool_ctx)
+                    # 与主 Agent 一致：工具往返只留在 working_messages（本轮喂模型），
+                    # **不写入 pending**——Thread 只提交 user 与最终 assistant，
+                    # 避免落库一条没有配对 tool_use 的孤儿 tool_result。
+                    working_messages.append(
+                        Message(role="tool", content=result, tool_call_id=call.id)
                     )
-                    if auth_decision.is_denied or auth_decision.is_confirm:
-                        from mini_deerflow.tool_authorization import ToolAuthorizationError
-                        raise ToolAuthorizationError(auth_decision)
-
-                # TOOL-02：构造执行上下文，包含父授权能力（供 subagent_submit handler 提取并传递）
-                from mini_deerflow.middleware import ExecutionContext
-                tool_ctx = ExecutionContext(
-                    thread_id=thread_id,
-                    run_id=self._run_id,
-                    granted_capabilities=self._parent_granted_capabilities,
-                    cancellation_token=self._token,
-                    budget=self._budget,
-                )
-                result = self._registry.execute(decision.name, decision.arguments, context=tool_ctx)
-                # 与主 Agent 一致：工具往返只留在 working_messages（本轮喂模型），
-                # **不写入 pending**——Thread 只提交 user 与最终 assistant，
-                # 避免落库一条没有配对 tool_use 的孤儿 tool_result。
-                working_messages.append(
-                    Message(role="tool", content=result, tool_call_id=decision.id)
-                )
 
         raise RuntimeError(f"Subagent 在 {self._max_steps} 步内未完成")
 

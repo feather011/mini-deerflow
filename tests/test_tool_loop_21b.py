@@ -33,10 +33,12 @@ from mini_deerflow.models import (
     FakeModel,
     Message,
     ToolCall,
+    ToolCalls,
     ToolSpec,
 )
 from mini_deerflow.thread_store import InMemoryThreadStore
 from mini_deerflow.tools import (
+    Tool,
     ToolExecutionError,
     ToolNotFoundError,
     ToolRegistry,
@@ -230,6 +232,72 @@ class Test工具消息往返:
         assert payload[1]["content"] == "2"
 
 
+class Test多工具消息往返:
+    """一次响应包含多个 tool_use 的请求重建。
+
+    协议要求：一个 assistant turn 里的每个 tool_use，都要在**紧随其后**的
+    user turn 里有对应的 tool_result。拆成多组会被判为「tool_use 没有对应
+    结果」而拒收该轮请求。
+
+    术语说明：这里说的是「模型一次响应给出多个工具调用」，
+    **不是并行执行** —— Agent 侧是按顺序串行执行的。
+    """
+
+    def _multi_messages(self) -> list[Message]:
+        return [
+            Message(role="assistant", content="a",
+                    tool_call_id="toolu_1", tool_name="calculator",
+                    tool_arguments={"expression": "1"}),
+            Message(role="assistant", content="b",
+                    tool_call_id="toolu_2", tool_name="calculator",
+                    tool_arguments={"expression": "2"}),
+            Message(role="tool", content="1", tool_call_id="toolu_1"),
+            Message(role="tool", content="2", tool_call_id="toolu_2"),
+        ]
+
+    def test_两个_tool_use_合成一个_assistant_turn(self) -> None:
+        payload = provider_messages_from(self._multi_messages())
+        assert [m["role"] for m in payload] == ["assistant", "user"]
+        blocks = payload[0]["content"]
+        assert len(blocks) == 2
+        assert [b["id"] for b in blocks] == ["toolu_1", "toolu_2"]
+        assert [b["type"] for b in blocks] == ["tool_use", "tool_use"]
+
+    def test_两个_tool_result_合成一个_user_turn(self) -> None:
+        payload = provider_messages_from(self._multi_messages())
+        blocks = payload[1]["content"]
+        assert len(blocks) == 2
+        assert [b["tool_use_id"] for b in blocks] == ["toolu_1", "toolu_2"]
+        assert [b["type"] for b in blocks] == ["tool_result", "tool_result"]
+        assert [b["content"] for b in blocks] == ["1", "2"]
+
+    def test_单工具的重建形状保持不变(self) -> None:
+        """回归：单工具仍是「一个 assistant turn + 一个 user turn」。"""
+        messages = [
+            Message(role="assistant", content="x", tool_call_id="toolu_1",
+                    tool_name="calculator", tool_arguments={"expression": "1"}),
+            Message(role="tool", content="1", tool_call_id="toolu_1"),
+        ]
+        payload = provider_messages_from(messages)
+        assert [m["role"] for m in payload] == ["assistant", "user"]
+        assert len(payload[0]["content"]) == 1
+        assert len(payload[1]["content"]) == 1
+
+    def test_只有部分结果时不发空的_result_块(self) -> None:
+        """缺结果的 tool_use 仍要出现在 assistant turn 里，不能凭空造结果。"""
+        messages = [
+            Message(role="assistant", content="a", tool_call_id="toolu_1",
+                    tool_name="calculator", tool_arguments={"expression": "1"}),
+            Message(role="assistant", content="b", tool_call_id="toolu_2",
+                    tool_name="calculator", tool_arguments={"expression": "2"}),
+            Message(role="tool", content="1", tool_call_id="toolu_1"),
+        ]
+        payload = provider_messages_from(messages)
+        assert [m["role"] for m in payload] == ["assistant", "user"]
+        assert len(payload[0]["content"]) == 2
+        assert len(payload[1]["content"]) == 1
+
+
 # ---------------------------------------------------------------------------
 # 3. 解析 tool_use 响应
 # ---------------------------------------------------------------------------
@@ -247,7 +315,13 @@ class Test解析ToolCall:
         assert decision.arguments == {"expression": "1+1"}
         assert decision.id == "toolu_abc"
 
-    def test_多个_tool_use_拒绝执行且不静默丢弃(self) -> None:
+    def test_多个_tool_use_全部保留_不静默丢弃(self) -> None:
+        """一次响应给出多个 tool_use → 全部保留，不丢任何一个。
+
+        旧行为是直接抛 ModelProtocolError 让整轮失败；模型在项目会话里
+        经常一次给出多个调用，那等于「模型一给多个就整轮挂掉」。
+        现在解析成 `ToolCalls`，由 Agent 按顺序逐个执行、结果一并回灌。
+        """
         model, _ = make_model([
             Block(content=[
                 Block(type="tool_use", id="toolu_1", name="calculator",
@@ -256,10 +330,36 @@ class Test解析ToolCall:
                       input={"expression": "2"}),
             ])
         ])
+        decision = model.decide([USER], [CALCULATOR_SPEC])
+
+        assert isinstance(decision, ToolCalls)
+        assert len(decision.calls) == 2
+        assert [c.id for c in decision.calls] == ["toolu_1", "toolu_2"]
+        assert [c.name for c in decision.calls] == ["calculator", "calculator"]
+        assert [c.arguments["expression"] for c in decision.calls] == ["1", "2"]
+
+    def test_单个_tool_use_仍是_ToolCall(self) -> None:
+        """回归：单工具调用不能变成 ToolCalls（否则 Agent 分支要重写）。"""
+        model, _ = make_model([
+            tool_use_response("calculator", {"expression": "1+1"}, "toolu_abc")
+        ])
+        decision = model.decide([USER], [CALCULATOR_SPEC])
+        assert isinstance(decision, ToolCall)
+        assert not isinstance(decision, ToolCalls)
+
+    def test_多个调用的参数也要逐个校验(self) -> None:
+        """第二个调用参数非法时同样报错，不能只校验第一个。"""
+        model, _ = make_model([
+            Block(content=[
+                Block(type="tool_use", id="toolu_1", name="calculator",
+                      input={"expression": "1"}),
+                Block(type="tool_use", id="toolu_2", name="calculator",
+                      input={}),
+            ])
+        ])
         with pytest.raises(ModelProtocolError) as exc:
             model.decide([USER], [CALCULATOR_SPEC])
-        assert "2" in str(exc.value)
-        assert "单工具" in str(exc.value)
+        assert "必填参数" in str(exc.value)
 
     def test_tool_use_缺少_call_id(self) -> None:
         model, _ = make_model([
@@ -330,6 +430,116 @@ class _ScriptedModel:
 
 
 class TestAgent闭环:
+    def test_多工具调用_两个都执行且都回灌(self) -> None:
+        """模型一次响应给出两个调用 → 两个都执行、结果都回灌给模型。
+
+        旧行为：解析阶段直接抛 ModelProtocolError，整轮失败。
+
+        执行是**串行**的：顺序即模型给出的顺序。
+        """
+        store = InMemoryThreadStore()
+        store.create("t1")
+        model = _ScriptedModel([
+            ToolCalls(calls=(
+                ToolCall(name="calculator", arguments={"expression": "1+1"},
+                         id="toolu_1"),
+                ToolCall(name="calculator", arguments={"expression": "2+2"},
+                         id="toolu_2"),
+            )),
+            FinalAnswer(content="两个都算完了"),
+        ])
+        agent = Agent(model=model, registry=create_default_registry(), store=store)
+
+        answer, trace = agent.run("t1", "同时算 1+1 和 2+2")
+
+        assert answer == "两个都算完了"
+        assert len(model.calls) == 2
+
+        # 第二轮：两个 tool_use assistant 消息**连续**，两个 tool 结果**连续**
+        second = model.calls[1]
+        roles = [m.role for m in second]
+        assert roles[-4:] == ["assistant", "assistant", "tool", "tool"]
+        assert [m.tool_call_id for m in second[-4:-2]] == ["toolu_1", "toolu_2"]
+        assert [m.tool_call_id for m in second[-2:]] == ["toolu_1", "toolu_2"]
+        assert second[-2].content == "2"
+        assert second[-1].content == "4"
+
+        # trace：两个 model_decision + 两个 tool_call + final_answer
+        assert [e["action"] for e in trace] == [
+            "model_decision", "model_decision",
+            "tool_call", "tool_call",
+            "final_answer",
+        ]
+        assert [e["detail"]["name"] for e in trace if e["action"] == "tool_call"] == [
+            "calculator", "calculator",
+        ]
+
+    def test_多工具调用_重建出的请求是规范形状(self) -> None:
+        """两轮之间的消息经 provider_messages_from 后必须是合规的分组形状。"""
+        store = InMemoryThreadStore()
+        store.create("t1")
+        model = _ScriptedModel([
+            ToolCalls(calls=(
+                ToolCall(name="calculator", arguments={"expression": "1+1"},
+                         id="toolu_1"),
+                ToolCall(name="calculator", arguments={"expression": "2+2"},
+                         id="toolu_2"),
+            )),
+            FinalAnswer(content="ok"),
+        ])
+        agent = Agent(model=model, registry=create_default_registry(), store=store)
+        agent.run("t1", "同时算 1+1 和 2+2")
+
+        payload = provider_messages_from(model.calls[1])
+        # 末尾是「一个 assistant turn（2 个 tool_use）+ 一个 user turn（2 个 result）」
+        assert payload[-2]["role"] == "assistant"
+        assert len(payload[-2]["content"]) == 2
+        assert payload[-1]["role"] == "user"
+        assert len(payload[-1]["content"]) == 2
+        # 每个 tool_use 都有对应的 tool_result
+        used = [b["id"] for b in payload[-2]["content"]]
+        answered = [b["tool_use_id"] for b in payload[-1]["content"]]
+        assert sorted(used) == sorted(answered)
+
+    def test_多工具调用_首个失败则整轮失败_后续不执行(self) -> None:
+        """一次响应给出多个调用时，**首个调用失败即整轮失败**。
+
+        这是本轮明确保留的语义：**不**做失败隔离 —— 失败不会作为结果
+        回灌给模型，后续调用也不会执行。原因：工具之间可能有依赖
+        （前一个改了仓库后，后一个的结果才有意义），静默跳过会让
+        模型拿到一份「看起来都跑了」的错误上下文。
+
+        因此这里断言两件事：
+        1. 整轮抛 ToolNotFoundError（失败即整轮失败）；
+        2. 第二个调用的 handler **完全没有被执行**。
+        """
+        store = InMemoryThreadStore()
+        store.create("t1")
+        executed: list[str] = []
+
+        registry = ToolRegistry()
+        registry.register(Tool(
+            name="calculator",
+            description="记录调用并返回固定结果",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda args: (executed.append("calculator"), "2")[1],
+        ))
+        model = _ScriptedModel([
+            ToolCalls(calls=(
+                ToolCall(name="no_such_tool", arguments={}, id="toolu_1"),
+                ToolCall(name="calculator", arguments={}, id="toolu_2"),
+            )),
+            FinalAnswer(content="ok"),
+        ])
+        agent = Agent(model=model, registry=registry, store=store)
+
+        # 未知工具会抛 ToolNotFoundError → 整轮失败（既有语义不变）
+        with pytest.raises(ToolNotFoundError):
+            agent.run("t1", "调用不存在的工具")
+
+        # 首个失败后，第二个调用**没有**被执行
+        assert executed == []
+
     def test_tool_result_final_两轮闭环(self) -> None:
         store = InMemoryThreadStore()
         store.create("t1")

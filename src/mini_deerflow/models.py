@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Iterator, Protocol, runtime_checkable
 
 _VALID_ROLES: frozenset[str] = frozenset({"system", "user", "assistant", "tool"})
 
@@ -154,6 +154,33 @@ class FinalAnswer:
     content: str
 
 
+@dataclass(frozen=True)
+class ToolCalls:
+    """模型在**一次响应**里发起了多个工具调用。
+
+    Anthropic 兼容协议允许**单个 assistant turn 里带多个 tool_use 块**
+    （模型一次请求给出多个工具调用）。这类响应过去会被当作协议错误直接
+    拒绝，代价是整轮失败；现在由这个类型承载，Agent 会**全部**执行、
+    结果按 call_id 配对后一并回灌 —— 仍然不做静默丢弃。
+
+    注意术语：这是「一次响应包含多个工具调用」，**不是并行执行**。
+    顺序即模型给出的顺序；执行是**串行**的（同一轮里前一个工具可能
+    修改仓库，后一个必须看到修改后的结果）。
+    """
+
+    calls: tuple[ToolCall, ...]
+
+    def __len__(self) -> int:
+        return len(self.calls)
+
+    def __iter__(self) -> Iterator[ToolCall]:
+        return iter(self.calls)
+
+
+# 一次模型决策的全部可能形态
+Decision = ToolCall | ToolCalls | FinalAnswer
+
+
 @runtime_checkable
 class Model(Protocol):
     """模型协议：任何实现 decide 方法的类都满足此协议。
@@ -170,7 +197,7 @@ class Model(Protocol):
         self,
         messages: list[Message],
         tools: list[ToolSpec] | None = None,
-    ) -> ToolCall | FinalAnswer: ...
+    ) -> Decision: ...
 
 
 class FakeModel:
