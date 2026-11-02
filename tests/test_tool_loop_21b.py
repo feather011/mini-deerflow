@@ -540,6 +540,82 @@ class TestAgent闭环:
         # 首个失败后，第二个调用**没有**被执行
         assert executed == []
 
+    def test_多工具调用_取消后剩余工具不执行(self) -> None:
+        """停止（取消）后，**后续工具不得再启动**。
+
+        步骤开始与模型调用后都有取消检查，但工具之间原本没有 ——
+        一次响应给出多个调用时，用户点了停止，剩余工具仍会执行完。
+        """
+        from mini_deerflow.middleware import BudgetExceededError, CancellationToken
+
+        store = InMemoryThreadStore()
+        store.create("t1")
+        token = CancellationToken()
+        executed: list[str] = []
+
+        def _handler(args: dict[str, object]) -> str:
+            executed.append("calculator")
+            # 模拟「第一个工具执行期间用户点了停止」
+            token.cancel()
+            return "2"
+
+        registry = ToolRegistry()
+        registry.register(Tool(
+            name="calculator",
+            description="第一个工具执行期间触发取消",
+            parameters={"type": "object", "properties": {}},
+            handler=_handler,
+        ))
+        model = _ScriptedModel([
+            ToolCalls(calls=(
+                ToolCall(name="calculator", arguments={}, id="toolu_1"),
+                ToolCall(name="calculator", arguments={}, id="toolu_2"),
+            )),
+            FinalAnswer(content="ok"),
+        ])
+        agent = Agent(model=model, registry=registry, store=store)
+
+        with pytest.raises(BudgetExceededError):
+            agent.run("t1", "同时算两个", cancellation_token=token)
+
+        # 第一个工具执行了，第二个**没有**
+        assert executed == ["calculator"]
+
+    def test_多工具调用_超时后剩余工具不执行(self) -> None:
+        """模型超时（令牌被置位）后，后续工具同样不得启动。"""
+        from mini_deerflow.middleware import BudgetExceededError, CancellationToken
+
+        store = InMemoryThreadStore()
+        store.create("t1")
+        token = CancellationToken()
+        executed: list[str] = []
+
+        def _handler(args: dict[str, object]) -> str:
+            executed.append("calculator")
+            token.cancel()  # 与模型超时同一条路径：令牌被置位
+            return "2"
+
+        registry = ToolRegistry()
+        registry.register(Tool(
+            name="calculator",
+            description="第一个工具执行期间触发超时",
+            parameters={"type": "object", "properties": {}},
+            handler=_handler,
+        ))
+        model = _ScriptedModel([
+            ToolCalls(calls=(
+                ToolCall(name="calculator", arguments={}, id="toolu_1"),
+                ToolCall(name="calculator", arguments={}, id="toolu_2"),
+            )),
+            FinalAnswer(content="ok"),
+        ])
+        agent = Agent(model=model, registry=registry, store=store)
+
+        with pytest.raises(BudgetExceededError):
+            agent.run("t1", "同时算两个", cancellation_token=token)
+
+        assert executed == ["calculator"]
+
     def test_tool_result_final_两轮闭环(self) -> None:
         store = InMemoryThreadStore()
         store.create("t1")

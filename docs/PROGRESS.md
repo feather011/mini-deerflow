@@ -4095,6 +4095,10 @@ E2E 全部用 `page.route` 本地夹具（注入 `/api/threads/{id}` 与 SSE 事
   该码是稳定字面量，不含敏感信息，但**不是**面向终端用户的文案。
 - 路径泄露的修复只覆盖 `_resolve_in_repo` 这一处 `Path.resolve()` 失败点；
   其他可能携带绝对路径的异常文本仍按既有保守策略**不展示**。
+  > ⚠️ **此条已被 BACKEND-02（2026-11-03）更正为不成立**：复审证明
+  > `project_read_file` 的 OSError 分支与 `_as_tool_result` 的兜底分支仍把
+  > 原始异常（带绝对路径）放进**工具结果**，而工具结果会回灌给模型。
+  > BACKEND-02 已修这两处并把码写进结果；原文保留以记录当时的真实状态。
 
 **后续事项（不在本轮范围）**
 
@@ -4109,3 +4113,126 @@ E2E 全部用 `page.route` 本地夹具（注入 `/api/threads/{id}` 与 SSE 事
   提交前已核对三者依赖（`Decision` 类型随「多工具调用」引入，故类型标注的
   同步放在该提交内；「安全错误展示」依赖前两者的错误类型，但不改它们的代码）。
 - **未推送**（用户本轮未授权）。
+
+---
+
+#### BACKEND-02：F1 路径泄露闭合 / F2 错误码落到真实结果 / B1 取消后停止执行（2026-11-03）
+
+- 任务 ID：BACKEND-02
+- 会话标识：claude-worker-20261010-2015
+- 目标版本：基线 `a29af0c3fbcbbadca3a5159521a0884f35f25ad7`（分支 `automation/tool-07`，已推送）
+- 当前状态：**代码已改、定向测试与相关回归已跑（新增用例全绿）；未推送、未合并**
+- 更新时间：2026-11-03
+- 范围：`project_tools.py` / `context_shared.py` / `agent.py` / `subagent_executor.py` /
+  `api/schemas/streaming.py`（仅注释与表述）+ 对应测试 + 本记录。不改前端、不改 SSE 协议形状
+
+**一、B1：停止／超时后继续执行**
+
+- 任务 ID：BACKEND-02-B1
+- 根因：取消检查只在**步骤开始**（`agent.py:291`）与**模型调用后**
+  （`agent.py:387`）各有一处，**工具与工具之间没有**。一次响应给出多个工具
+  调用时，用户停止或模型超时后，剩余工具仍会执行完。子代理
+  （`subagent_executor.py`）同样：步骤开始查了取消与截止时间，工具循环里没有。
+- 改动：
+  - 主 Agent 的工具循环：**每个后续工具启动前**检查取消令牌，命中即抛
+    `BudgetExceededError("tool_call_cancelled", None)`；
+  - 子代理的工具循环：**每个后续工具启动前**同时检查取消令牌与截止时间
+    （`_token.is_cancelled()` / `_check_deadline()`），命中即抛 `_CancelledError()`。
+- 语义：API 层按「令牌已置位」把 `BudgetExceededError` 映射为
+  `AgentRunCancelledError`（`agent_runs.py:276`），终态仍是 `run.cancelled`
+  —— 与既有「用户点了停止」的语义一致，未改变终态判定。
+- 覆盖：主 Agent 的取消与超时两条路径各 1 项；子代理的取消与超时两条路径各 1 项。
+
+**二、F1：原始异常泄露（真实消费链已闭合）**
+
+- 任务 ID：BACKEND-02-F1
+- 复审结论：`project_read_file` 的 OSError 分支与 `_as_tool_result` 的兜底分支
+  仍把原始异常文本放进**工具结果**；工具结果会作为 `tool_result` **回灌给模型**
+  （外部 Provider），并可能被回显到聊天界面。
+- 改动（全部在 `project_tools.py` 的错误返回出口）：
+  - `read_file` 的 `except OSError` → **原始异常只进服务端日志**（warning +
+    traceback），对外只给受控说明「文件无法读取（权限或 IO 错误）」+ 仓库**相对**路径；
+  - `_as_tool_result` 的兜底 `except Exception` → 原文只进日志，对外只给
+    「工具内部错误，请重试或联系管理员」；
+  - `glob` 的 `except (OSError, ValueError)` → 同上；
+  - `project_execute` 的四个终态出口（`STATUS_STOPPED` / `STATUS_TIMEOUT` /
+    `STATUS_LAUNCH_FAILED` / `STATUS_PROTOCOL_ERROR` / `STATUS_FAILED`）→
+    harness 返回的原文（含 harness 根目录、python 解释器路径）只进日志，
+    对外给受控说明；失败原因由 `answer` 承载（那本就是模型该读的产物）。
+  - `grep` 的 `re.error` 文案**保留**（描述的是模型自己的 pattern，不含服务端
+    路径，模型靠它改参），但按上限截断。
+- **两条真实消费链的实测结果**（探针，非推断）：
+  | 链 | 结果 |
+  |---|---|
+  | 模型回灌：工具结果 → tool message → provider 请求 | 结果为 `{"ok": false, "action": "read_file", "error": "文件无法读取（权限或 IO 错误）：src/app.py", "kind": "error", "code": "PROJECT_TOOL_FILE_UNREADABLE"}` —— **无绝对路径**，含相对路径与稳定码 |
+  | 客户端输出：`run.failed` 终态文案 | **无绝对路径** |
+  | execute 内部异常 → 工具结果 | `{"ok": false, ..., "error": "工具内部错误，请重试或联系管理员", "code": "PROJECT_TOOL_INTERNAL_ERROR"}` —— **无绝对路径** |
+  | 正常读取（对照） | 仍成功返回内容，结果里无 `code` 字段 |
+
+**三、F2：项目错误码落到真实错误结果**
+
+- 任务 ID：BACKEND-02-F2
+- 关键事实（复审实测）：`project_tools._as_tool_result` 把
+  `ProjectToolUsageError` / `ProjectToolStateError` 转成 `ok:false` 的 JSON，
+  异常**不逃出 handler** → 不进 `ToolRegistry.execute` 的异常分支 →
+  `RunEventMiddleware.error` 不触发 → **项目工具失败不产生 `tool.failed` 事件**。
+- 本轮决定：**保留 `ok:false` JSON**（业务失败是可恢复的，模型改参即可重试，
+  不该让整轮 Run 失败），**稳定码进入真实错误结果**。
+- 改动：
+  - `context_shared.err_response` 增加可选 `code` 参数 → 结果 JSON 多了
+    `code` 键（没有码时该键**不出现**，不是 null）；
+  - `project_tools.PROJECT_TOOL_CODES` 定义 9 个稳定码（usage / state /
+    file_unreadable / internal / launch_failed / protocol_error / stopped /
+    timeout / execute_failed），**消费者是模型**，不是事件流；
+  - `project_tools` 的全部 `err_response` 出口与 `project_execute` 的四个
+    `ok:false` 终态体都带上对应码。
+- **撤回的声明**：BACKEND-01 提交信息里「这个错误会经 `safe_failure_detail`
+  直接进客户端 SSE 事件」**不成立** —— 那条路径根本到不了 SSE；
+  `streaming.py` 里 `PROJECT_TOOL_USAGE_ERROR` / `PROJECT_TOOL_STATE_ERROR`
+  两个分支现在只是**异常万一逃逸时的兜底**（注释已改明），不是正常路径。
+- 覆盖：业务失败不抛异常且结果含稳定码 1 项；**改参后重试成功 1 项**（对照：
+  失败是可恢复的）；正常读取不受影响 1 项。
+
+**四、F8：文档失真已更正**
+
+- 任务 ID：BACKEND-02-F8
+- BACKEND-01「已知限制」里「其他可能携带绝对路径的异常文本仍按既有保守策略
+  **不展示**」**与事实不符**，已加更正标注（原文保留，记录当时的真实状态）。
+- 本节写清了实际路径：**错误结果 JSON（模型回灌）** 与 **SSE 终态文案
+  （客户端输出）** 是两条不同的链，两者都不得含绝对路径。
+
+**验证证据**
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 本轮定向测试 | `pytest tests/test_project_tools.py tests/test_tool_loop_21b.py tests/test_subagent_executor.py -q` | **92 passed / 1 failed / 1 skipped**；1 failed 为既有项（见下），1 skipped 为既有跳过 |
+| 受影响回归 | `pytest`（project_tools / tool_loop_21b / subagent×3 / agent×2 / web_tools / context_agent / api_runs_stream_components / anthropic_compat_model / phase21b_events） | **381 passed / 6 failed / 1 skipped**；6 项与基线**逐项一致**（同一批 node ID），无新增失败 |
+| F1 真实消费链探针 | 独立脚本（临时目录、构造注入 OSError） | 模型回灌 / 客户端输出 / execute 内部异常 **三条链均无绝对路径**；正常读取对照仍成功 |
+
+**既有失败（基线 `a29af0c3fbcbbadca3a5159521a0884f35f25ad7` 同样失败，与本轮无关）**
+
+`test_tool_loop_21b.py::Test预算与步数::test_budget_耗尽时抛出`、
+`test_context_agent.py::test_summary_uses_separate_budget_from_decisions`、
+`test_subagent_allowed_tools.py` 3 项、
+`test_phase21b_events.py::TestSSE事件::test_工具失败_发_tool_failed_且唯一终态为_run_failed`。
+
+**因本轮契约变化而更新的既有用例**
+
+`tests/test_project_tools.py::test_execute_runner_run_抛异常_锁仍释放`：
+原断言 `"子进程崩溃" in result`（即原始异常外泄）已按 F1 新契约改为
+「原始文本**不得**出现 + 结果为 `ok:false` 且带 `PROJECT_TOOL_INTERNAL_ERROR`」；
+该用例的**本意**（锁必须释放、第二次调用不被锁挡住）**两条断言原样保留**。
+
+**明确未做 / 未覆盖**
+
+- **未**把可恢复的项目业务失败改成整轮失败（明确保留 `ok:false` 语义）。
+- **未**修 `streaming.py` 的分层问题、重复链遍历与死代码（`F9` / `F10`，本轮
+  不作为新增阻断）。
+- **未**修 `F3`～`F7`（被包装的具体错误码退化、`run.failed` 丢码、error 钩子
+  抛错风险、工具名长度上限、`_exception_chain` 只跟 `__cause__`）—— 留待具体复现。
+- **未**处理 `context_tools.py` / `history_tools.py` / `web_tools.py` 里同样存在的
+  `err_response(..., str(exc))` 模式 —— 它们不在项目工具链路上，本轮不扩范围。
+- **未**覆盖 harness 的 `answer` / `tool_calls` 字段：那是 harness 自己的产物，
+  按设计就是给模型读的，不属于「原始异常」。
+- **未**验证真实 Provider 回灌与真实聊天（不调用付费模型）。
+- **未**跑后端全量回归。

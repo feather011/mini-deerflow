@@ -434,6 +434,13 @@ class _BudgetAwareAgent:
 
                 # 串行执行：后一个工具要看到前一个的结果
                 for call in calls:
+                    # 取消 / 超时检查：**每个后续工具启动前**都要确认。
+                    # 步骤开始（379-382 行）有检查，但工具之间没有 ——
+                    # 一次响应给出多个调用时，超时或取消后剩余工具仍会执行。
+                    if self._token.is_cancelled():
+                        raise _CancelledError()
+                    self._check_deadline()
+
                     # 工具调用前原子消费额度（成功/失败都计入）
                     try:
                         self._budget.consume_tool_call()

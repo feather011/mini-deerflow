@@ -146,11 +146,19 @@ def _tool_failure_parts(exc: BaseException | None) -> tuple[str, str] | None:
 
     **绝不透传 `str(exc)`**：`ToolExecutionError` 的 message 里嵌着 handler
     抛出的原始异常，那可能是文件系统路径、内部栈或凭据片段。
-    只有 `ProjectToolError` 家族例外 —— 它们的 message 在产生端就已受控
-    （绝对路径留在服务端日志，见 `project_tools._resolve_in_repo`）。
 
     错误码是稳定的字面量，前端可据此区分「模型叫错了名字」「越权调用」
     「授权未过」与「工具执行失败」，无需解析文案。
+
+    **项目工具不在本函数的正常覆盖范围内**：项目工具的失败被
+    `project_tools._as_tool_result` 转成 `ok:false` 的 JSON 结果，
+    异常**不逃出 handler** —— 业务失败是**可恢复**的（模型改参即可重试），
+    因此**不会**产生 `tool.failed` 事件。项目工具的稳定错误码在**结果
+    JSON 的 `code` 字段**里（见 `project_tools.PROJECT_TOOL_CODES`），
+    消费者是模型，不是事件流。
+
+    下面两个 `ProjectToolError` 分支只是**异常万一逃逸时的兜底**（例如
+    直接调用 handler 而不经过注册表），不是项目工具失败的正常路径。
     """
     if exc is None:
         return None
@@ -201,6 +209,7 @@ def safe_failure_detail(exc: BaseException | None) -> str:
     - `ModelError` 家族：只含状态码 / 供应商 / 模型名（见 `model_errors.py`
       的模块约定：异常消息只包含非敏感信息，绝不携带 API Key）
     - `ProjectToolError` 家族：只含参数校验与会话状态的描述
+      （**兜底**：项目工具的失败正常走 `ok:false` 结果，不产生事件）
     - 工具类异常：给**稳定错误码 + 固定说明**，不放行原始 message
 
     其它异常（尤其第三方 SDK 异常）一律**不**展示 message —— 沿用既有保守策略。

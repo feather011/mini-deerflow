@@ -585,6 +585,12 @@ class Agent:
                 # 串行执行：同一轮里前一个工具可能修改仓库，
                 # 后一个必须看到修改后的结果。
                 for call in calls:
+                    # 停止检查：**每个后续工具启动前**都要确认没被取消。
+                    # 步骤开始（291 行）与模型调用后（387 行）都有检查，
+                    # 但工具之间没有 —— 一次响应给出多个调用时，用户停止或
+                    # 模型超时后，剩余工具仍会执行完。
+                    if cancellation_token is not None and cancellation_token.is_cancelled():
+                        raise BudgetExceededError("tool_call_cancelled", None)
                     result = _perform_tool_call(call.name, call.arguments)
                     trace.append({
                         "step": step,

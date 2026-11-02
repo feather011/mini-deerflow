@@ -46,6 +46,7 @@ __all__ = [
     "PROJECT_GLOB_TOOL_NAME",
     "PROJECT_GREP_TOOL_NAME",
     "PROJECT_EXECUTE_TOOL_NAME",
+    "PROJECT_TOOL_CODES",
     "create_project_read_tools",
     "create_project_execute_tool",
 ]
@@ -55,6 +56,32 @@ PROJECT_EXECUTE_TOOL_NAME = "project_execute"
 PROJECT_READ_FILE_TOOL_NAME = "project_read_file"
 PROJECT_GLOB_TOOL_NAME = "project_glob"
 PROJECT_GREP_TOOL_NAME = "project_grep"
+
+
+# --- 项目工具的稳定错误码 ---
+#
+# 这些码进入**工具结果**（ok:false JSON 的 `code` 字段），也就是模型
+# 真正读到的那份错误。模型可以按码判断「改参重试」还是「如实转告用户」，
+# 不必解析文案。
+#
+# 为什么码在结果里而不在 SSE 事件里：项目工具的失败被 `_as_tool_result`
+# 转成 ok:false JSON，**异常不逃出 handler** —— 业务失败是**可恢复**的
+# （模型改参即可重试），不该让整轮 Run 失败，因此也**不会**产生
+# `tool.failed` 事件。稳定码的消费者是模型，不是事件流。
+PROJECT_TOOL_CODES: dict[str, str] = {
+    "usage": "PROJECT_TOOL_USAGE_ERROR",
+    "state": "PROJECT_TOOL_STATE_ERROR",
+    "file_unreadable": "PROJECT_TOOL_FILE_UNREADABLE",
+    "internal": "PROJECT_TOOL_INTERNAL_ERROR",
+    "launch_failed": "PROJECT_TOOL_LAUNCH_FAILED",
+    "protocol_error": "PROJECT_TOOL_PROTOCOL_ERROR",
+    "execute_stopped": "PROJECT_TOOL_STOPPED",
+    "execute_timeout": "PROJECT_TOOL_TIMEOUT",
+    "execute_failed": "PROJECT_TOOL_EXECUTE_FAILED",
+}
+
+# 错误文案的对外长度上限：文案会回灌给模型，超长既费 token 又撑爆展示
+_ERROR_TEXT_MAX = 300
 
 # --- 输出上限（超限截断并标注，不静默丢弃） ---
 
@@ -150,23 +177,72 @@ def _as_tool_result(action: str, fn):
 
     - usage_error：参数不合法，模型改参即可重试
     - error：会话 / 项目状态问题，重试无用，模型如实转告用户
+
+    **返回的 JSON 会作为 tool_result 回灌给模型**（也会出现在 `run.result`
+    事件里），因此文案必须受控：只给必要的相对路径，**不给服务端绝对路径、
+    不给原始异常文本**。原始异常一律留在服务端日志。
+
+    领域异常（`ProjectToolUsageError` / `ProjectToolStateError`）的文案由
+    本模块本地构造、逐条受控，可以直接对外；其它异常一律走兜底分支。
     """
 
     def wrapper(arguments: dict[str, object], context: object) -> str:
         try:
             return fn(arguments, context)
         except ProjectToolUsageError as exc:
-            return err_response(action, str(exc), kind="usage_error")
+            return err_response(
+                action,
+                _bounded_text(str(exc)),
+                kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
         except ProjectToolStateError as exc:
-            return err_response(action, str(exc), kind="error")
+            return err_response(
+                action,
+                _bounded_text(str(exc)),
+                kind="error",
+                code=PROJECT_TOOL_CODES["state"],
+            )
         except Exception as exc:  # noqa: BLE001 - runner.run() 等底层抛任意异常都兜住
             import logging
             logging.getLogger("mini_deerflow.project_tools").error(
-                "project_execute 异常（将在日志后转为错误响应）: %s", exc, exc_info=True
+                "project tool 异常（原文只进日志，对外只给受控说明）: %s", exc, exc_info=True
             )
-            return err_response(action, str(exc), kind="error")
+            # 原始异常的 message 可能带绝对路径、内部栈或凭据片段 → 不外泄。
+            return err_response(
+                action,
+                "工具内部错误，请重试或联系管理员",
+                kind="error",
+                code=PROJECT_TOOL_CODES["internal"],
+            )
 
     return wrapper
+
+
+def _bounded_text(text: str) -> str:
+    """把对外文案限制在 `_ERROR_TEXT_MAX` 以内。"""
+    text = text.strip()
+    if len(text) > _ERROR_TEXT_MAX:
+        return text[:_ERROR_TEXT_MAX] + "…"
+    return text
+
+
+def _executor_error(raw: str, fallback: str) -> str:
+    """执行器（harness）返回的原文只进服务端日志，对外给受控说明。
+
+    harness 的 error 可能带 harness 根目录、python 解释器路径等**服务端
+    绝对路径**；而这段文案会随工具结果回灌给模型 → 等于把服务端目录结构
+    发给外部 Provider。因此原文只进日志，对外只给 `fallback` 这句受控说明。
+
+    执行失败的具体原因由 `answer`（harness 的最终回答）承载 —— 那是模型
+    本来就该读的产物，不属于「原始异常」。
+    """
+    import logging
+    if raw:
+        logging.getLogger("mini_deerflow.project_tools").warning(
+            "执行器返回的原文（只进日志，对外只给受控说明）: %s", raw
+        )
+    return fallback
 
 
 def _bound_repo(
@@ -264,11 +340,13 @@ def create_project_read_tools(
             return err_response(
                 "read_file", f"文件不存在: {arguments.get('path')}",
                 kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
         if not target.is_file():
             return err_response(
                 "read_file", f"不是文件: {arguments.get('path')}",
                 kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
 
         offset = _int_arg(arguments, "offset", default=0, minimum=0)
@@ -282,7 +360,24 @@ def create_project_read_tools(
             with target.open("rb") as fh:
                 chunk = fh.read(READ_MAX_BYTES)
         except OSError as exc:
-            return err_response("read_file", f"文件无法读取: {exc}")
+            # OSError 的 message 会带**绝对路径**（POSIX 上形如
+            # "[Errno 13] Permission denied: '/home/user/secret'"，Windows 上
+            # 带盘符全路径）。本错误结果会回灌给模型 → 等于把服务端目录结构
+            # 发给外部 Provider。因此：**原始异常只进服务端日志**，对外只给
+            # 受控说明 + 仓库**相对**路径（模型改参要用）。
+            import logging
+            logging.getLogger("mini_deerflow.project_tools").warning(
+                "read_file 读取失败（%s）: %s",
+                _display_path(repo, target),
+                exc,
+                exc_info=True,
+            )
+            return err_response(
+                "read_file",
+                f"文件无法读取（权限或 IO 错误）：{_display_path(repo, target)}",
+                kind="error",
+                code=PROJECT_TOOL_CODES["file_unreadable"],
+            )
         text = chunk.decode("utf-8", errors="replace")
         lines = text.splitlines()
         byte_truncated = size > len(chunk)
@@ -308,21 +403,36 @@ def create_project_read_tools(
         repo = _repo_root(_require_thread_id(context))
         raw_pattern = arguments.get("pattern")
         if not isinstance(raw_pattern, str) or not raw_pattern.strip():
-            return err_response("glob", "pattern 不能为空", kind="usage_error")
+            return err_response(
+                "glob", "pattern 不能为空", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
         pattern = raw_pattern.strip().replace("\\", "/")
         if "\x00" in pattern:
-            return err_response("glob", "pattern 不能包含 NUL 字符", kind="usage_error")
+            return err_response(
+                "glob", "pattern 不能包含 NUL 字符", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
         if _looks_absolute(pattern) or ".." in pattern.split("/"):
             return err_response(
                 "glob", "pattern 必须是仓库内相对路径，且不含 '..'",
                 kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
 
         try:
             matches = sorted(repo.glob(pattern))
         except (OSError, ValueError) as exc:
             # ValueError：pathlib 拒绝的模式（如 "**" 之外的畸形写法）
-            return err_response("glob", f"pattern 非法: {exc}", kind="usage_error")
+            # OSError：可能带**绝对路径** → 原文只进日志，对外只给受控说明
+            import logging
+            logging.getLogger("mini_deerflow.project_tools").warning(
+                "glob pattern 非法: %s", exc, exc_info=True
+            )
+            return err_response(
+                "glob", "pattern 非法，无法展开", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
 
         hits: list[str] = []
         truncated = False
@@ -361,7 +471,10 @@ def create_project_read_tools(
         repo = _repo_root(_require_thread_id(context))
         raw_pattern = arguments.get("pattern")
         if not isinstance(raw_pattern, str) or not raw_pattern.strip():
-            return err_response("grep", "pattern 不能为空", kind="usage_error")
+            return err_response(
+                "grep", "pattern 不能为空", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
 
         base = _resolve_in_repo(
             repo, arguments.get("path") or ".", what="path"
@@ -370,6 +483,7 @@ def create_project_read_tools(
             return err_response(
                 "grep", f"路径不存在: {arguments.get('path')}",
                 kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
 
         max_hits = min(
@@ -388,7 +502,10 @@ def create_project_read_tools(
         if _USE_LITERAL:
             needle = raw_pattern.strip().lower() if arguments.get("ignore_case") else raw_pattern.strip()
             if not needle:
-                return err_response("grep", "pattern 不能为空", kind="usage_error")
+                return err_response(
+                    "grep", "pattern 不能为空", kind="usage_error",
+                    code=PROJECT_TOOL_CODES["usage"],
+                )
             deadline = time.monotonic() + _LITERAL_DEADLINE_SECONDS
             hits: list[dict] = []
             deadline_exceeded = False
@@ -441,7 +558,13 @@ def create_project_read_tools(
                 re.IGNORECASE if arguments.get("ignore_case") else 0,
             )
         except re.error as exc:
-            return err_response("grep", f"正则表达式非法: {exc}", kind="usage_error")
+            # re.error 的文案描述的是**模型给的 pattern**（如 "unterminated
+            # character set at position 5"），不含服务端路径 —— 模型靠它改参，
+            # 因此保留，但按上限截断（文案会回灌给模型）。
+            return err_response(
+                "grep", _bounded_text(f"正则表达式非法: {exc}"), kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
 
         deadline = time.monotonic() + _LITERAL_DEADLINE_SECONDS
         hits = []
@@ -830,11 +953,13 @@ def create_project_execute_tool(
         if not isinstance(task_raw, str) or not task_raw.strip():
             return err_response(
                 "execute", "task 不能为空", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
         context_raw = arguments.get("context", "")
         if not isinstance(context_raw, str):
             return err_response(
                 "execute", "context 必须是字符串", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
 
         # 从 context 提取取消令牌，转换为 stop_event 传给 HarnessRunner
@@ -858,6 +983,7 @@ def create_project_execute_tool(
                 "execute",
                 "该项目正在执行另一个任务，请等待完成后重试",
                 kind="error",
+                code=PROJECT_TOOL_CODES["state"],
             )
 
         def _release():
@@ -904,6 +1030,7 @@ def create_project_execute_tool(
                 "execute",
                 "执行器未配置，请联系管理员设置 harness 路径",
                 kind="error",
+                code=PROJECT_TOOL_CODES["internal"],
             )
 
         from mini_deerflow.harness_runner import (
@@ -959,12 +1086,13 @@ def create_project_execute_tool(
                 body = {
                     "ok": False,
                     "status": "stopped",
+                    "code": PROJECT_TOOL_CODES["execute_stopped"],
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
                     "verification": _build_verification(result),
                     "changes": changes,
-                    "error": result.error or "任务被停止",
+                    "error": _executor_error(result.error, "任务被停止"),
                     "tool_events": [
                         {"name": e["name"], "duration_s": e.get("duration_s")}
                         for e in result.tool_events
@@ -976,6 +1104,7 @@ def create_project_execute_tool(
                 body = {
                     "ok": False,
                     "status": "timeout",
+                    "code": PROJECT_TOOL_CODES["execute_timeout"],
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
@@ -992,25 +1121,33 @@ def create_project_execute_tool(
             elif result.status == STATUS_LAUNCH_FAILED:
                 return err_response(
                     "execute",
-                    f"执行器启动失败：{result.error}",
+                    _executor_error(result.error, "执行器启动失败，请检查执行器配置"),
                     kind="error",
+                    code=PROJECT_TOOL_CODES["launch_failed"],
                 )
             elif result.status == STATUS_PROTOCOL_ERROR:
                 return err_response(
                     "execute",
-                    f"执行器协议错误：{result.error}（{result.unmapped_lines} 行非法输出）",
+                    _executor_error(
+                        result.error,
+                        f"执行器协议错误（{result.unmapped_lines} 行非法输出）",
+                    ),
                     kind="error",
+                    code=PROJECT_TOOL_CODES["protocol_error"],
                 )
             else:  # STATUS_FAILED / unknown
                 body = {
                     "ok": False,
                     "status": result.status,
+                    "code": PROJECT_TOOL_CODES["execute_failed"],
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
                     "verification": _build_verification(result),
                     "changes": changes,
-                    "error": result.error or f"执行失败（{result.status}）",
+                    "error": _executor_error(
+                        result.error, f"执行失败（{result.status}）"
+                    ),
                     "tool_events": [
                         {"name": e["name"], "duration_s": e.get("duration_s")}
                         for e in result.tool_events

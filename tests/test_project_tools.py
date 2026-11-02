@@ -165,12 +165,12 @@ def test_glob_越界模式被拒(repo):
 
 
 def test_路径不可解析_错误响应不含绝对路径(repo, monkeypatch):
-    """原始 OSError 的 message 可能带绝对路径 —— 客户端只应拿到受控说明。
+    """原始 OSError 的 message 可能带绝对路径 —— 对外只给受控说明。
 
-    `Path.resolve()` 失败时（权限/IO 错误），POSIX 上 OSError 的 str 形如
-    "[Errno 13] Permission denied: '/home/user/secret'"。这个错误响应会
-    经 safe_failure_detail 进客户端 SSE 事件，因此绝对路径必须留在
-    服务端日志里，不能进响应。
+    `Path.resolve()` 失败时（权限/IO 错误），OSError 的 str 形如
+    "[Errno 13] Permission denied: '/home/user/secret'"。这个错误**结果**
+    会作为 tool_result 回灌给模型，因此绝对路径必须留在服务端日志里，
+    不能进结果。
     """
     tools, ctx = _make_tools(repo)
     secret = str(repo / "secret" / "token.txt")
@@ -191,6 +191,75 @@ def test_路径不可解析_错误响应不含绝对路径(repo, monkeypatch):
     body = json.dumps(result, ensure_ascii=False)
     assert secret not in body
     assert "无法解析" in body
+
+
+# ---------------------------------------------------------------------------
+# F1：原始异常不得进入工具结果（结果会回灌给模型）
+# ---------------------------------------------------------------------------
+
+
+def test_read_file_读取失败_结果不含绝对路径(repo, monkeypatch):
+    """读文件失败时，原始 OSError（带绝对路径）只进日志，不进结果。"""
+    tools, ctx = _make_tools(repo)
+    secret = str(repo / "src" / "app.py")
+    original_open = Path.open
+
+    def _boom(self, *args, **kwargs):
+        if self.name == "app.py":
+            raise OSError(f"[Errno 13] Permission denied: {secret}")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _boom)
+
+    result = _call(tools["project_read_file"], {"path": "src/app.py"}, ctx)
+    assert result["ok"] is False
+    body = json.dumps(result, ensure_ascii=False)
+    assert secret not in body
+    # 必要的**相对**路径要给（模型改参要用）
+    assert "src/app.py" in body
+    assert result["code"] == "PROJECT_TOOL_FILE_UNREADABLE"
+
+
+def test_正常读取_不受错误处理改动影响(repo):
+    """对照：正常路径仍然返回内容，且没有 code 字段。"""
+    tools, ctx = _make_tools(repo)
+    result = _call(tools["project_read_file"], {"path": "src/app.py"}, ctx)
+    assert result["ok"] is True
+    assert "def main" in result["content"]
+    assert "code" not in result
+
+
+# ---------------------------------------------------------------------------
+# F2：项目工具业务失败 → ok:false 结果 + 稳定码，模型可改参重试
+# ---------------------------------------------------------------------------
+
+
+def test_业务失败_不抛异常_结果含稳定码(repo):
+    """非项目会话属**可恢复**的业务失败：转成 ok:false，不让整轮失败。"""
+    tools, ctx = _make_tools(repo)
+    # 让会话失去项目绑定 → 触发 ProjectToolStateError
+    ctx.thread_id = "not-a-project-thread"
+
+    result = _call(tools["project_read_file"], {"path": "src/app.py"}, ctx)
+    assert result["ok"] is False
+    assert result["code"] == "PROJECT_TOOL_STATE_ERROR"
+    assert "kind" in result
+
+
+def test_业务失败后改参重试_可以成功(repo):
+    """对照：业务失败是**可恢复**的 —— 改参后重试能成功。"""
+    tools, ctx = _make_tools(repo)
+
+    # 第一次：路径不存在（usage 错误，模型改参）
+    first = _call(tools["project_read_file"], {"path": "src/nope.py"}, ctx)
+    assert first["ok"] is False
+    assert first["code"] == "PROJECT_TOOL_USAGE_ERROR"
+    assert first["kind"] == "usage_error"
+
+    # 改参重试：换成存在的相对路径 → 成功
+    second = _call(tools["project_read_file"], {"path": "src/app.py"}, ctx)
+    assert second["ok"] is True
+    assert "def main" in second["content"]
 
 
 def test_read_file_符号链接指向仓库外被拒(tmp_path, repo):
@@ -546,11 +615,46 @@ def test_execute_runner_run_抛异常_锁仍释放(tmp_path):
 
     # runner.run() 抛异常 → 锁必须已释放
     result = registry.execute("project_execute", {"task": "crash"}, context=_ctx("t-leak-1"))
-    assert "子进程崩溃" in result, f"异常应正常传播: {result}"
+    # F1：原始异常文本**不再**进入工具结果（结果会回灌给模型），
+    # 对外只给受控说明 + 稳定错误码。
+    assert "子进程崩溃" not in result, f"原始异常不得外泄: {result}"
+    payload = json.loads(result)
+    assert payload["ok"] is False
+    assert payload["code"] == "PROJECT_TOOL_INTERNAL_ERROR"
     # 锁已由 finally 释放，同一 project_id 可再次获取
     result2 = registry.execute("project_execute", {"task": "retry"}, context=_ctx("t-leak-1"))
     # 第二次拿到的是"子进程崩溃"（runner.run() 又抛了），而不是"请等待"（锁未泄漏）
     assert "请等待" not in result2, f"锁泄漏：第二次调用被前一次持有的锁挡住: {result2}"
+
+
+def test_execute_内部异常_结果不含原始异常(tmp_path):
+    """执行器内部异常（含绝对路径）不得进入工具结果。"""
+    registry = create_default_registry()
+    thread_store = InMemoryThreadStore()
+    project_store = InMemoryProjectStore()
+
+    project = project_store.create("p-secret", "泄漏测试", str(tmp_path))
+    project.workspace_path = tmp_path
+    project_store.save(project)
+    thread_store.create("t-secret-1", "p-secret")
+
+    secret = str(tmp_path / "internal" / "traceback.txt")
+    mock_runner = MagicMock()
+    mock_runner.is_configured = True
+    mock_runner.run.side_effect = RuntimeError(f"内部细节泄漏：{secret}")
+
+    tool = create_project_execute_tool(
+        thread_store, project_store, runner=mock_runner, get_lock=None,
+    )
+    registry.register(tool)
+
+    result = registry.execute(
+        "project_execute", {"task": "crash"}, context=_ctx("t-secret-1")
+    )
+    assert secret not in result, f"绝对路径不得进入工具结果: {result}"
+    payload = json.loads(result)
+    assert payload["ok"] is False
+    assert payload["code"] == "PROJECT_TOOL_INTERNAL_ERROR"
 
 
 def test_execute_锁按_project_id_隔离(tmp_path):

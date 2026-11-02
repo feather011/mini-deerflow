@@ -30,7 +30,13 @@ def ok_response(**payload: Any) -> str:
     return json.dumps({"ok": True, **payload}, ensure_ascii=False)
 
 
-def err_response(action: str, error: str, *, kind: str = "error") -> str:
+def err_response(
+    action: str,
+    error: str,
+    *,
+    kind: str = "error",
+    code: str | None = None,
+) -> str:
     """失败响应。
 
     `error` 恒为文案、`kind` 恒为类型，**两者是并列的两个键**：
@@ -40,11 +46,23 @@ def err_response(action: str, error: str, *, kind: str = "error") -> str:
     - `usage_error`：参数不合法，模型改一下就能重试
     - `error`：领域错误，见文案
     - `index_error`：索引落后且补齐失败
+
+    `code` 是**稳定错误码**（可选）：同一类失败永远是同一个码，调用方
+    按码分支即可，不必解析文案。没有码时该键**不出现**（不是 null），
+    以免调用方误以为存在一个空码。
+
+    注意：`error` 文案会**回灌给模型**（工具结果是模型的输入），
+    因此不得包含服务端绝对路径或原始异常文本。
     """
-    return json.dumps(
-        {"ok": False, "action": action, "error": error, "kind": kind},
-        ensure_ascii=False,
-    )
+    payload: dict[str, Any] = {
+        "ok": False,
+        "action": action,
+        "error": error,
+        "kind": kind,
+    }
+    if code:
+        payload["code"] = code
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def context_attr(context: object, name: str) -> str | None:
