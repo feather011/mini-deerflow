@@ -29,6 +29,13 @@
 - 推送 `model.token` 事件（含增量文本 delta），由 RunEventMiddleware 透传到 Broker
 - `decide()` 保持不变（向后兼容）
 
+BACKEND-01-A 变更（system 协议修复）：
+- `role="system"` 的消息走 Anthropic 协议的**顶层 `system` 字段**，不再放进
+  `messages` 数组（协议要求 system 不在 messages 里）
+- 过去适配器把 system 当"不支持的角色"直接抛错 —— 结果是：只要线程里有
+  摘要 / 任务笔记 / 记忆 / Skill 上下文，请求在**发送前**就失败，那些
+  上下文**从来没有真的发给过模型**
+
 不做的事：
 - 不在日志、repr、异常消息中输出 API Key
 - 不在模块 import 期创建客户端或发起网络请求（客户端在 __init__ 创建，
@@ -87,8 +94,27 @@ def _paired_tool_indices(messages: list[Message]) -> set[int]:
     return paired
 
 
+def extract_system_prompt(messages: list[Message]) -> str | None:
+    """取出全部 `role="system"` 消息，按原始顺序拼成顶层 system 字符串。
+
+    Anthropic 协议的 system 不在 `messages` 数组里，而是顶层 `system=` 字段；
+    没有 system 消息时返回 `None`（此时请求**不带** system 字段，形状与
+    没有这套逻辑之前完全一致）。
+
+    上游 `ContextAssembler` 会产出**多条**独立的 system 消息（摘要段 /
+    任务笔记段 / 记忆段 / Skill 段），顺序即注入顺序，这里用空行拼接以
+    保持各段边界可读。
+    """
+    parts = [m.content for m in messages if m.role == "system" and m.content.strip()]
+    return "\n\n".join(parts) if parts else None
+
+
 def provider_messages_from(messages: list[Message]) -> list[dict[str, Any]]:
     """把内部 Message 列表转换为供应商 messages 格式（含工具往返）。
+
+    **不包含** `role="system"` 的消息：system 走 Anthropic 协议的**顶层
+    `system=` 字段**，不在 `messages` 数组里，由 `extract_system_prompt`
+    单独取出。
 
     三种形态：
     1. 携带 `tool_call_id` + `tool_name` 的 assistant
@@ -137,7 +163,11 @@ def provider_messages_from(messages: list[Message]) -> list[dict[str, Any]]:
             })
             continue
 
-        # 3) 普通文本消息（含孤立的历史 tool 结果）
+        # 3) system 消息：跳过，由 extract_system_prompt 单独放进顶层字段
+        if message.role == "system":
+            continue
+
+        # 4) 普通文本消息（含孤立的历史 tool 结果）
         role = _PROVIDER_ROLES.get(message.role)
         if role is None:
             raise ModelError(f"不支持的消息角色: {message.role!r}")
@@ -248,6 +278,11 @@ class AnthropicCompatModel:
         anthropic_tools = anthropic_tools_from(tools)
 
         extra: dict[str, Any] = {}
+        # 摘要 / 任务笔记 / 记忆 / Skill 上下文 —— 协议要求走顶层 system 字段。
+        # 没有 system 消息时不传该字段，请求形状与 21A 完全一致。
+        system_prompt = extract_system_prompt(messages)
+        if system_prompt is not None:
+            extra["system"] = system_prompt
         if anthropic_tools:
             # 只有本轮提供工具时才带上 tools 字段；不传时行为与 21A 完全一致，
             # 因此旧的纯文本路径不受影响。
@@ -416,6 +451,11 @@ class AnthropicCompatModel:
         anthropic_tools = anthropic_tools_from(tools)
 
         extra: dict[str, Any] = {}
+        # 与 decide() 一致：system 必须同时进流式请求，否则流式路径下
+        # 摘要/记忆/Skill 上下文同样会丢失。
+        system_prompt = extract_system_prompt(messages)
+        if system_prompt is not None:
+            extra["system"] = system_prompt
         if anthropic_tools:
             extra["tools"] = anthropic_tools
             extra["tool_choice"] = {"type": "any"}
