@@ -164,6 +164,35 @@ def test_glob_越界模式被拒(repo):
     assert result["kind"] == "usage_error"
 
 
+def test_路径不可解析_错误响应不含绝对路径(repo, monkeypatch):
+    """原始 OSError 的 message 可能带绝对路径 —— 客户端只应拿到受控说明。
+
+    `Path.resolve()` 失败时（权限/IO 错误），POSIX 上 OSError 的 str 形如
+    "[Errno 13] Permission denied: '/home/user/secret'"。这个错误响应会
+    经 safe_failure_detail 进客户端 SSE 事件，因此绝对路径必须留在
+    服务端日志里，不能进响应。
+    """
+    tools, ctx = _make_tools(repo)
+    secret = str(repo / "secret" / "token.txt")
+    original_resolve = Path.resolve
+
+    def _boom(self, *args, **kwargs):
+        # 只让目标文件解析失败；仓库根目录的 resolve 必须正常，
+        # 否则先在 _bound_repo 里就炸了，测不到 _resolve_in_repo 这条路径。
+        if self.name == "app.py":
+            raise OSError(f"[Errno 13] Permission denied: {secret}")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", _boom)
+
+    result = _call(tools["project_read_file"], {"path": "src/app.py"}, ctx)
+    assert result["ok"] is False
+    assert result["kind"] == "usage_error"
+    body = json.dumps(result, ensure_ascii=False)
+    assert secret not in body
+    assert "无法解析" in body
+
+
 def test_read_file_符号链接指向仓库外被拒(tmp_path, repo):
     outside = tmp_path / "secret.txt"
     outside.write_text("secret", encoding="utf-8")

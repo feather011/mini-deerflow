@@ -50,6 +50,10 @@
 未知工具、工具异常、多 `tool_use` 拒绝、tool→result→final 两轮闭环、
 Budget/max_steps、失败不提交、FakeModel 回归、CLI/API/SSE 事件。
 
+> ⚠️ 上面的「多 `tool_use` 拒绝」已被 BACKEND-01-B（2026-11-02）**反转**：
+> 现在一次响应里的多个 tool_use 会被**全部保留**并按顺序执行，不再整轮拒绝。
+> 此处的原文与测试数字保留不改，以记录当时（Phase 21–23）的真实状态。
+
 本轮修掉的两处真实缺口（都是「包装器丢 `tools` 导致真实模型看不到工具」）：
 
 - `tests/e2e_server.py::SlowFakeModel` 不转发 `tools`
@@ -202,6 +206,9 @@ smoke 实测：
 - **已实现 token streaming** —— 模型逐 token 推送 SSE 事件，前端按 token 增量渲染 assistant 消息
 - **无远程 MCP** —— 只支持本地 stdio
 - **无并行工具调用** —— 一次一个 `tool_use`
+  - ⚠️ **此条已被 BACKEND-01-B（2026-11-02）反转**：现在支持「一次响应包含
+    多个工具调用，按顺序执行」（协议上一个 assistant turn 带多个 tool_use）。
+    原文保留不改，以记录当时的真实状态；详见 BACKEND-01 章节。
 - **单实例** —— SQLite 与进程内协调器都是单实例语义
 
 ---
@@ -3965,3 +3972,140 @@ E2E 全部用 `page.route` 本地夹具（注入 `/api/threads/{id}` 与 SSE 事
   未做增量解析）。长回复在流式阶段有重复解析开销，首版未优化。
 - 复制按钮依赖 `navigator.clipboard`：非安全上下文下不可用，此时按钮如实显示
   「复制失败」，不谎称已复制。
+
+---
+
+#### BACKEND-01：system 协议修复 / 多工具调用 / 安全错误展示（2026-11-02）
+
+- 任务 ID：BACKEND-01
+- 会话标识：claude-worker-20261010-2015
+- 目标版本：基线 `bd261a4`（分支 `automation/tool-07`）
+- 当前状态：**代码已改、定向测试与相关回归已跑（新增用例全绿）、用户已确认收尾决定；未推送**
+- 更新时间：2026-11-02
+- 范围：`src/mini_deerflow/` 的模型适配层、Agent 工具循环、SSE 错误展示；不改前端、不改 SSE 协议形状、不改消息存储与去重
+
+**一、system 协议修复（Anthropic 顶层 `system` 字段）**
+
+- 任务 ID：BACKEND-01-A
+- 根因：HEAD 的 `anthropic_compat_model._PROVIDER_ROLES` 只有
+  `{user, assistant, tool}`，`role="system"` 落到普通分支直接抛
+  `ModelError("不支持的消息角色: 'system'")`。两个真实后果：
+  1. `context_assembler.py:459-465` 产出的摘要 / 任务笔记 / 记忆 / Skill 四段
+     上下文，以及 `agent.py:201/219` 的记忆与 Skill 上下文，**从未真正发给模型**
+     —— 请求在发送前就失败；
+  2. `context_compactor.py:228` 的摘要请求第一条消息就是 system，**在真实
+     Anthropic 兼容 provider（minimax / mimo）下摘要必然失败**。
+- 改动：`extract_system_prompt()` 把全部 system 消息按原顺序用空行拼成顶层
+  `system` 字段；`provider_messages_from()` 跳过 system（不进 `messages` 数组）；
+  `decide()` 与 `stream_decide()` 两条路径都带上该字段。无 system 时请求形状与
+  21A 完全一致（不传该字段），旧的纯文本路径不受影响。
+- 契约变化：过去「带 system 的请求在发送前报错」是既有行为，本轮**反转**该行为。
+
+**二、多工具调用（一次响应包含多个 tool_use）**
+
+- 任务 ID：BACKEND-01-B
+- 术语约定：本轮统一用「**一次响应包含多个工具调用，按顺序执行**」，
+  **不再用「并行执行」** —— 执行是**串行**的（同一轮里前一个工具可能修改仓库，
+  后一个必须看到修改后的结果）。
+- 改动：新增领域类型 `ToolCalls`（`models.py`）承载多个调用，配套类型别名
+  `Decision = ToolCall | ToolCalls | FinalAnswer`；`_parse_decision()` 遇多个
+  tool_use 时**全部保留**（返回 `ToolCalls`）而不再抛 `ModelProtocolError`；
+  `Agent` 与 `_BudgetAwareAgent` 按顺序逐个执行、结果按 call_id 配对后回灌；
+  `provider_messages_from()` 把连续的 N 个 tool_use assistant 合成**一个**
+  assistant turn、配对的 N 个结果合成**一个** user turn（供应商协议要求）。
+- 契约变化：过去「一次响应给出多个 tool_use → 抛 ModelProtocolError 整轮失败」，
+  本轮**反转**该行为（原始意图「不静默丢弃」得以保留）。
+- 失败语义（本轮明确保留，**未**新增失败隔离）：一次响应多个调用时，
+  **首个调用失败即整轮失败**，后续调用不执行，失败也不作为结果回灌给模型。
+  理由：工具之间可能有依赖（前者改了仓库后者的结果才有意义），静默跳过会让
+  模型拿到一份「看起来都跑了」的错误上下文。
+
+**三、安全错误展示**
+
+- 任务 ID：BACKEND-01-C
+- 改动 1（路径泄露）：`project_tools._resolve_in_repo()` 捕获 `Path.resolve()`
+  的 `OSError` 后，不再把原始异常文本放进 `ProjectToolUsageError`——POSIX 上该
+  文本形如 `[Errno 13] Permission denied: '/home/user/secret'`，会经
+  `safe_failure_detail` 直接进客户端 SSE 事件。改为：客户端只拿受控说明
+  「路径无法解析（路径不可访问）」，**原始异常与绝对路径留在服务端日志**
+  （`mini_deerflow.project_tools` 的 warning + traceback）。
+- 改动 2（工具错误展示）：`tool.failed` 事件改为
+  `工具 <名> 调用失败（<稳定错误码>）：<安全说明>`。错误码为稳定字面量：
+  `TOOL_NOT_FOUND` / `TOOL_NOT_ALLOWED` / `TOOL_AUTHORIZATION_DENIED` /
+  `TOOL_EXECUTION_FAILED` / `PROJECT_TOOL_USAGE_ERROR` /
+  `PROJECT_TOOL_STATE_ERROR`。**绝不透传 `str(exc)`** —— `ToolExecutionError`
+  的 message 内嵌 handler 的原始异常（可能是路径、内部栈或凭据片段）。
+  未识别的异常只给类名。
+
+**四、类型标注**
+
+- 任务 ID：BACKEND-01-D
+- `decide()` / `stream_decide()` / Agent 内部闭包 / `_BudgetAwareAgent.decide()`
+  的返回标注统一改为 `Decision`。仓库**未**引入整套类型检查工具（本轮明确不做），
+  这些标注属文档级约束。
+
+**验证证据**
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 定向测试（本轮改动） | `pytest tests/test_anthropic_compat_model.py tests/test_tool_loop_21b.py tests/test_api_runs_stream_components.py tests/test_project_tools.py tests/test_harness_windows_console.py -q` | **178 passed / 1 failed / 1 skipped**；1 failed 与 1 skipped 均为既有项（见下） |
+| Agent / Context / Subagent 回归 | `pytest tests/test_agent*.py tests/test_context_*.py tests/test_subagent_*.py tests/test_phase21b_events.py tests/test_memory_context.py tests/test_skill_context.py -q` | **544 passed / 5 failed**，5 项与 HEAD 基线逐项一致 |
+| API / SSE / MCP / 模型配置 / Lead 回归 | `pytest tests/test_api_runs*.py tests/test_mcp*.py tests/test_tool05_mcp_integration.py tests/test_model_*.py tests/test_lead_agent_{budget,planner,planner_budget}.py -q` | **401 passed / 11 failed**，11 项与 HEAD 基线逐项一致 |
+
+**既有失败（HEAD 基线同样失败，与本轮改动无关）**
+
+基线对照方式：`git archive HEAD src tests` 导出 HEAD 版副本，用
+`PYTHONPATH=<基线>/src` 复跑同一批用例，确认失败项与断言完全一致
+（同一测试、同一断言、同一行号）。
+
+| 失败用例 | 原因 |
+|---|---|
+| `test_tool_loop_21b.py::Test预算边界::test_budget_耗尽时抛出` | `Agent` 只在**流式**路径（`_do_model_call_stream`）消费 `max_model_calls`；无 `stream_decide` 的模型（FakeModel 等）走非流式路径，额度**从不消费** → 超限不报错。生产用 `AnthropicCompatModel`（有 `stream_decide`）不受影响。**既有缺口，本轮未扩大范围修** |
+| `test_context_agent.py::test_summary_uses_separate_budget_from_decisions` | 既有失败（assert 0 == 1），基线一致 |
+| `test_subagent_allowed_tools.py` 3 项（MCP 边界隔离 / 同时命中 MCP 与内置 / agent 层级） | 既有失败，基线一致 |
+| `test_phase21b_events.py::test_工具失败_发_tool_failed_再以终态为_run_failed` | 失败点在 `tools_seen` 断言（第 207 行，模型未收到 `boom` 的 ToolSpec），**不在**本轮改动的 tool.failed 文案上；该用例的 tool.failed / tool.completed / run.failed 断言均通过 |
+| `test_mcp.py` 11 项 | MCP 服务连接类既有失败（`MCPError: Connection closed` / `ToolNotFoundError`），基线一致 |
+
+**本轮新增/改写的用例**
+
+- `test_anthropic_compat_model.py`：新增假流客户端 `FakeStream`；system 用例改为
+  **实际调用 `decide()` / `stream_decide()` 并捕获真正发出去的请求参数**，覆盖
+  顶层 `system` 字段、多段拼接顺序、空白段忽略、无 system 时请求不变
+  （流式与非流式各一套）；`extract_system_prompt` 另有直接单测。
+- `test_tool_loop_21b.py`：失败语义用例改名
+  `test_多工具调用_首个失败则整轮失败_后续不执行`，并**新增断言第二个
+  handler 完全未被执行**（用记账 handler 记录执行次数）。
+- `test_api_runs_stream_components.py`：新增 8 项，覆盖工具错误的稳定错误码、
+  工具名透出、原始 message 不放行、沿 `__cause__` 链取到项目工具的受控原因。
+- `test_project_tools.py`：新增 `test_路径不可解析_错误响应不含绝对路径`。
+
+**明确未做**
+
+- 未引入 mypy / pyright / ruff（类型标注属文档级约束，无工具强制）。
+- 未修 `lead_agent/planner.py:763` 的既有类型检查失效
+  （`getattr(response, "content", "")` 让 `isinstance(content, str)` 恒真，
+  「模型返回不是 FinalAnswer」分支永不触发）—— **记录为后续事项，本轮不扩范围**。
+- 未新增工具失败隔离（按决定保留「首个失败即整轮失败」）。
+- 未做语法高亮 / 前端改动 / SSE 协议形状变更。
+
+**已知限制**
+
+- 错误展示只覆盖已识别的异常家族；未识别的工具异常只给类名（不放行 message）。
+- `TOOL_AUTHORIZATION_DENIED` 会带上内部 `reason_code`（如 `tool_disabled`）；
+  该码是稳定字面量，不含敏感信息，但**不是**面向终端用户的文案。
+- 路径泄露的修复只覆盖 `_resolve_in_repo` 这一处 `Path.resolve()` 失败点；
+  其他可能携带绝对路径的异常文本仍按既有保守策略**不展示**。
+
+**后续事项（不在本轮范围）**
+
+1. `lead_agent/planner.py` 的类型检查失效（非 FinalAnswer 分支不可达）。
+2. `Agent` 非流式路径不消费 `max_model_calls`（FakeModel 等场景超限不报错）。
+3. `docs/PROGRESS.md` 上文「明确的真实限制」里的「无并行工具调用 —— 一次一个
+   `tool_use`」已被本轮反转（见该节的补充说明）。
+
+**提交**
+
+- 分三个提交：`system 协议修复` / `多工具调用` / `安全错误展示`；
+  提交前已核对三者依赖（`Decision` 类型随「多工具调用」引入，故类型标注的
+  同步放在该提交内；「安全错误展示」依赖前两者的错误类型，但不改它们的代码）。
+- **未推送**（用户本轮未授权）。

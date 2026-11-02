@@ -235,7 +235,15 @@ def create_project_read_tools(
             # 随后的边界检查自然拦下。
             candidate = repo.joinpath(*parts).resolve() if parts else repo
         except OSError as exc:
-            raise ProjectToolUsageError(f"{what}无法解析: {exc}") from None
+            # 原始 OSError 的 message 可能带绝对路径（POSIX 上形如
+            # "[Errno 13] Permission denied: '/home/user/secret'"），
+            # 而本异常会经 safe_failure_detail 直接进客户端 SSE 事件。
+            # 因此**客户端只拿受控说明**，原始异常与绝对路径留在服务端日志。
+            import logging
+            logging.getLogger("mini_deerflow.project_tools").warning(
+                "路径无法解析（%s）: %s", what, exc, exc_info=True
+            )
+            raise ProjectToolUsageError(f"{what}无法解析（路径不可访问）") from None
         if not _within(candidate, repo):
             raise ProjectToolUsageError(f"{what}越出仓库绑定目录（符号链接同样不允许）")
         return candidate
