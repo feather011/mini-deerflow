@@ -100,6 +100,32 @@ def _parse_protocol_line(line: str) -> dict:
     return payload
 
 
+def _windows_creation_flags() -> int:
+    """Windows 下启动 harness 子进程用的 creationflags。
+
+    **刻意不包含 `DETACHED_PROCESS`**：Windows 规定 `CREATE_NO_WINDOW`
+    与 `DETACHED_PROCESS` 同时指定时会被**忽略**（MSDN："This flag is
+    ignored if … used with either CREATE_NEW_CONSOLE or DETACHED_PROCESS"）。
+    只留 `DETACHED_PROCESS` 时子进程会新分配一个可见控制台 —— 桌面弹出
+    黑色命令行窗口（实测：uv venv 的 `python.exe` 是转发器，还会再 fork
+    出真正的解释器，`DETACHED` 只作用在转发器那层，第二层自己分配控制台
+    并弹出窗口，标题恰是 venv 的 python 路径）。
+
+    去掉 `DETACHED_PROCESS` 不影响回收：Windows 上整棵进程树的回收靠
+    `_create_kill_on_close_job` 的 **Job Object**
+    （`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，成员身份由后代继承、不依赖
+    PPID 链），与控制台继承/分配无关。
+
+    非 Windows 返回 0（POSIX 侧靠 `start_new_session=True` 做会话隔离）。
+    """
+    if sys.platform != "win32":
+        return 0
+    return (
+        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+
+
 def _posix_group_alive(pgid: int) -> bool:
     """进程组是否还有成员（含已忽略 SIGTERM 的后代）。
 
@@ -464,16 +490,10 @@ class HarnessRunner:
             try:
                 # R1：进程组隔离（让 taskkill /T /F / killpg 精确定向回收）
                 #   - POSIX: start_new_session=True → 新会话组长
-                #   - Windows: CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW
-                # DETACHED_PROCESS 让子进程脱离父 console，CREATE_NO_WINDOW
-                # 抑制启动时一闪而过的命令行窗口。
-                creationflags = 0
-                if sys.platform == "win32":
-                    creationflags = (
-                        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                        | getattr(subprocess, "DETACHED_PROCESS", 0)
-                        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                    )
+                #   - Windows: CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+                #     （**不带 DETACHED_PROCESS** —— 会让 CREATE_NO_WINDOW
+                #     被忽略并弹出可见控制台窗口，详见 _windows_creation_flags）
+                creationflags = _windows_creation_flags()
                 process = subprocess.Popen(
                     argv,
                     cwd=str(repo_path),

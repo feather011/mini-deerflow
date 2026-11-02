@@ -3805,6 +3805,83 @@ A∩B1 → **exit 1**（新引入 1 条，即已记录的偶发超时用例）�
 
 **本轮状态**：代码已提交并推送，复审依据与浏览器结果已写入 PR #6；
 **仍不是验收通过**（真实模型聊天未验证），合并待用户最终决定。
+
+---
+
+#### TOOL-07 修复：Windows 工具执行时弹出黑色控制台窗口（2026-10-29）
+
+- 任务 ID：TOOL-07-BUG-CONSOLE
+- 会话标识：claude-worker-20261010-2015
+- 目标版本：基线 `9fa5216`（分支 `automation/tool-07`）
+- 当前状态：**代码已改、自动化测试已补、真实链路已验证；未提交、未推送**
+- 更新时间：2026-10-29
+- 范围：**只改 `src/mini_deerflow/harness_runner.py` 一处 + 新增 1 个测试文件**
+
+**现象**
+
+真实项目会话里，工具执行期间桌面弹出黑色控制台窗口，标题为
+`D:\项目解读\Deerflow\mini-deerflow\.venv\Scripts\python.exe`。
+
+**根因（两层，均本机实测复现）**
+
+1. **标志位互斥**：`src/mini_deerflow/harness_runner.py` 原先 Windows 侧给的是
+   `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW`。MSDN 规定
+   `CREATE_NO_WINDOW` 与 `DETACHED_PROCESS` 同时指定时**会被忽略**
+   （"This flag is ignored if … used with either CREATE_NEW_CONSOLE or
+   DETACHED_PROCESS"）→ 实际只剩 `DETACHED_PROCESS`。原代码注释
+   「CREATE_NO_WINDOW 抑制启动时一闪而过的命令行窗口」**在 Windows 上不成立**。
+2. **uv venv 的双层进程**：`.venv\Scripts\python.exe` 是 262KB 转发器，会再 fork
+   出真正的解释器（`…\uv\python\cpython-3.12.12\python.exe`，PE subsystem =
+   `WINDOWS_CUI`）。`DETACHED_PROCESS` 只作用在转发器那一层；第二层解释器发现
+   无可继承的控制台，就自己新分配一个 → 弹出可见窗口，标题取自第一层 argv[0]
+   （即 venv 的 python 路径，与截图字面一致）。
+
+**改动**
+
+抽出模块级 `_windows_creation_flags()`，Windows 侧只给
+`CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`，**去掉 `DETACHED_PROCESS`**；
+非 Windows 返回 0（POSIX 侧仍靠 `start_new_session=True`）。
+
+去掉 `DETACHED_PROCESS` **不影响回收**：Windows 上整棵进程树的回收靠
+`_create_kill_on_close_job` 的 **Job Object**
+（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，成员身份由后代继承、不依赖 PPID 链），
+与控制台继承/分配无关。
+
+**验证证据**
+
+| 项 | 结果 |
+|---|---|
+| 新增 `tests/test_harness_windows_console.py` | **4 passed**（Windows 专属，非 win32 自动 skip） |
+| 旧标志在同等断言下 | 会失败（旧值 ≠ 期望组合，且含 `DETACHED_PROCESS`） |
+| `tests/test_tool07_process_tree_recovery.py`（Job Object 回收 5 项） | **5 passed**，与 HEAD 基线一致 |
+| `tests/test_tool07_harness_permission_e2e.py` | **3 passed** |
+| `tests/test_harness_runner_integration.py` | 7 failed / 7 passed —— **与 HEAD 基线完全一致**（失败项是子进程打真实 API 报 401 的既有问题，与本改动无关；基线对照用 `PYTHONPATH` 指向 HEAD 版 `src` 复跑得到同样 7 项失败） |
+| **真实项目会话**（后端 `127.0.0.1:8000`，provider=minimax） | harness 真实执行 `write_file` / `bash(pwd)` / `bash(ls)` / `read_file` 共 4 次工具调用，`hello_from_harness.txt` 真实落盘（11 字节），`run.completed` |
+| **窗口监视**（Win32 `EnumWindows` 枚举 `ConsoleWindowClass`，全程 5 分钟覆盖真实会话） | 期间新出现控制台窗口 **0** 个，可见窗口 **0** 个 |
+| **修复前后对照**（`scripts/console_popup_control.py`，同一解释器、只换标志） | 旧标志 → **POPUP**（窗口标题正是 `.venv\Scripts\python.exe`）；新标志 → **NO-POPUP** |
+
+**新增文件**
+
+- `tests/test_harness_windows_console.py` —— 4 项，锁定标志位组合（防「顺手加回
+  `DETACHED_PROCESS`」）
+- `scripts/watch_consoles.py` —— 窗口枚举监视器（诊断用）
+- `scripts/console_popup_control.py` —— 修复前后对照（诊断用）
+
+**明确未做**
+
+- 未改 `sandbox_command.py` 的 `Popen`（无 `creationflags`）：该路径只在 CLI
+  `--sandbox-root` 下用，API 生产路径未接入，本轮不扩范围。
+- 未改用 uv 基础解释器（会改变子进程的包解析路径，风险更大）。
+- 未改 `harnessagent` 仓库（另一个 repo，且实测不是弹窗来源：它内部的
+  `bash` 工具单独跑不弹窗）。
+- **未 commit / 未 push**（用户本轮未授权；工作区另有并行 tool_use /
+  system-role / 错误可观测性等改动，需分开提交）。
+
+**已知限制**
+
+- 真实会话验证覆盖的是「项目会话 + harness 派发」这一条链路；普通会话
+  不拉起 harness 子进程，天然无此现象（普通会话实测同样 0 窗口）。
+
 ---
 
 #### FE-01：聊天消息 Markdown 渲染与排版优化（2026-10-29）
