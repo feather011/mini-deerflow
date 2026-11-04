@@ -59,7 +59,12 @@ from mini_deerflow.tool_authorization import ToolPolicyRegistry
 from mini_deerflow.middleware import (  # noqa: E402, F401
     Budget as SubagentBudget,
     BudgetExceededError,
+    ChildBudget,
 )
+
+# 预算既可以是 Budget 本体，也可以是 ChildBudget 视图（父子共享 + 局部更严）。
+# 二者接口一致：consume_* 与 max_* 读属性。
+BudgetLike = SubagentBudget | ChildBudget
 
 
 # --- Cancellation Token ---
@@ -98,7 +103,7 @@ class SubagentRunner:
     model: Model
     registry: ToolRegistry
     store: ThreadStore
-    budget: SubagentBudget
+    budget: BudgetLike
     cancellation_token: CancellationToken
     # 用于 Trace 关联
     parent_run_id: str = ""
@@ -188,6 +193,11 @@ class SubagentRunner:
                 run_id=self.run_id,
             )
 
+        except _DeadlineExceededError:
+            # 复审 B2：超时是**独立的终态**，不能与主动取消混为一谈，
+            # 也不能被标成 SUCCEEDED（模型在截止时间之后才返回时尤其明显）。
+            return self._mark_timed_out_and_result()
+
         except _CancelledError:
             return self._mark_cancelled_and_result()
 
@@ -250,9 +260,32 @@ class SubagentRunner:
             run_id=self.run_id,
         )
 
+    def _mark_timed_out_and_result(self) -> SubagentResult:
+        """标记超时并返回结果（与主动取消区分开）。"""
+        self._safe_transition(TaskStatus.TIMED_OUT)
+        return SubagentResult.from_task(
+            self.task,
+            output="",
+            error_type="TimeoutError",
+            error_message="任务超时",
+            run_id=self.run_id,
+        )
+
 
 class _CancelledError(Exception):
     """协作取消信号。"""
+    pass
+
+
+class _DeadlineExceededError(Exception):
+    """子任务超时信号。
+
+    复审 B2：超时与「主动取消」是**两种不同的终态** ——
+    - 主动取消（cancellation token）→ `CANCELLED`；
+    - 超过 `timeout_seconds` 的截止时间 → `TIMED_OUT`。
+
+    过去两者共用 `_CancelledError`，超时被标成"被取消"，原因不准确。
+    """
     pass
 
 
@@ -265,7 +298,7 @@ class _CancellableModel:
     """包装 Model，在每次 decide 前检查取消并原子消费 model 预算。"""
     __slots__ = ("_model", "_token", "_budget")
 
-    def __init__(self, model: Model, token: CancellationToken, budget: SubagentBudget) -> None:
+    def __init__(self, model: Model, token: CancellationToken, budget: BudgetLike) -> None:
         self._model = model
         self._token = token
         self._budget = budget
@@ -293,7 +326,7 @@ class _BudgetAwareAgent:
         registry: ToolRegistry,
         store: ThreadStore,
         max_steps: int | None,
-        budget: SubagentBudget,
+        budget: BudgetLike,
         cancellation_token: CancellationToken,
         timeout_seconds: float | None = None,
         allowed_tools: tuple[str, ...] | None = None,
@@ -334,7 +367,7 @@ class _BudgetAwareAgent:
     def _check_deadline(self) -> None:
         """检查是否超时。"""
         if self._deadline is not None and time.monotonic() > self._deadline:
-            raise _CancelledError()
+            raise _DeadlineExceededError()
 
     def run(self, thread_id: str, instruction: str) -> str:
         thread = self._store.get(thread_id)
@@ -402,6 +435,14 @@ class _BudgetAwareAgent:
             else:
                 model_messages = list(working_messages)
             decision = self._model.decide(model_messages, model_tools)
+
+            # 复审 B2：模型调用可能耗时很久 —— 返回后、采纳结果前必须
+            # **复查取消与截止时间**（与步骤开始处同一套信号）。
+            # 否则「模型调用期间越过 deadline」的 FinalAnswer 会被直接采纳，
+            # 超时的子任务被标成 SUCCEEDED —— 超时没有准确收口。
+            if self._token.is_cancelled():
+                raise _CancelledError()
+            self._check_deadline()
 
             if isinstance(decision, FinalAnswer):
                 assistant_message = Message(role="assistant", content=decision.content)
@@ -562,7 +603,7 @@ class SubagentManager:
         parent_task_id: str | None = None,
         depth: int = 1,
         timeout_seconds: float | None = None,
-        budget: SubagentBudget | None = None,
+        budget: BudgetLike | None = None,
         model: Model | None = None,
         registry: ToolRegistry | None = None,
         context_policy: SubagentContextPolicy | None = None,
@@ -580,9 +621,15 @@ class SubagentManager:
         if self._shutdown:
             raise RuntimeError("Manager 已关闭，不能提交新任务")
 
+        # BUDGET-01：子任务额度必须记到**本次运行**的预算上。
+        # `budget` 由调用方（父 Agent 的 subagent_submit handler）从执行上下文
+        # 取出 —— 那是与运行对齐的计数器，父子共享同一个实例。
+        # 只有在没有带预算的直连调用时才回退到 Manager 的 shared_budget。
+        effective_budget = budget if budget is not None else self._shared_budget
+
         # 父子共享 Budget：原子扣减 + 深度校验
-        if self._shared_budget is not None:
-            self._shared_budget.consume_subagent_task(depth)
+        if effective_budget is not None:
+            effective_budget.consume_subagent_task(depth)
 
         # 深度检查（向后兼容，即使没有 shared_budget 也允许 Manager 内部 max_depth 限制）
         if depth > self._max_depth:
@@ -646,7 +693,7 @@ class SubagentManager:
         token: CancellationToken,
         model: Model | None,
         registry: ToolRegistry | None,
-        budget: SubagentBudget | None,
+        budget: BudgetLike | None,
     ) -> None:
         """在 worker 线程中执行任务。"""
         # 先在锁内做状态确认和转换，释放锁后再处理取消分支（避免重入死锁）

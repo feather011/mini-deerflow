@@ -204,13 +204,17 @@ def _tool_failure_parts(exc: BaseException | None) -> tuple[str, str] | None:
 def safe_failure_detail(exc: BaseException | None) -> str:
     """提取**可以安全展示给客户端**的失败原因；没有则返回空串。
 
-    三类来源：
+    四类来源：
 
     - `ModelError` 家族：只含状态码 / 供应商 / 模型名（见 `model_errors.py`
       的模块约定：异常消息只包含非敏感信息，绝不携带 API Key）
     - `ProjectToolError` 家族：只含参数校验与会话状态的描述
       （**兜底**：项目工具的失败正常走 `ok:false` 结果，不产生事件）
     - 工具类异常：给**稳定错误码 + 固定说明**，不放行原始 message
+    - 预算耗尽（`AgentBudgetExceededError` / `BudgetExceededError`）：
+      只取 `.resource` 与 `.limit` 两个**代码内受控属性**拼出原因，
+      不放行 `str(exc)`（复审 B3：否则 SSE 只剩异常类型名，
+      `model_calls` 与上限丢失，消费方无从判断原因）
 
     其它异常（尤其第三方 SDK 异常）一律**不**展示 message —— 沿用既有保守策略。
 
@@ -220,6 +224,8 @@ def safe_failure_detail(exc: BaseException | None) -> str:
     if exc is None:
         return ""
     # 延迟导入：避免 api.schemas 反向依赖领域模块时产生循环导入
+    from mini_deerflow.api.services.agent_runs import AgentBudgetExceededError
+    from mini_deerflow.middleware import BudgetExceededError
     from mini_deerflow.model_errors import ModelError
     from mini_deerflow.project_tools import ProjectToolError
 
@@ -230,6 +236,18 @@ def safe_failure_detail(exc: BaseException | None) -> str:
         if isinstance(cur, ModelError):
             text = str(cur).strip()
             if text:
+                return _truncate(text)
+
+    # 预算耗尽：resource（固定字符串集合）与 limit（数值）是受控属性，
+    # 拼装成因；两者都取属性、不取 str(exc)。
+    for cur in chain:
+        if isinstance(cur, (AgentBudgetExceededError, BudgetExceededError)):
+            resource = getattr(cur, "resource", "") or ""
+            limit = getattr(cur, "limit", None)
+            if resource:
+                text = f"预算耗尽：{resource}"
+                if limit is not None:
+                    text += f"（上限: {limit}）"
                 return _truncate(text)
 
     # 工具类错误：稳定错误码 + 安全说明（不放行原始 message）。

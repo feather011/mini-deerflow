@@ -147,6 +147,8 @@ class Agent:
         self._memory_processor = memory_processor
         self._skill_context_provider = skill_context_provider
         self._middleware_pipeline = middleware_pipeline
+        # BUDGET-01：这里存的是**额度上限模板**，不是活的计数器。
+        # 每次运行由 new_run_budget() 派生一个独立计数器（见 run()）。
         self._budget = budget
         self._context_assembler = context_assembler
         self._last_assembled: "AssembledContext | None" = None
@@ -160,6 +162,18 @@ class Agent:
     def last_assembled(self) -> "AssembledContext | None":
         """最近一次 assemble() 的结果，供 IntegratedAgent 读取快照用。"""
         return self._last_assembled
+
+    def new_run_budget(self) -> Budget | None:
+        """按额度上限派生一个**本次运行专属**的预算计数器。
+
+        BUDGET-01：预算是运行级的 —— 不同运行互不消耗。调用方
+        （`IntegratedAgent.run`，即 run 边界）派生一次，并把同一个实例
+        传进 `Agent.run(budget=...)`，于是本轮的主 Agent 与其子代理
+        共享**同一个**计数器。
+
+        没有配置额度时返回 None（= 不限制），与既有语义一致。
+        """
+        return self._budget.derive() if self._budget is not None else None
 
     def _run_via_pipeline(
         self,
@@ -177,6 +191,7 @@ class Agent:
     def run(
         self, thread_id: str, user_input: str, run_id: str = "",
         cancellation_token: CancellationToken | None = None,
+        budget: Budget | None = None,
     ) -> tuple[str, list[dict]]:
         """对指定 thread_id 执行一轮 Agent 循环；成功后原子写入，失败时 Thread 不变。
 
@@ -184,7 +199,15 @@ class Agent:
             run_id: 上层 Run 的标识，仅用于 Trace 关联上下文组装与压缩事件。
                 缺省为空串，保持既有调用方兼容。
             cancellation_token: 可选取消令牌；主任务停止时置位，Agent 在每步开始检查。
+            budget: 本次运行的预算。**None = 按 Agent 的额度上限派生一个本次运行
+                专属的计数器**（BUDGET-01）；显式传入则直接使用。
+
+        BUDGET-01：预算是**运行级**的，不是进程级的。
+        `self._budget` 只作为「额度上限模板」，每次 run() 派生一个独立计数器
+        —— 不同运行互不消耗；本轮的父子 Agent 共享**同一个**派生实例。
         """
+        # 本次运行的预算（run 局部变量 → run 结束即释放，天然不跨运行残留）
+        run_budget = budget if budget is not None else self.new_run_budget()
         thread = self._store.get(thread_id)  # ThreadNotFoundError 原样传播
 
         # 25：计算本轮允许的工具集（暴露限制 + 执行限制的基础）
@@ -284,15 +307,15 @@ class Agent:
 
         for step in range(1, self._max_steps + 1):
             # 步骤预算：每步开始前扣减，超限抛 BudgetExceededError
-            if self._budget is not None:
-                self._budget.consume_step()
+            if run_budget is not None:
+                run_budget.consume_step()
 
             # 停止检查：主任务停止时在步骤开始前退出
             if cancellation_token is not None and cancellation_token.is_cancelled():
                 # 预算可能未启用（API 默认 disable_budget=True），
-                # 此时不能解引用 self._budget，否则取消会变成 AttributeError。
+                # 此时不能解引用 run_budget，否则取消会变成 AttributeError。
                 raise BudgetExceededError(
-                    "steps", self._budget.max_steps if self._budget is not None else None
+                    "steps", run_budget.max_steps if run_budget is not None else None
                 )
             # 组合发送给模型的完整消息列表：Memory → Skill → history → user
             # 每次循环重新组合以包含新增的 tool messages
@@ -325,7 +348,7 @@ class Agent:
                 thread_id=thread_id,
                 operation=OperationType.MODEL_CALL,
                 operation_name="model_decide",
-                budget=self._budget,
+                budget=run_budget,
                 token_accumulator=token_accumulator,
             )
             def _do_model_call(
@@ -338,6 +361,12 @@ class Agent:
                 if hasattr(self._model, "stream_decide"):
                     return _do_model_call_stream(_msgs, _tools, _acc)
                 else:
+                    # BUDGET-01：非流式路径**也**必须在真正发起调用前消费额度。
+                    # 过去这条路径直接 decide()，model_calls 永不增长 ——
+                    # 不支持流式的模型（FakeModel 等）完全绕过了 max_model_calls。
+                    # 与流式路径同一语义：**一次模型决策 = 一次额度消耗**。
+                    if run_budget is not None:
+                        run_budget.consume_model_call()
                     result = self._model.decide(_msgs, _tools)
                     _acc.append(result.content if isinstance(result, FinalAnswer) else "")
                     return result
@@ -348,8 +377,8 @@ class Agent:
                 _acc: list[str],
             ) -> Decision:
                 # 真正发起调用前原子消费额度（成功/失败/Retry 每次都计）
-                if self._budget is not None:
-                    self._budget.consume_model_call()
+                if run_budget is not None:
+                    run_budget.consume_model_call()
 
                 if self._model_timeout_seconds > 0 and cancellation_token is not None:
                     timer = threading.Timer(
@@ -383,13 +412,20 @@ class Agent:
                     return FinalAnswer(content="".join(_acc))
                 return result
 
-            # 模型调用返回后检查是否因超时/停止而被取消
+            # 模型调用返回后检查是否因超时/停止而被取消。
+            #
+            # BUDGET-01：这个检查**必须在模型调用之后**。原先它写在调用
+            # 之前 —— 于是「模型调用过程中发生的取消」（模型超时定时器在
+            # 调用期间置位、用户在模型返回前点了停止）会被完全漏掉：
+            # 决策照样被采纳，工具照样执行，停止退化成"跑完了"。
+            # 调用**之前**是否已取消，由步骤开始处的检查（见上方）负责。
+            decision = self._run_via_pipeline(model_ctx, _do_model_call)
+
             if cancellation_token is not None and cancellation_token.is_cancelled():
                 raise BudgetExceededError(
                     "model_call_timeout",
                     None,
                 )
-            decision = self._run_via_pipeline(model_ctx, _do_model_call)
 
             if isinstance(decision, FinalAnswer):
                 assistant_message = Message(role="assistant", content=decision.content)
@@ -460,7 +496,7 @@ class Agent:
                         thread_id=thread_id,
                         operation=OperationType.TOOL_CALL,
                         operation_name=_name,
-                        budget=self._budget,
+                        budget=run_budget,
                         cancellation_token=cancellation_token,
                     )
                     def _do_tool_call() -> str:
@@ -576,8 +612,8 @@ class Agent:
                             # 授权通过：记录已授予能力，供 handler（如 subagent_submit）读取并传递
                             tool_ctx.granted_capabilities = default_caps
                         # 真正发起调用前原子消费额度（成功/失败都计）
-                        if self._budget is not None:
-                            self._budget.consume_tool_call()
+                        if run_budget is not None:
+                            run_budget.consume_tool_call()
                         return self._registry.execute(_name, _args, context=tool_ctx)
 
                     return self._run_via_pipeline(tool_ctx, _do_tool_call)

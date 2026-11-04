@@ -336,23 +336,30 @@ class IntegratedAgent:
         # 唯一 ID 生成点：未指定时内部生成；指定时绝不二次生成。
         effective_run_id = run_id if run_id else self._next_run_id()
 
+        # BUDGET-01：本次运行专属的预算计数器（run 局部 → run 结束即释放）。
+        # 主 Agent 与其子代理共享**同一个**实例；不同运行互不消耗。
+        run_budget = self._agent.new_run_budget()
+
         ctx = ExecutionContext(
             run_id=effective_run_id,
             thread_id=thread_id,
             operation=OperationType.AGENT_RUN,
             operation_name="agent_run",
             cancellation_token=cancellation_token,
+            budget=run_budget,
         )
 
         pipeline = MiddlewarePipeline(self._middlewares)
 
         def action() -> tuple[str, list[dict]]:
-            # 传 run_id 和 cancellation_token：上下文组装与压缩需要前者，
-            # 步骤预算与停止传播需要后者。
+            # 传 run_id、cancellation_token 与**本次运行的预算**：
+            # 上下文组装与压缩需要前者，步骤预算与停止传播需要后者，
+            # 额度计数必须落在与运行对齐的计数器上。
             return self._agent.run(
                 thread_id, user_input,
                 run_id=effective_run_id,
                 cancellation_token=cancellation_token,
+                budget=run_budget,
             )
 
         # finally 捕获：即便 run 失败，本轮已完成的 assemble 快照也要保留
@@ -853,7 +860,10 @@ def create_runtime(
             max_depth=config.subagent_max_depth,
             max_tasks_per_parent=config.subagent_max_tasks_per_parent,
             default_timeout=config.subagent_default_timeout,
-            shared_budget=budget,  # 父子共享同一 Budget
+            # BUDGET-01：这里的 shared_budget 只是**直连调用**（不带运行上下文）
+            # 的回退额度。生产的父子共享走 subagent_submit handler 从执行上下文
+            # 取到的**本次运行**预算 —— 那才是与运行对齐的计数器。
+            shared_budget=budget,
             # 24：子代理复用同一 assembler。thread_id 形如
             # `subagent-{task_id}`，因此 ContextState / 摘要 / 水位 / Task Notes
             # 与父线程以及其它子代理天然隔离，无需另建 store。

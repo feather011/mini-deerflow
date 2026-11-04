@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
+from mini_deerflow.middleware import Budget, ChildBudget, build_child_budget
 from mini_deerflow.subagent_executor import CancellationToken, SubagentBudget, SubagentManager
 from mini_deerflow.subagent_models import (
     SubagentContextPolicy,
@@ -139,6 +140,21 @@ class _SubmitHandler:
                 if hasattr(context, "granted_capabilities"):
                     parent_caps = getattr(context, "granted_capabilities") or frozenset()
 
+            # BUDGET-01：父运行的预算（Agent.run 放进 tool_ctx 的那一个）。
+            # 子代理必须与父**共享同一个**计数器 —— 子代理的模型/工具消耗
+            # 真实计入父运行，父的额度上限对子代理同样生效。
+            #
+            # 复审 B1：必须同时接受 `Budget` 与 `ChildBudget`。带局部额度的
+            # 子代理持有的是 `ChildBudget` 视图（不是 Budget 子类），只认
+            # Budget 会让**继续委派**在这一层把整条父预算链丢掉 —— 孙代理
+            # 的消耗从此不进根计数器。ChildBudget 作为 parent 传给
+            # build_child_budget 会继续向上链到根，链条不中断。
+            parent_budget: Budget | ChildBudget | None = None
+            if context is not None:
+                ctx_budget = getattr(context, "budget", None)
+                if isinstance(ctx_budget, (Budget, ChildBudget)):
+                    parent_budget = ctx_budget
+
             instruction = _check_str(arguments, tool_name, "instruction")
             timeout = _check_int(arguments, tool_name, "timeout_seconds", 1)
             max_steps = _check_int(arguments, tool_name, "max_steps", 1)
@@ -158,15 +174,21 @@ class _SubmitHandler:
                 allow_further_delegation=allow_delegation,
             )
 
-            # 构建 per-task budget。仅当调用方显式提供了局部上限时才创建独立 Budget；
-            # 默认（None）走 Manager 的 shared_budget，父子共享同一额度。
-            budget: SubagentBudget | None = None
+            # BUDGET-01：模型自填的局部上限**只能收紧，不能扩额**。
+            # 过去这里直接造一个独立的 SubagentBudget 顶替父额度 —— 子代理
+            # 的消耗完全不进父计数器，等于凭空扩出一份额度。
+            # 现在：父额度始终参与计数；模型自填的上限作为**附加的更严限制**，
+            # 由 ChildBudget 视图同时检查两边。
+            local_budget: SubagentBudget | None = None
             if max_model_calls or max_tool_calls or (max_steps and max_steps > 0):
-                budget = SubagentBudget(
-                    max_steps=max_steps,
+                local_budget = SubagentBudget(
+                    # 缺省（0）表示**不设局部步数上限**，不能当成"0 步"——
+                    # 否则模型只填 max_model_calls 就会把子代理直接卡死。
+                    max_steps=max_steps if max_steps and max_steps > 0 else None,
                     max_model_calls=max_model_calls if max_model_calls else None,
                     max_tool_calls=max_tool_calls if max_tool_calls else None,
                 )
+            budget = build_child_budget(parent_budget, local_budget)
 
             # TOOL-02（R2a-1）：从共享 ThreadStore 获取父线程的 project_id，继承项目会话上下文
             parent_project_id: str | None = None

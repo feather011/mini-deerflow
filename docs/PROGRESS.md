@@ -4250,3 +4250,202 @@ E2E 全部用 `page.route` 本地夹具（注入 `/api/threads/{id}` 与 SSE 事
   sha256 `d1cea6b90eb111501407c2835ef31d004ae6742a3c9bce5d4373bbd43593a342`。
   **后续推送后从 GitHub 核对即可**，不再走补丁传输。
 - 本轮**不再追加返修或测试**；下一步先做**远端交付核对**，再进入测试隔离阶段。
+
+---
+
+## BUDGET-01：运行级预算与停止生命周期（2026-11-04）
+
+- 状态：**READY_FOR_REVIEW** —— 实现完成 + 作者自测通过；**未 commit / push / merge**（提交、推送、合并仍未授权）。
+- 会话：claude-worker-20261010-2015
+- 源码基线：`edd5d64`（= a29af0c + 662bbe2 BACKEND-02 + edd5d64 复审结论记录）。本轮改动**全部在工作区，未提交**。
+- 范围（生产）：`src/mini_deerflow/middleware.py`、`agent.py`、`runtime.py`、`subagent_executor.py`、`subagent_tools.py`。
+- 范围（测试）：新增 `tests/test_budget_lifecycle.py`；改 `tests/test_phase17_18_closing.py`（3 处断言的**观察对象**）、`tests/test_context_agent.py`（1 处调用）。
+
+### 一、四个被证实的缺陷（不是推测）
+
+| # | 缺陷 | 证据 |
+|---|---|---|
+| 1 | 预算是**进程级**的：`runtime.py` 启动时造**一个** `Budget`，Agent / SubagentManager / BudgetMiddleware 共享它 | 不同 run 互相消耗对方额度 |
+| 2 | **非流式**模型调用**不计数**：`agent.py` `_do_model_call` 的 else 分支直接 `decide()`，没有 `consume_model_call()` | 基线 `tests/test_phase17_18_closing.py` 的 3 项预算用例**在 HEAD 上本来就红**（本次已转绿） |
+| 3 | 子代理**凭空扩额**：模型填了 `max_model_calls` / `max_tool_calls` / `max_steps` 时，handler 直接造一个独立 `SubagentBudget` **顶替**父额度 | 子代理消耗完全不进父计数器 |
+| 4 | 取消检查**顺序错**：模型调用**之后**的取消检查写在调用**之前** | 模型调用期间发生的取消被漏掉：决策照样采纳、工具照样执行，"停止"退化成"跑完了" |
+
+### 二、改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `middleware.py` | 新增 `Budget.derive()`（按同样的**上限**派生一个独立计数器）；新增 `ChildBudget` + `build_child_budget(parent, local)`（父子共享父计数器；局部上限**只能收紧**）；`BudgetMiddleware.before` **不再覆盖** `ctx.budget`（否则会把 per-run 计数器换回进程级模板） |
+| `agent.py` | 新增 `new_run_budget()`；`run()` 新增可选参数 `budget`（None = 由模板派生本次运行专属计数器），run 内 10 处 `self._budget` 改为 `run_budget`；**非流式**路径补 `consume_model_call()`；**修正取消检查顺序**（检查移到模型调用之后） |
+| `runtime.py` | `IntegratedAgent.run` 在 run 边界派生一次 per-run 预算，同时放进 `ExecutionContext.budget` **和** `Agent.run(budget=...)`；`SubagentManager.shared_budget` 降级为"直连调用的回退" |
+| `subagent_executor.py` | 新增 `BudgetLike = SubagentBudget \| ChildBudget`；`submit()` 优先用调用方传入的额度，回退 `shared_budget`；子代理工具循环补取消/截止时间检查（BACKEND-02 B1） |
+| `subagent_tools.py` | handler 从执行上下文取**父运行**预算，与模型自填的局部上限合成 `ChildBudget`；局部上限**不能扩额**；局部 `max_steps` 缺省 `0` 按"不设限"处理（此前会被当成"0 步"，模型只填 `max_model_calls` 就会把子代理卡死 —— 既有缺陷，顺带修正） |
+
+### 三、契约变化（会影响下游）
+
+- `Agent.run(..., budget=None)` 新增可选参数；`None` = 按模板派生一个**本次运行专属**的计数器。
+- **`Agent(budget=...)` 的语义变了**：它现在是**额度上限模板**，不再是活的计数器（构造后不再被消耗）。
+- `Budget.derive()`：只复制上限、不复制计数；新实例有自己的锁。
+- `ChildBudget` / `build_child_budget(parent, local)`：父子共享父计数器；模型自填的局部上限**只能收紧**（局部先检查，父额度照常计数）。
+- `SubagentManager.submit(budget=...)`：优先用传入额度。
+- `BudgetMiddleware.before`：**不再覆盖**已有 `ctx.budget`。
+
+### 四、五项验收 → 证据对照
+
+| 验收 | 证据（`tests/test_budget_lifecycle.py`，18 项全绿） |
+|---|---|
+| 每次 run 新建预算，不同运行互不消耗（同一会话连续两轮、不同会话并发） | `test_同一会话连续两轮_第二轮额度从头算`、`test_不同会话并发_各自独立计数`、`test_每轮派生独立计数器_计数互不影响` |
+| 同一 run 的主／子 Agent 共享额度上限（子代理消耗计入父运行，不能扩额） | `test_端到端_父Agent派活_子代理消耗计入父运行`（走**真实** `subagent_submit` handler → 父计数器 `model_calls == 3` = 父 2 次 + 子 1 次）、`test_模型自填局部上限_不能扩额`、`test_模型自填局部上限_更严时先挡` |
+| 流式、非流式模型调用都计数，避免重复计数 | `test_流式模型调用计数`、`test_非流式模型调用计数`、`test_额度计数与脚本模型调用次数一致`（计数 == 脚本模型**实际**调用次数） |
+| 额度耗尽后不再启动模型或工具；终态与原因准确 | `test_额度耗尽后不再启动模型`、`test_额度耗尽后不再启动工具`、`test_端到端_父额度耗尽_子代理不再启动模型`（子任务 FAILED，`error_type=BudgetExhaustedError`）、`test_API入口_额度耗尽_终态与原因准确且下一轮可开始`（API 入口映射为 `AgentBudgetExceededError(resource="model_calls", limit=1)`） |
+| 取消、超时后释放资源，下一轮可正常开始（实际 API 入口） | `test_取消后下一轮可正常开始`、`test_API入口_停止后重试可正常开始`（走 `AgentRunService.run`） |
+
+### 五、验证证据
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 新增定向 | `pytest tests/test_budget_lifecycle.py -q` | **18 passed** |
+| 受影响回归 | `pytest tests/test_budget_lifecycle.py tests/test_cancel_semantics.py tests/test_tool_loop_21b.py tests/test_context_agent.py -q` | **89 passed** |
+| 预算既有失败 | `pytest tests/test_phase17_18_closing.py -q` | **19 passed**（3 项由红转绿，见下） |
+| 全量后端 | `pytest tests -q` | **3629 passed / 16 failed / 15 skipped / 42 subtests**（约 214s） |
+| 基线对照 | 同一命令跑在 `git archive HEAD` 导出的**基线副本**（不含本轮改动） | 同样这批文件上 **19 failed**，node ID 与本轮**逐项一致** → 本轮**新增 0**、**消除 3** |
+
+**由红转绿的 3 项**（基线 `edd5d64` 上就失败，原因是"非流式路径存在既有计数缺口" + 计数对象错位）：
+
+- `test_phase17_18_closing.py::TestBudgetAtomicConsume::test_model_keeps_failing_stops_at_model_limit`
+- `test_phase17_18_closing.py::TestBudgetAtomicConsume::test_tool_failure_still_consumes_tool_call`
+- `test_phase17_18_closing.py::TestMiddlewareInAgentRealPath::test_retryable_model_failure_triggers_retry`
+
+**因契约变化而更新的既有用例**（**断言值一个没改**，只改"观测对象"）：构造参数里的 `budget` 现在只是上限模板，
+断言改到本次运行的计数器上（`agent.new_run_budget()` → `agent.run(..., budget=run_budget)`）。
+涉及 `tests/test_phase17_18_closing.py` 3 处、`tests/test_context_agent.py` 1 处。**未放宽任何断言，未删除任何用例。**
+
+**全量回归中仍失败的 16 项**（与基线**逐项一致**，本轮未触碰）：
+`test_mcp.py` 10 项 + `test_mcp.py::TestSubagentAllowedTools` 1 项、
+`test_subagent_allowed_tools.py` 3 项、`test_project_execute_e2e.py` 1 项、
+`test_phase21b_events.py::test_工具失败_发_tool_failed_且唯一终态为_run_failed` 1 项。
+MCP 相关失败报 `MCPError: Connection closed`（环境问题），本轮**未**深查，**不宣称**已解决。
+
+### 六、明确未做 / 未覆盖
+
+- **未**把 `disable_budget=True` 翻成 False（`api/app.py:173`）→ **生产 API 路径目前仍不启用额度**。
+  本轮修的是**生命周期与计数本身**，不是"启用"；要真正用上生产额度，需要单独一轮显式开启并单独验收。
+- **未**做费用估算、预算 UI、持久化账本（按约定不扩范围）。
+- **摘要额度（`summary_calls`）仍是进程级共享**：它挂在跨线程共享的 `ContextCompactor` 上，
+  改成运行级需要把预算推进压缩器，超出本轮范围。本轮**未**改变"摘要不占决策额度"这一既有语义。
+- **未**调真实付费 Provider；**未**做 Windows 桌面人工体验；**未**做浏览器验收。
+- **未**改动 `ChildBudget` 的 `max_subagent_depth`（只取父额度，当前无使用方）。
+- 全量回归里 MCP 相关失败**未**定位根因（只记录现象，不下结论）。
+
+### 七、遗留风险
+
+- `Agent(budget=...)` 的**语义变更**属于接口级变更：旧调用方若依赖"构造的 budget 会被消耗"，
+  需改为读取运行计数器（`new_run_budget()` 或 run 传参）。本仓库内已同步的调用点见上表。
+- 子代理额度耗尽 → 子任务 `FAILED`（`error_type=BudgetExhaustedError`），**尚未**映射到更友好的终态文案／客户端展示。
+- 进程级模板 `Budget` 与运行级计数器共存，若将来有第三条路径直接使用模板实例，仍会退回进程级语义
+  （本轮已把 `runtime.py` / `subagent_tools.py` / `subagent_executor.py` 三处都改到运行级）。
+
+
+---
+
+## BUDGET-01 独立复审返修（2026-11-04，第二轮）
+
+- 状态：**READY_FOR_REVIEW** —— 复审提出的 3 项已逐项修复 + 自测通过；**未 commit / push / merge**（提交、推送、合并仍未授权）。
+- 会话：claude-worker-20261010-2015
+- 源码基线：`edd5d64`（同上一节）。本轮改动**仍全部在工作区，未提交**。
+- 范围：**只集中修这 3 项**。摘要额度、生产启用开关（`api/app.py:173` 的 `disable_budget=True`）、其他既有失败**保持范围外**。
+
+### 一、复审结论与本轮修复
+
+| 编号 | 复审实测 | 本轮修复 | 回归用例 |
+|---|---|---|---|
+| B1 继续委派丢根预算 | `subagent_tools.py:146–150` 只接受 `Budget`，带局部额度的子代理再次派活时预算脱链（根上限 3、实际模型调用 4 次、根计数仍为 3） | handler 同时接受 `Budget` 与 `ChildBudget`；`ChildBudget` 可再作为 parent 嵌套（`build_child_budget`），整条父预算链一路链到根。**不改变现有委派权限** | `test_继续委派_ChildBudget链到根` |
+| B2 超时最终答案被标成功 | `subagent_executor.py:409–416` 模型返回后直接采纳 `FinalAnswer`，没有复查截止时间（截止 10ms、模型 50ms 后返回 → 仍 SUCCEEDED） | 模型返回后、采纳结果前**复查取消与截止时间**；并把**超时**与**主动取消**拆成两个终态：超时 → `TIMED_OUT`（`error_type=TimeoutError`），主动取消仍是 `CANCELLED` | `test_复审B2_模型越过截止时间_子任务不以成功收口`、`test_复审B2_宽松时限_子任务正常成功`、`test_复审B2_主动取消_仍是取消而非超时` |
+| B3 预算原因未到 SSE 消费者 | `api/services/run_stream.py:171–176` 额度耗尽后只输出 `Run 失败 (AgentBudgetExceededError)`，丢失 `model_calls` 与上限 1 | `api/schemas/streaming.py` 的 `safe_failure_detail` 增加预算分支：只取 `.resource` 与 `.limit` 两个**受控属性**拼出原因，不放行 `str(exc)`，**不扩展通用错误体系** | `test_复审B3_预算耗尽_SSE终态带资源与上限`、`test_复审B3_预算文案不含任意异常文本` |
+
+### 二、改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/mini_deerflow/subagent_tools.py` | handler 从执行上下文取预算时**同时接受** `Budget` 与 `ChildBudget`（B1） |
+| `src/mini_deerflow/middleware.py` | `ExecutionContext.budget` 放宽为 `Budget \| ChildBudget \| None`；`ChildBudget.__init__` 允许 parent 再套一层 `ChildBudget`；`build_child_budget` 同步放宽（B1 支撑） |
+| `src/mini_deerflow/subagent_executor.py` | 模型调用后、采纳结果前复查取消与截止时间；新增 `_DeadlineExceededError` 与 `_mark_timed_out_and_result`（超时独立终态）；`BudgetLike` 类型贯通（B2、B1 类型支撑） |
+| `src/mini_deerflow/api/schemas/streaming.py` | `safe_failure_detail` 增加预算分支（B3） |
+| `tests/test_budget_lifecycle.py` | 新增 6 项回归用例（B1 一项、B2 三项、B3 两项） |
+
+### 三、验证证据
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 本文件全量定向 | `pytest tests/test_budget_lifecycle.py -q` | **24 passed**（上一轮 18 → 本轮 24） |
+| 受影响回归（第一组） | `pytest tests/test_budget_lifecycle.py tests/test_subagent_executor.py tests/test_subagent_integration.py tests/test_subagent_models.py tests/test_subagent_allowed_tools.py tests/test_middleware.py tests/test_agent.py tests/test_api_runs_stream.py tests/test_api_runs_stream_components.py tests/test_api_runs.py tests/test_api_errors.py -q` | **299 passed / 3 failed**。3 项为**基线既有**的 MCP 环境失败（`test_subagent_allowed_tools.py`，报 `MCPError: Connection closed`），与上一节基线清单逐项一致，本轮未触碰 |
+| 受影响回归（第二组） | `pytest tests/test_cancel_semantics.py tests/test_context_agent.py tests/test_phase17_18_closing.py tests/test_tool_loop_21b.py tests/test_lead_agent_budget.py tests/test_lead_agent_planner_budget.py tests/test_api_e2e.py tests/test_confirmation_lifecycle.py -q` | **236 passed** |
+| 回归有效性（逐项撤掉修复复跑） | 临时撤掉 B1 的 `isinstance` 放宽 → `test_继续委派_ChildBudget链到根` **失败**（根计数 0）；撤掉 B2 的模型后复查 → `test_复审B2_模型越过截止时间_...` **失败**（实际 SUCCEEDED）；撤掉 B3 的预算分支 → 两项 B3 用例 **失败**（终态只剩异常类型名）。**三次撤销均已还原**，还原后复跑 24 passed | 三项缺陷各自被对应用例稳定捕获 |
+
+**未跑全量**（复审明确"无需重跑全量"）。上面两组覆盖了三处改动的直接调用方与下游消费方（子代理执行器、API 流式入口、Agent 主循环、取消语义）。
+
+### 四、明确未做 / 限制
+
+- 生产 API 路径**仍未启用额度**（`api/app.py:173` 的 `disable_budget=True` 未动）—— 本轮修的是正确性，不是启用。
+- 摘要额度（`summary_calls`）仍为进程级共享，**策略未改**。
+- B2、B3 **不宣称**是本轮新引入的缺陷；属本阶段已约定的**超时及原因准确性**验收项。
+- 未调真实付费 Provider；未做浏览器 / 人工验收。
+- 未 commit / push / merge。
+
+### 五、遗留风险
+
+- 超时终态由 `CANCELLED` 改为 `TIMED_OUT` 属于**终态语义变化**：若下游依赖"超时也算取消"需相应调整。
+  仓库内**无**其他消费方断言该语义（`TaskStatus.TIMED_OUT` 此前从未被产生）。
+
+
+---
+
+## BUDGET-01 第二轮独立复审结论（2026-11-04，代码级通过）
+
+- 结论：**B1 / B2 / B3 三项判定为代码级修复通过**；复审方建议**不再发起第三轮代码返修**。
+- 会话：claude-worker-20261010-2015
+- 复审方式：基于交付包的**独立静态复审 + 语法检查**（`py_compile` 6 个生产文件与新增测试文件全部通过）。
+  复审方**未**在完整项目环境独立复现测试运行（包内无完整项目文件，测试收集失败 —— **非**断言失败）。
+- 基线：`edd5d64`（未变）。改动仍全部在工作区，**未 commit / push / merge**。
+
+### 一、复审逐项判定
+
+| 检查项 | 结论 | 复核证据（复审方给出） |
+|---|---|---|
+| B1 继续委派的根预算链 | ✅ 通过 | `ChildBudget` 可嵌套；`subagent_submit` 接受两种预算类型；Manager 保留传入的预算视图 |
+| B2 迟到答案误标成功 | ✅ 通过 | `decide()` 返回后、处理 `FinalAnswer` 前检查取消和截止时间 |
+| B2 终态语义 | ✅ 通过 | `_DeadlineExceededError` → `TIMED_OUT`；主动取消 → `CANCELLED` |
+| B3 SSE 预算原因 | ✅ 通过 | 沿异常链提取预算异常，用 `resource`、`limit` 构建错误消息 |
+| 新增测试的针对性 | ✅ 通过 | 覆盖三个原始缺陷 + 正常成功、主动取消等对照情况 |
+| Python 语法检查 | ✅ 通过 | 6 个生产文件 + 新增测试文件均通过 `py_compile` |
+| 独立运行 24 项测试 | ⚪ 未完成 | 缺少完整项目文件，测试收集失败（**不是**测试断言失败） |
+
+### 二、两个非阻断性观察（复审方明确不要求本轮改造）
+
+1. **B1 的嵌套扣减不是整体原子事务**：`ChildBudget` 先扣局部预算、再扣父预算；父预算拒绝本次调用时，
+   局部计数可能已经增加。**不构成绕过根预算的漏洞**。若将来要求每层计数严格反映"实际获准执行的调用"，
+   需要额外设计跨层原子扣减。**本轮不改**。
+2. **B2 的取消与超时存在优先级**：实现先查取消令牌、再查截止时间，两者同时成立时可能优先 `CANCELLED`。
+   符合现有检查顺序；本轮已明确保留主动取消语义，**不新增状态机制**。
+
+以上两项作为**已知限制**记录在案，后续要收紧需单独一轮。
+
+### 三、提交前最终测试确认（完整仓库环境）
+
+复审方要求"在正常提交前由完整仓库环境完成最终测试确认"。本轮已在**完整工作区**执行：
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 全量后端 | `pytest tests -q` | **3635 passed / 16 failed / 15 skipped / 42 subtests**（约 238s） |
+
+- 与上一节记录的全量基线（**3629 passed / 16 failed / 15 skipped / 42 subtests**）对照：
+  通过数 **+6**，正好等于本轮新增的 6 项复审回归用例；**失败数仍为 16**，node ID **逐项一致**
+  （`test_mcp.py` 11、`test_subagent_allowed_tools.py` 3、`test_project_execute_e2e.py` 1、`test_phase21b_events.py` 1）。
+  → **新增失败 0**：B1/B2/B3 的修复**未引入回归**。
+- 16 项失败均为**既有**失败（MCP 环境类报 `MCPError: Connection closed`），本轮未触碰，**不宣称**已解决。
+
+### 四、状态与边界
+
+- BUDGET-01 的**代码级复审通过**；后续只剩提交动作本身（提交、推送、合并**仍未授权**）。
+- **生产启用仍未处理**：`api/app.py:173` 的 `disable_budget=True` **未翻转**。
+  按复审意见，BUDGET-01 的生产启用**作为单独阶段**处理，不在本次收尾顺手做。
+- 未 commit / push / merge。
