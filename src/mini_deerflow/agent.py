@@ -192,15 +192,22 @@ class Agent:
         self, thread_id: str, user_input: str, run_id: str = "",
         cancellation_token: CancellationToken | None = None,
         budget: Budget | None = None,
+        *,
+        parent_span_id: str | None = None,
     ) -> tuple[str, list[dict]]:
         """对指定 thread_id 执行一轮 Agent 循环；成功后原子写入，失败时 Thread 不变。
 
         Args:
-            run_id: 上层 Run 的标识，仅用于 Trace 关联上下文组装与压缩事件。
-                缺省为空串，保持既有调用方兼容。
+            thread_id: 目标 Thread ID。
+            user_input: 用户输入文本。
+            run_id: 上层 Run 的标识；**同时**用于 Trace 关联（模型 / 工具 span
+                都挂在它下面）。缺省为空串，保持既有调用方兼容。
             cancellation_token: 可选取消令牌；主任务停止时置位，Agent 在每步开始检查。
             budget: 本次运行的预算。**None = 按 Agent 的额度上限派生一个本次运行
                 专属的计数器**（BUDGET-01）；显式传入则直接使用。
+            parent_span_id: TRACE-01。上层（IntegratedAgent 的 AGENT_RUN span）
+                传下来的父 span id；本轮产生的所有 span 挂在它下面。
+                None = 无父节点。
 
         BUDGET-01：预算是**运行级**的，不是进程级的。
         `self._budget` 只作为「额度上限模板」，每次 run() 派生一个独立计数器
@@ -305,6 +312,12 @@ class Agent:
 
         trace: list[dict] = []
 
+        # TRACE-01：因果链的链尾（span id）。
+        # 规则：模型调用的父节点 = 链尾；模型调用后链尾 = 模型 span；
+        # 工具调用的父节点 = 发起它的那次模型 span；工具完成后链尾 = 工具 span。
+        # 于是「模型 → 工具 → 模型」串成一条链，而不是一堆并列的兄弟节点。
+        chain_tail: str | None = parent_span_id
+
         for step in range(1, self._max_steps + 1):
             # 步骤预算：每步开始前扣减，超限抛 BudgetExceededError
             if run_budget is not None:
@@ -344,12 +357,20 @@ class Agent:
             # 25C: 使用 stream_decide() 实现 token 流式推送
             token_accumulator: list[str] = []
             model_ctx = ExecutionContext(
-                run_id="",  # 由 IntegratedAgent 在外层生成
+                # TRACE-01：run_id 贯通 —— 过去这里硬编码空串，
+                # Trace 直接记录它，于是同一次运行里模型调用事件的 run_id
+                # 与工具调用事件的不一致，按 run_id 查不到模型调用。
+                run_id=run_id or "",
                 thread_id=thread_id,
                 operation=OperationType.MODEL_CALL,
                 operation_name="model_decide",
                 budget=run_budget,
                 token_accumulator=token_accumulator,
+                # TRACE-01：取消令牌进模型上下文 —— 少了它，
+                # 「模型调用期间被取消」在 Trace 里无法与普通失败区分。
+                cancellation_token=cancellation_token,
+                # TRACE-01：父节点 = 因果链的链尾
+                parent_span_id=chain_tail,
             )
             def _do_model_call(
                 _msgs=model_messages,
@@ -383,7 +404,11 @@ class Agent:
                 if self._model_timeout_seconds > 0 and cancellation_token is not None:
                     timer = threading.Timer(
                         self._model_timeout_seconds,
-                        cancellation_token.cancel,
+                        # TRACE-01：标记「本次取消源于模型超时」。
+                        # 用户主动停止置位的是**同一个**令牌，光看
+                        # is_cancelled() 分不出二者（Trace 终态分类依赖原因）。
+                        # 首次取消原因胜出：用户先停止时不会被后来的超时覆盖。
+                        lambda: cancellation_token.cancel(reason="model_timeout"),
                     )
                     timer.start()
                     try:
@@ -420,6 +445,10 @@ class Agent:
             # 决策照样被采纳，工具照样执行，停止退化成"跑完了"。
             # 调用**之前**是否已取消，由步骤开始处的检查（见上方）负责。
             decision = self._run_via_pipeline(model_ctx, _do_model_call)
+
+            # TRACE-01：模型 span 成为新的链尾 —— 本次决策触发的工具挂在它下面。
+            # 取 ctx.span_id 而不是构造时的值：重试会换新 span（D6）。
+            chain_tail = model_ctx.span_id
 
             if cancellation_token is not None and cancellation_token.is_cancelled():
                 raise BudgetExceededError(
@@ -491,6 +520,9 @@ class Agent:
                     _name: str,
                     _args: dict[str, object],
                 ) -> str:
+                    # TRACE-01：工具 span 的父节点 = 发起它的那次模型决策 span。
+                    # 同一轮里的多个工具是**并列兄弟**（都挂在同一个模型 span 下）。
+                    nonlocal chain_tail
                     tool_ctx = ExecutionContext(
                         run_id=run_id or "",
                         thread_id=thread_id,
@@ -498,6 +530,7 @@ class Agent:
                         operation_name=_name,
                         budget=run_budget,
                         cancellation_token=cancellation_token,
+                        parent_span_id=model_ctx.span_id,
                     )
                     def _do_tool_call() -> str:
                         # 25：三层纵深防御
@@ -616,7 +649,11 @@ class Agent:
                             run_budget.consume_tool_call()
                         return self._registry.execute(_name, _args, context=tool_ctx)
 
-                    return self._run_via_pipeline(tool_ctx, _do_tool_call)
+                    tool_result = self._run_via_pipeline(tool_ctx, _do_tool_call)
+                    # TRACE-01：工具 span 成为新的链尾 —— 下一次模型调用
+                    # 挂在它下面（「模型 → 工具 → 模型」）。
+                    chain_tail = tool_ctx.span_id
+                    return tool_result
 
                 # 串行执行：同一轮里前一个工具可能修改仓库，
                 # 后一个必须看到修改后的结果。

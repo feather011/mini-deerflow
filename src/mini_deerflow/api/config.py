@@ -105,6 +105,15 @@ class ApiSettings:
     web_search_mcp_tool: str = "search"
     """MCP 搜索工具名（默认 search）；模型通过 mcp__<server>__<tool> 暴露。"""
 
+    # ---- TRACE-01：Trace 采集与落盘 ----
+    trace_enabled: bool = False
+    """是否启用 Trace 事件采集。默认 False（不启用时不产生任何 Trace 事件）。
+
+    启用后可在 `trace_path` 指定 JSONL 落盘路径；不指定则只在内存里
+    （进程退出即丢，仅供进程内调试）。"""
+    trace_path: str | None = None
+    """Trace JSONL 输出路径。None = 不落盘（仅内存）。路径不可写时启动即报错。"""
+
     def __post_init__(self) -> None:
         """从环境变量覆盖各字段。"""
         # 使用 object.__setattr__ 因为 frozen=True
@@ -131,6 +140,17 @@ class ApiSettings:
         env_list = _get_env("MAX_LIST_ENTRIES", None)
         if env_list is not None:
             object.__setattr__(self, "max_list_entries", int(env_list))
+        # TRACE-01：Trace 采集与落盘
+        env_trace_enabled = _get_env("TRACE_ENABLED", None)
+        if env_trace_enabled is not None and env_trace_enabled.strip():
+            object.__setattr__(
+                self,
+                "trace_enabled",
+                env_trace_enabled.strip().lower() in ("1", "true", "yes", "on"),
+            )
+        env_trace_path = _get_env("TRACE_PATH", None)
+        if env_trace_path is not None and env_trace_path.strip():
+            object.__setattr__(self, "trace_path", env_trace_path.strip())
         # Thread 持久化：未设置或空白 → 保持内存实现（默认行为不变）
         env_db = _get_env("DB_PATH", None)
         if env_db is not None and env_db.strip():

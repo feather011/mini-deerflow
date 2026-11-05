@@ -155,6 +155,14 @@ class _SubmitHandler:
                 if isinstance(ctx_budget, (Budget, ChildBudget)):
                     parent_budget = ctx_budget
 
+            # TRACE-01：父侧工具 span 的 id —— 子代理的 SUBAGENT_TASK span
+            # 挂在它下面，于是一次运行里的「模型 → 工具 → 子代理」是一条链。
+            parent_span_id: str | None = None
+            if context is not None:
+                ctx_span_id = getattr(context, "span_id", None)
+                if isinstance(ctx_span_id, str) and ctx_span_id:
+                    parent_span_id = ctx_span_id
+
             instruction = _check_str(arguments, tool_name, "instruction")
             timeout = _check_int(arguments, tool_name, "timeout_seconds", 1)
             max_steps = _check_int(arguments, tool_name, "max_steps", 1)
@@ -211,6 +219,8 @@ class _SubmitHandler:
                 context_policy=policy,
                 parent_granted_capabilities=parent_caps,
                 parent_project_id=parent_project_id,
+                # TRACE-01：子代理 span 的父节点
+                parent_span_id=parent_span_id,
             )
 
             return _ok(

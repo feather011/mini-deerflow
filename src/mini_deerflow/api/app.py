@@ -170,6 +170,10 @@ def _default_runtime_factory(
             mcp_servers=load_mcp_config(),
             harness_root=resolved.harness_root,
             harness_timeout_seconds=resolved.harness_timeout_seconds,
+            # TRACE-01：Trace 默认关闭；开启后可把事件落成 JSONL
+            # （MINI_DEERFLOW_TRACE_PATH）。落盘路径不可写时启动即报错。
+            trace_enabled=resolved.trace_enabled,
+            trace_path=resolved.trace_path,
             disable_budget=True,
             # TOOL-06：网络只读配置
             web_read_timeout_s=resolved.web_read_timeout_s,
