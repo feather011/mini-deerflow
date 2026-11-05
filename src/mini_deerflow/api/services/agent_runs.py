@@ -97,12 +97,23 @@ class AgentRunTimeoutError(AgentRunError):
 
 
 class AgentRunCancelledError(AgentRunError):
-    """Run 被取消；映射 HTTP 503（与 not ready 一致；非 500）。"""
+    """Run 被取消；映射 HTTP 503（与 not ready 一致；非 500）。
 
-    def __init__(self, thread_id: str, run_id: str) -> None:
+    TRACE-01：带 `reason` —— **取消原因的底层事实**。
+
+    `reason="cancelled"` = 用户主动停止；
+    `reason="model_timeout"` = 模型调用超时（模型超时定时器置位的是同一个令牌）。
+
+    公开终态事件名本轮保持兼容：两种 reason 都映射为 `run.cancelled`
+    （不改 SSE 契约）。事实随异常一路带到 SSE 层，将来切换公开映射时
+    不需要重新推导「到底是不是用户停止的」。
+    """
+
+    def __init__(self, thread_id: str, run_id: str, reason: str = "cancelled") -> None:
         super().__init__(f"Run 被取消: thread_id={thread_id} run_id={run_id}")
         self.thread_id = thread_id
         self.run_id = run_id
+        self.reason = reason
 
 
 class AgentRunFailedError(AgentRunError):
@@ -269,13 +280,37 @@ class AgentRunService:
                     thread_id, message, run_id=run_id, cancellation_token=cancellation_token
                 )
             except BudgetExceededError as exc:
-                # 主动停止：取消令牌已置位 → 报"已取消"，不是预算耗尽。
-                # 与 finally 中的 cancelled 判定保持一致（同一事实、同一语义），
-                # 否则 SSE 终态会退化成 run.failed，前端无法区分
-                # "用户点了停止" 与 "任务真的失败"。
-                if cancellation_token is not None and cancellation_token.is_cancelled():
-                    raise AgentRunCancelledError(thread_id, run_id) from exc
-                # 根据 resource 区分"主动停止"与"模型超时"
+                # TRACE-01：终态判定读**同一个底层事实** —— 取消令牌记录的
+                # 首次取消原因（Trace 侧 `classify_terminal_status` 读的是同一个
+                # `cancel_state()`）。API 与 Trace 不再各判各的「是不是用户停止」。
+                cancelled, reason = (
+                    cancellation_token.cancel_state()
+                    if cancellation_token is not None
+                    else (False, None)
+                )
+                if cancelled and reason == "model_timeout":
+                    # 事实：模型超时（模型超时定时器置位的是同一个令牌）。
+                    # 公开终态本轮**保持兼容**：仍映射为 run.cancelled，
+                    # 不改 SSE 契约；但事实（reason）随异常带下去，不丢。
+                    # Trace 侧同一事实记为 timeout —— 两个观测渠道都基于同一事实。
+                    _LOGGER.warning(
+                        "模型超时以兼容状态对外：thread_id=%s run_id=%s "
+                        "（内部事实=model_timeout；SSE=run.cancelled；Trace=timeout）",
+                        thread_id,
+                        run_id,
+                    )
+                    raise AgentRunCancelledError(
+                        thread_id, run_id, reason="model_timeout"
+                    ) from exc
+                if cancelled:
+                    # 主动停止：取消令牌已置位 → 报"已取消"，不是预算耗尽。
+                    # 与 finally 中的 cancelled 判定保持一致（同一事实、同一语义），
+                    # 否则 SSE 终态会退化成 run.failed，前端无法区分
+                    # "用户点了停止" 与 "任务真的失败"。
+                    raise AgentRunCancelledError(
+                        thread_id, run_id, reason="cancelled"
+                    ) from exc
+                # 没有取消令牌时的模型超时（运行未带令牌）
                 if exc.resource == "model_call_timeout":
                     raise AgentRunTimeoutError(
                         thread_id, run_id, timeout=None
@@ -304,9 +339,14 @@ class AgentRunService:
             # TOOL-04 R5/R6 round 4：清理权威记录
             # cancelled=True 表示本次 run 被取消（AgentRunCancelledError 路径），
             # 保持取消标记以拒绝旧 run 的确认执行；非取消路径清空即可。
+            #
+            # TRACE-01：这里判的是**取消令牌**，不是公开的终态事件名。
+            # 「用户停止」与「模型超时」都置位同一个令牌 → 清理行为一致，
+            # 因此 SSE 把超时兼容映射成 run.cancelled **只影响表示层**，
+            # 不会让超时的 run 走错清理 / 持久化路径。
             was_cancelled = False
-            if cancellation_token is not None and cancellation_token.is_cancelled():
-                was_cancelled = True
+            if cancellation_token is not None:
+                was_cancelled, _reason = cancellation_token.cancel_state()
             if getattr(self, "_runtime", None) is not None:
                 self._runtime.unregister_run(run_id, cancelled=was_cancelled)
             self._coordinator.release(thread_id, run_id=run_id)

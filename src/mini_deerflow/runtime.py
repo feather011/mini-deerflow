@@ -360,6 +360,9 @@ class IntegratedAgent:
                 run_id=effective_run_id,
                 cancellation_token=cancellation_token,
                 budget=run_budget,
+                # TRACE-01：本轮 AGENT_RUN span 是根节点，
+                # Agent 内部产生的模型 / 工具 span 挂在它下面。
+                parent_span_id=ctx.span_id,
             )
 
         # finally 捕获：即便 run 失败，本轮已完成的 assemble 快照也要保留
@@ -872,6 +875,8 @@ def create_runtime(
             tool_policy_registry=tool_policy_registry,
             # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问和 project_id 反查）
             thread_store=store,
+            # TRACE-01：子代理的 span 也进同一个 sink —— 与父运行同一条链
+            trace_sink=trace_sink,
         )
         # 注册子任务工具
         tools = create_subagent_tools(
