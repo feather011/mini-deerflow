@@ -4826,3 +4826,17 @@ This is mcp 2.x, where FastMCP was renamed to MCPServer ...
 
 **本轮未重跑全量**，未开新的独立复审，未触碰 PR #6 / #7。
 
+---
+
+## 交付记录（2026-11-06 收口）
+
+| 交付 | 分支 | 提交 | PR |
+|---|---|---|---|
+| TEST-01（7 个文件） | `automation/test-01` | `528babd` | **#8** https://github.com/feather011/mini-deerflow/pull/8 （base = `automation/tool-07`） |
+| HANDOVER-01 + GUARD-01（6 个文件） | `automation/handover-01` | `2adc6db`（内容提交） | **#9** https://github.com/feather011/mini-deerflow/pull/9 （base = `automation/test-01`） |
+
+- 授权范围：提交、推送、开 PR；**不合并**。两个 PR 均**不自动合并**。
+- 关联检查状态：**已关联的检查通过**（定向检查；**不等于所有验收条件已满足**）。
+- 4 个依赖外部仓库的回归文件：**未验证**（本轮不再申请执行）。
+- 未重跑全量、未开新复审、未触碰 PR #6 / #7。
+
