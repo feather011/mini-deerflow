@@ -2,7 +2,7 @@
 
 ## TEST-01：默认离线测试与真实 harness mock 接线（2026-11-03）
 
-- 状态：**READY_FOR_REVIEW** —— 隔离副本经其独立审查；**本机（Windows）已合入并复跑通过**；本机合入部分**尚未独立复审**。未 commit/push/merge。
+- 状态：**READY_FOR_REVIEW** —— 隔离副本经其独立审查；**本机（Windows）已合入并复跑通过**；本机合入部分**尚未独立复审**。已交付：提交 `528babd`，PR **#8**（base = `automation/tool-07`），**未 merge**。
 - 会话：codex-test01-20261103-isolated（隔离副本实现）；claude-worker-20261010-2015（2026-11-04 本机合入与复跑）。
 - 源码基线：隔离副本 a29af0c3fbcbbadca3a5159521a0884f35f25ad7；本机实际基线 **edd5d64**（= a29af0c + 662bbe2 BACKEND-02 修复 + edd5d64 复审结论记录），两者相差两个**仅后端**提交，本阶段未触及。
 - 662bbe2 尚未推送，未伪造该基线；本阶段不修改其生产文件或两个测试文件。
