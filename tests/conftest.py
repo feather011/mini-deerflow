@@ -29,3 +29,19 @@ def _pin_fake_model_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     # 压缩水位跨用例残留，制造出与真实行为无关的假失败。
     monkeypatch.delenv("MINI_DEERFLOW_CONTEXT_DB_PATH", raising=False)
     monkeypatch.delenv("MINI_DEERFLOW_CONTEXT_ENABLED", raising=False)
+
+def pytest_configure(config):
+    """pytest 默认离线；Python 子进程通过继承 PYTHONPATH 装载同一保护。
+
+    仅防止测试误连外部 Provider，不阻止恶意子进程绕过，不替代沙箱。
+    使用 python -I/-S 或显式清空环境的子进程不在此自动保护范围内。
+    """
+    import os
+    import runpy
+    from pathlib import Path
+
+    guard = Path(__file__).resolve().parent / "_offline_guard"
+    os.environ["MINI_DEERFLOW_TEST_OFFLINE"] = "1"
+    previous = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = str(guard) + (os.pathsep + previous if previous else "")
+    runpy.run_path(str(guard / "sitecustomize.py"))
