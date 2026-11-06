@@ -26,6 +26,29 @@ import time
 from pathlib import Path
 from typing import Optional
 
+
+def _test_runner(repo_path, timeout=60.0, max_tool_calls=50):
+    """专用配置 + 显式本地 endpoint；不继承开发者模型/代理选择。"""
+    from mini_deerflow.harness_runner import HarnessRunner
+    root = os.environ.get("HARNESS_ROOT")
+    if not root:
+        pytest.skip("需要显式设置 HARNESS_ROOT，指向已审查的 harnessagent")
+    env_file = repo_path.parent / "harness-test.env"
+    env_file.write_text("# test-only configuration; provider is injected explicitly\n", encoding="utf-8")
+    runner = HarnessRunner(harness_root=root, python_exe=sys.executable,
+                           timeout_seconds=timeout, max_tool_calls=max_tool_calls,
+                           env_file=str(env_file))
+    runner.set_extra_env({
+        "MINIMAX_API_KEY": "", "MINIMAX_OPENAI_BASE_URL": "", "MINIMAX_MODEL": "",
+        "MIMO_API_KEY": "fake-key-for-test", "MIMO_MODEL": "test-mock-model",
+        "HARNESS_USE_FAKE_LLM": "0", "HARNESS_FAKE_LLM_DELAY": "0",
+        "HTTP_PROXY": "", "HTTPS_PROXY": "", "ALL_PROXY": "",
+        "http_proxy": "", "https_proxy": "", "all_proxy": "",
+        "NO_PROXY": "127.0.0.1,localhost,::1", "no_proxy": "127.0.0.1,localhost,::1",
+    })
+    return runner
+
+
 import pytest
 
 
@@ -63,7 +86,7 @@ class _MockLLMHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        cls._calls.append({"path": self.path, "body": req})
+        cls._calls.append({"path": self.path, "body": req, "authorization": self.headers.get("Authorization")})
 
         if self.path.rstrip("/") in ("/v1/chat/completions", "/chat/completions"):
             self._handle_chat_completions(req)
@@ -231,25 +254,18 @@ class _MockServer:
 
     def start(self, scenario: dict):
         """启动服务器并返回 (host, port)。"""
-        # 找空闲端口
-        for port in range(19500, 19600):
-            try:
-                self._server = http.server.HTTPServer(("127.0.0.1", port), _MockLLMHandler)
-                break
-            except OSError:
-                continue
-        else:
-            raise RuntimeError("无法找到空闲端口")
-
-        self.port = port
+        self.stop()
+        self._server = http.server.HTTPServer(("127.0.0.1", 0), _MockLLMHandler)
+        self.port = self._server.server_address[1]
         _MockLLMHandler.reset(scenario)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        return f"http://127.0.0.1:{port}"
+        return f"http://127.0.0.1:{self.port}"
 
     def stop(self):
         if self._server:
             self._server.shutdown()
+            self._server.server_close()
             self._server = None
         if self._thread:
             self._thread.join(timeout=5)
@@ -297,25 +313,24 @@ def _run_harness(
     # 延迟导入避免循环
     from mini_deerflow.harness_runner import HarnessRunner
 
-    runner = HarnessRunner(
-        harness_root="D:/项目解读/harnessagent",
-        python_exe=sys.executable,
-        timeout_seconds=timeout,
-        max_tool_calls=scenario.get("max_tool_calls", 50),
-    )
+    runner = _test_runner(repo_path, timeout, scenario.get("max_tool_calls", 50))
 
     prompt = scenario.get("prompt", "写一个文件 test_output.txt，内容是 hello")
 
-    return runner.run(
+    result = runner.run(
         task_id="test-task-1",
         repo_path=str(repo_path),
         prompt=prompt,
         stop_event=stop_event,
         extra_env={
-            "MIMO_BASE_URL": mock_url,
+            "HARNESS_MIMO_BASE_URL": mock_url,
             "MIMO_API_KEY": "fake-key-for-test",
         },
     )
+    if result.status == "completed":
+        assert _MockLLMHandler.get_calls(), "任务完成但本地 mock 从未收到请求"
+        assert all(c["body"]["model"] == "test-mock-model" for c in _MockLLMHandler.get_calls())
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -404,12 +419,7 @@ def test_超时_timeout_终态(mock_server, repo_path):
     """墙钟超时 → timeout 终态 + timed_out=True。"""
     from mini_deerflow.harness_runner import HarnessRunner
 
-    runner = HarnessRunner(
-        harness_root="D:/项目解读/harnessagent",
-        python_exe=sys.executable,
-        timeout_seconds=2.0,  # 2 秒超时
-        max_tool_calls=50,
-    )
+    runner = _test_runner(repo_path, timeout=2.0)
 
     # 用一个会挂起的场景：连接不存在的端口
     fake_url = "http://127.0.0.1:15999"
@@ -420,7 +430,7 @@ def test_超时_timeout_终态(mock_server, repo_path):
         prompt="读取当前目录的文件",
         stop_event=None,
         extra_env={
-            "MIMO_BASE_URL": fake_url,
+            "HARNESS_MIMO_BASE_URL": fake_url,
             "MIMO_API_KEY": "fake-key-for-test",
         },
     )
@@ -435,70 +445,20 @@ def test_超时_timeout_终态(mock_server, repo_path):
 
 def test_协议错误_非JSON行(mock_server, repo_path):
     """stdout 出现非 JSON 行 → protocol_error 终态。"""
-    # 通过 mock server 注入一行非 JSON 到 stdout
-    # 但这需要在 harness 内部实现... 改用另一种方式：
-    # 直接用 Popen 注入污染行到 stdout
-
+    from unittest.mock import patch
     from mini_deerflow.harness_runner import HarnessRunner
+    real_popen = subprocess.Popen
+    runner = _test_runner(repo_path, timeout=10.0)
 
-    runner = HarnessRunner(
-        harness_root="D:/项目解读/harnessagent",
-        python_exe=sys.executable,
-        timeout_seconds=10.0,
-        max_tool_calls=50,
-    )
+    def malformed_process(argv, **kwargs):
+        # 只替换子进程内容，仍用生产 Runner 的读取/终态/回收逻辑。
+        return real_popen([sys.executable, "-c", "print('not-json')"], **kwargs)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-        f.write("写一个文件 x.txt，内容是 test")
-        prompt_file = f.name
-
-    env = dict(os.environ)
-    env["MIMO_BASE_URL"] = mock_server.start({"type": "write_file", "num_tool_calls": 1})
-    env["MIMO_API_KEY"] = "fake-key-for-test"
-    env["HARNESS_NONINTERACTIVE"] = "1"
-    env["PYTHONPATH"] = "D:/项目解读/harnessagent" + os.pathsep + env.get("PYTHONPATH", "")
-
-    argv = [
-        sys.executable,
-        "-m", "harness.noninteractive",
-        "--task-id", "test-protocol",
-        "--prompt-file", prompt_file,
-        "--max-tool-calls", "50",
-    ]
-
-    process = subprocess.Popen(
-        argv,
-        cwd=str(repo_path),
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
-
-    # 读取子进程输出，注入污染行，然后传给 harness_runner 解析
-    # 这需要直接操作 harness_runner 的内部协议解析逻辑
-    # 最简单的方式：直接用 HarnessRunner 的 run() 方法，
-    # 然后检查 unmapped_lines（如果有非 JSON 输出会计入）
-
-    # 实际上，我们测试 protocol_error 的方式是：
-    # 让 mock server 直接返回会触发错误的响应...
-    # 或者用一个更简单的方法：直接用 HarnessRunner.run() 然后验证
-
-    # 用一个已知会成功的场景，检查 unmapped_lines = 0
-    mock_server.start({"type": "write_file", "num_tool_calls": 1})
-
-    result = _run_harness(repo_path, env["MIMO_BASE_URL"], {"type": "write_file"})
-
-    # 注意：这里我们没有注入污染行，所以应该是 completed
-    # protocol_error 的测试需要特殊处理
-    assert result.status in ("completed", "failed", "protocol_error")
-    # 如果 completed，说明进程正常退出且有 done 事件
-    # unmapped_lines 应该为 0（因为 mock 返回的都是 JSON）
-    assert result.unmapped_lines == 0, f"期望 0 个非 JSON 行，实际 {result.unmapped_lines}"
+    with patch("mini_deerflow.harness_runner.subprocess.Popen", side_effect=malformed_process):
+        result = runner.run(task_id="test-protocol", repo_path=str(repo_path), prompt="test")
+    assert result.status == "protocol_error"
+    assert result.unmapped_lines == 1
+    assert result.exit_code == 0
 
 
 # ---------------------------------------------------------------------------
@@ -583,12 +543,17 @@ def test_连续权限拒绝_每次都计数():
 def test_正常调用_计数与seq跟随():
     """正常调用：tool_calls 递增，tool_events 有内容。"""
     mock = _MockServer()
-    mock_url = mock.start({"type": "write_file", "num_tool_calls": 1})
-    result = _run_harness(Path(tempfile.mkdtemp()), mock_url, {"type": "write_file"})
-    mock.stop()
-    assert result.status == "completed"
-    assert result.tool_calls >= 1
-    assert len(result.tool_events) >= 1  # tool_start + tool_done
+    try:
+        mock_url = mock.start({"type": "write_file", "num_tool_calls": 1})
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / "repo"
+            repo.mkdir()
+            result = _run_harness(repo, mock_url, {"type": "write_file"})
+        assert result.status == "completed"
+        assert result.tool_calls >= 1
+        assert len(result.tool_events) >= 1  # tool_start + tool_done
+    finally:
+        mock.stop()
 
 
 def test_同一响应多个调用_全部计数(mock_server, repo_path):
@@ -657,28 +622,21 @@ def test_同一响应多个调用_全部计数(mock_server, repo_path):
             self.end_headers()
             self.wfile.write(json.dumps(response).encode("utf-8"))
 
-    # 启动多工具 mock server
-    for port in range(19700, 19800):
-        try:
-            multi_server = http.server.HTTPServer(("127.0.0.1", port), _MultiHandler)
-            break
-        except OSError:
-            continue
-    else:
-        pytest.skip("无法找到空闲端口")
-
+    # 交由 OS 选择端口；即使 runner 抛异常/skip 也必须关闭服务。
+    multi_server = http.server.HTTPServer(("127.0.0.1", 0), _MultiHandler)
     _MultiHandler.reset({"type": "multi_tool", "max_calls": 2})
     multi_thread = threading.Thread(target=multi_server.serve_forever, daemon=True)
     multi_thread.start()
-    multi_url = f"http://127.0.0.1:{port}"
-
-    result = _run_harness(repo_path, multi_url, {"type": "multi_tool"})
-    multi_server.shutdown()
-    multi_thread.join(timeout=5)
-
-    assert result.tool_calls >= 1, (
-        f"同一响应多个调用应全部计数，期望 >= 1，实际 {result.tool_calls}"
-    )
+    multi_url = f"http://127.0.0.1:{multi_server.server_address[1]}"
+    try:
+        result = _run_harness(repo_path, multi_url, {"type": "multi_tool"})
+        assert result.tool_calls >= 1, (
+            f"同一响应多个调用应全部计数，期望 >= 1，实际 {result.tool_calls}"
+        )
+    finally:
+        multi_server.shutdown()
+        multi_server.server_close()
+        multi_thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -744,3 +702,36 @@ def test_超限后_handler不执行_宿主收到失败终态(mock_server, repo_p
         f"超限后锁应释放以便后续任务执行，实际无法获取"
     )
     lock.release(project_id, owner2)
+
+
+# TEST-01：真实子进程消费隔离配置，不能用 FakeLLM 的成功绕过 mock。
+def test_污染父配置_仍请求本地mock并写文件(mock_server, repo_path, monkeypatch):
+    monkeypatch.setenv("MINIMAX_API_KEY", "TEST_POISON_PARENT_KEY")
+    monkeypatch.setenv("MINIMAX_OPENAI_BASE_URL", "https://provider.invalid/v1")
+    monkeypatch.setenv("HARNESS_MIMO_BASE_URL", "https://fallback.invalid/v1")
+    monkeypatch.setenv("HARNESS_USE_FAKE_LLM", "1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    developer_env = repo_path.parent / "developer.env"
+    developer_env.write_text("MINIMAX_API_KEY=TEST_POISON_DOTENV_KEY\n", encoding="utf-8")
+    monkeypatch.setenv("HARNESS_ENV_FILE", str(developer_env))
+    url = mock_server.start({"type": "write_file", "num_tool_calls": 1})
+    result = _run_harness(repo_path, url, {"type": "write_file"})
+    assert result.status == "completed", result.error
+    assert (repo_path / "test_output.txt").read_text() == "hello from harness\n"
+    calls = mock_server.get_calls()
+    assert len(calls) >= 2  # 首轮工具调用 + 结果回灌
+    assert all(c["authorization"] == "Bearer fake-key-for-test" for c in calls)
+    assert all(c["body"]["model"] == "test-mock-model" for c in calls)
+
+
+def test_mock关闭_明确失败不回退公网(mock_server, repo_path, monkeypatch):
+    monkeypatch.setenv("MINIMAX_API_KEY", "TEST_POISON_PARENT_KEY")
+    monkeypatch.setenv("MINIMAX_OPENAI_BASE_URL", "https://provider.invalid/v1")
+    url = mock_server.start({"type": "write_file"})
+    mock_server.stop()
+    result = _run_harness(repo_path, url, {}, timeout=15.0)
+    assert result.status in ("failed", "protocol_error"), (result.status, result.error)
+    assert result.exit_code is not None
+    assert mock_server.get_calls() == []
+    assert not (repo_path / "test_output.txt").exists()
+    assert "provider.invalid" not in result.stderr_tail
