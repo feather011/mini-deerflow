@@ -40,6 +40,10 @@ from mini_deerflow.project_store import (
 )
 from mini_deerflow.thread_store import ThreadNotFoundError, ThreadStore
 from mini_deerflow.tools import Tool
+from mini_deerflow.verification_guard import (
+    evaluate_verification,
+    execution_failed_verdict,
+)
 
 __all__ = [
     "PROJECT_READ_FILE_TOOL_NAME",
@@ -1011,13 +1015,18 @@ def create_project_execute_tool(
 
         # 引导主 Agent 填写任务范围和验收条件（如有）
         scope = arguments.get("scope", "")
-        if isinstance(scope, str) and scope.strip():
-            prompt_parts.append(f"任务范围：{scope.strip()}")
+        scope = scope.strip() if isinstance(scope, str) else ""
         acceptance = arguments.get("acceptance", "")
-        if isinstance(acceptance, str) and acceptance.strip():
-            prompt_parts.append(f"验收条件：{acceptance.strip()}")
+        acceptance = acceptance.strip() if isinstance(acceptance, str) else ""
+        if scope:
+            prompt_parts.append(f"任务范围：{scope}")
+        if acceptance:
+            prompt_parts.append(f"验收条件：{acceptance}")
 
         prompt = "\n\n".join(prompt_parts)
+
+        # 交接要素盘点：让"边界没交过去"这件事在会话内可见（此前是静默缺口）
+        handover = _build_handover(context_raw, scope, acceptance)
 
         # 快照：持有项目锁后采集执行前基线（所有终态都需要）
         baseline = _snapshot_workspace(repo_path)
@@ -1062,8 +1071,17 @@ def create_project_execute_tool(
             changes["baseline_complete"] = baseline_complete
             changes["snapshot_complete"] = after_complete
 
+            # 验证判定（Guard）：**status=completed 只说明执行器跑完了**，
+            # 不代表用户的验收条件已经满足。结论一律由代码从证据算出 ——
+            # 模型只能转述，不能自己判定"已完成"。
+            verification = _build_verification(result)
+            guard = evaluate_verification(
+                verification,
+                acceptance,
+                has_changes=bool(changes.get("files")),
+            )
+
             if result.status == STATUS_COMPLETED:
-                verification = _build_verification(result)
                 body = {
                     "ok": True,
                     "status": "completed",
@@ -1071,6 +1089,9 @@ def create_project_execute_tool(
                     "answer": result.final_answer,
                     "files_written": result.files_written,
                     "verification": verification,
+                    "guard": guard,
+                    "acceptance": acceptance,
+                    "handover": handover,
                     "changes": changes,
                     "tool_events": [
                         {
@@ -1090,7 +1111,10 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": _build_verification(result),
+                    "verification": verification,
+                    "guard": guard,
+                    "acceptance": acceptance,
+                    "handover": handover,
                     "changes": changes,
                     "error": _executor_error(result.error, "任务被停止"),
                     "tool_events": [
@@ -1108,7 +1132,10 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": _build_verification(result),
+                    "verification": verification,
+                    "guard": guard,
+                    "acceptance": acceptance,
+                    "handover": handover,
                     "changes": changes,
                     "error": f"执行超时（{runner._timeout_seconds}s），任务已被终止",
                     "tool_events": [
@@ -1119,21 +1146,25 @@ def create_project_execute_tool(
                 }
                 return ok_response(**body)
             elif result.status == STATUS_LAUNCH_FAILED:
-                return err_response(
+                return _err_with_guard(
                     "execute",
                     _executor_error(result.error, "执行器启动失败，请检查执行器配置"),
-                    kind="error",
-                    code=PROJECT_TOOL_CODES["launch_failed"],
+                    PROJECT_TOOL_CODES["launch_failed"],
+                    execution_failed_verdict(
+                        "执行器启动失败，本轮没有任何验证证据"
+                    ),
                 )
             elif result.status == STATUS_PROTOCOL_ERROR:
-                return err_response(
+                return _err_with_guard(
                     "execute",
                     _executor_error(
                         result.error,
                         f"执行器协议错误（{result.unmapped_lines} 行非法输出）",
                     ),
-                    kind="error",
-                    code=PROJECT_TOOL_CODES["protocol_error"],
+                    PROJECT_TOOL_CODES["protocol_error"],
+                    execution_failed_verdict(
+                        "执行器协议错误，本轮没有任何可采信的验证证据"
+                    ),
                 )
             else:  # STATUS_FAILED / unknown
                 body = {
@@ -1143,7 +1174,10 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": _build_verification(result),
+                    "verification": verification,
+                    "guard": guard,
+                    "acceptance": acceptance,
+                    "handover": handover,
                     "changes": changes,
                     "error": _executor_error(
                         result.error, f"执行失败（{result.status}）"
@@ -1163,10 +1197,15 @@ def create_project_execute_tool(
         description=(
             "在绑定仓库内执行编码任务（调用 harness 执行器）。"
             "当任务涉及创建文件、修改代码、运行程序或验证输出时，应使用本工具。"
-            "task 为任务描述；context 为补充背景（如相关文件、之前的讨论等）。"
-            "scope 为任务范围约束（可选，如'单文件输出'）；"
-            "acceptance 为验收条件（可选，如'运行后输出正确'）。"
-            "返回包含 files_written、verification（含退出码）和 changes diff。"
+            "四个参数各有分工：task 写要达成的目标；"
+            "context 写用户已确认的背景与约束（无则写'无'，不要编造）；"
+            "scope 写范围边界（改哪些文件、明确不做什么）；"
+            "acceptance 写验收条件（跑什么命令、期望什么结果）。"
+            "返回包含 files_written、verification（含退出码）、changes diff、handover"
+            "（本次交接带了哪些要素）与 guard（系统按证据算出的权威验证结论："
+            "verified 验证通过 / unverified 有改动但未验证 / failed 验证失败）。"
+            "**status=completed 只说明执行器跑完了，不代表验收条件已满足** —— "
+            "汇报结论一律以 guard 为准，不要自己复述未验证的结果。"
             "已有改动会被保留；不自动提交或推送。只能由项目会话调用。"
         ),
         parameters={
@@ -1198,6 +1237,50 @@ def create_project_execute_tool(
         handler=_as_tool_result("execute", _execute),
         needs_context=True,
     )
+
+
+def _err_with_guard(action: str, error: str, code: str, guard: dict) -> str:
+    """带验证判定的错误响应。
+
+    ``launch_failed`` / ``protocol_error`` 这两条路径拿不到任何验证记录，
+    但它们同样不能让主 Agent 自由写"已完成" —— 所以错误响应里也带
+    ``guard``，让结论闸门有依据可依。
+
+    形状与 ``context_shared.err_response`` 一致（ok/action/error/kind/code），
+    只多一个 ``guard`` 键。
+    """
+    import json
+
+    return json.dumps(
+        {
+            "ok": False,
+            "action": action,
+            "error": error,
+            "kind": "error",
+            "code": code,
+            "guard": guard,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _build_handover(context_raw: str, scope: str, acceptance: str) -> dict:
+    """盘点本次交接实际带了哪些要素，让缺口在会话内可见。
+
+    背景：交接缺口此前是**静默**的 —— 主 Agent 只填 task 时，执行 Agent 仍会
+    收到固定约束规则（`_TASK_RULES`），但"用户确认的边界没有交过去"这件事，
+    主 Agent 和用户都看不到，只能等执行结果不对才发现。
+
+    这里把三要素的到位情况显式放进工具结果：主 Agent 在同一会话里就能看到
+    `missing`，补齐后再派发；用户也能从结果里知道这一轮交接带了什么。
+    """
+    provided = {
+        "context": bool(context_raw.strip()),
+        "scope": bool(scope),
+        "acceptance": bool(acceptance),
+    }
+    missing = [name for name, ok in provided.items() if not ok]
+    return {"provided": provided, "missing": missing, "complete": not missing}
 
 
 def _build_verification(result) -> list[dict]:
