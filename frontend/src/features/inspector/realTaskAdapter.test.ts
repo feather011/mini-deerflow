@@ -658,3 +658,171 @@ describe('realTaskAdapter 多段 hunk 解析', () => {
     expect(file?.diff.some((l) => l.text === '++ 新增行')).toBe(true)
   })
 })
+
+// ---- 判定以代码（guard）为准：前端不再自己按退出码推断结论 ----
+
+describe('realTaskAdapter guard 判定', () => {
+  function seed(threadId: string): void {
+    ingestRealTaskData(threadId, {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-guard',
+      title: threadId,
+    })
+  }
+
+  it('有 guard 时：判定与 guard 一致，不用前端推断', () => {
+    seed('thread-G1')
+    ingestProjectExecuteResult(
+      'thread-G1',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        // 两条命令：一条 0、一条 2 —— guard 判 failed
+        verification: [
+          { command: 'pytest -q', exit_code: 0, output: 'ok' },
+          { command: 'pytest -q tests/x.py', exit_code: 2, output: 'boom' },
+        ],
+        guard: {
+          verdict: 'failed',
+          label: '验证失败',
+          reason: '1 条验证命令退出码非 0：pytest -q tests/x.py',
+          acceptance_covered: true,
+        },
+      }),
+    )
+    const validation = realTaskAdapter.getTask('thread-G1')?.validation
+    expect(validation?.guard?.verdict).toBe('failed')
+    expect(validation?.status).toBe('failed')
+    // 逐条命令的结构化退出码都在
+    expect(validation?.entries.map((e) => e.exit_code)).toEqual([0, 2])
+    expect(validation?.entries.map((e) => e.passed)).toEqual([true, false])
+    // 说明文字来自 guard.reason，不是前端拼的
+    expect(validation?.note).toBe('1 条验证命令退出码非 0：pytest -q tests/x.py')
+  })
+
+  it('没有 guard 的旧记录：明确未判定，且不用退出码自己补结论', () => {
+    seed('thread-G2')
+    ingestProjectExecuteResult(
+      'thread-G2',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        // 退出码非 0，但这条记录没有 guard 字段
+        verification: [{ command: 'pytest -q', exit_code: 2, output: 'boom' }],
+      }),
+    )
+    const validation = realTaskAdapter.getTask('thread-G2')?.validation
+    expect(validation?.guard).toBeNull()
+    // 关键：不能因为退出码非 0 就自己判成 failed
+    expect(validation?.status).toBe('not_run')
+    expect(validation?.note).toContain('未判定')
+    // 原始证据仍然列出来
+    expect(validation?.entries).toHaveLength(1)
+    expect(validation?.entries[0]?.exit_code).toBe(2)
+  })
+
+  it('退出码缺失就是缺失：不默认成 0，也不算通过', () => {
+    seed('thread-G3')
+    ingestProjectExecuteResult(
+      'thread-G3',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        verification: [{ command: 'pytest -q', output: 'no exit info' }],
+        guard: {
+          verdict: 'unverified',
+          label: '未验证',
+          reason: '1 条验证命令的退出码无法解析，不能判定为通过',
+          acceptance_covered: null,
+        },
+      }),
+    )
+    const validation = realTaskAdapter.getTask('thread-G3')?.validation
+    expect(validation?.entries[0]?.exit_code).toBeNull()
+    expect(validation?.entries[0]?.passed).toBeNull()
+    expect(validation?.guard?.verdict).toBe('unverified')
+  })
+
+  it('guard.verdict 认不出来时按"没有判定"处理，不猜', () => {
+    seed('thread-G4')
+    ingestProjectExecuteResult(
+      'thread-G4',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        verification: [{ command: 'pytest -q', exit_code: 0 }],
+        guard: { verdict: 'whatever' },
+      }),
+    )
+    const validation = realTaskAdapter.getTask('thread-G4')?.validation
+    expect(validation?.guard).toBeNull()
+    expect(validation?.status).toBe('not_run')
+  })
+})
+
+describe('realTaskAdapter 历史结果与"从未执行过"的区分', () => {
+  it('刷新后恢复历史结果：状态记为有历史结果，副标题不说"尚未建立 Run"', () => {
+    ingestRealTaskData('thread-H1', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: '刷新后的会话',
+    })
+    ingestProjectExecuteResult(
+      'thread-H1',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        verification: [{ command: 'pytest -q', exit_code: 0 }],
+        guard: { verdict: 'verified', label: '验证通过', reason: 'ok' },
+        changes: { files: [{ path: 'a.py', status: 'added' }] },
+      }),
+    )
+    const task = realTaskAdapter.getTask('thread-H1')
+    // 关键：不得说成"从未执行过"
+    expect(task?.last_result_status).toBe('completed')
+    expect(task?.run_label).not.toContain('尚未建立 Run')
+    expect(task?.run_label).toContain('历史运行结果')
+    // 证据仍在
+    expect(task?.files).toHaveLength(1)
+    expect(task?.validation.guard?.verdict).toBe('verified')
+  })
+
+  it('没有任何执行记录时：last_result_status 为 null，副标题维持"尚未建立 Run"', () => {
+    ingestRealTaskData('thread-H2', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: '从没跑过的会话',
+    })
+    const task = realTaskAdapter.getTask('thread-H2')
+    expect(task?.last_result_status ?? null).toBeNull()
+    expect(task?.run_label).toContain('尚未建立 Run')
+  })
+
+  it('新 run 开始时清掉上一轮的历史标记（新一轮开始≠从未执行过，但面板显示当前轮为空）', () => {
+    ingestRealTaskData('thread-H3', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: '会话',
+    })
+    ingestProjectExecuteResult(
+      'thread-H3',
+      JSON.stringify({ ok: true, status: 'completed', verification: [] }),
+    )
+    expect(realTaskAdapter.getTask('thread-H3')?.last_result_status).toBe('completed')
+
+    // 新 run 开始：runId 变化
+    ingestRealTaskData('thread-H3', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-new',
+      title: '会话',
+    })
+    expect(realTaskAdapter.getTask('thread-H3')?.last_result_status).toBeNull()
+    // run_label 取 runId 前 4 位：run-new → run-run
+    expect(realTaskAdapter.getTask('thread-H3')?.run_label).toContain('run-run')
+  })
+})
