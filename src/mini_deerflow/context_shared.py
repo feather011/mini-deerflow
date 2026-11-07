@@ -111,5 +111,9 @@ def emit_event(
             status=status,
             error_type=error_type,
             metadata=metadata or {},
+            # TRACE-01：上下文事件的 operation 也叫 MODEL_CALL / TOOL_CALL，
+            # 与中间件的 span **同名** —— 用 kind 区分，否则两串事件会被
+            # 混成同一条链。
+            kind="context",
         )
     )

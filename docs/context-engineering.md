@@ -236,6 +236,118 @@ budget.total_provider_calls()   # 两者之和，对外的用量指标仍要合�
 （`compaction.failed` 只由 Compactor 发一次；Assembler 的降级决策记在随后那条
 `context.assembled` 的 `compaction_fallback` 里，避免同名事件重复出现。）
 
+### 调用链 span（TRACE-01）
+
+上表是**上下文事件**（`kind="context"`）；下面是一次运行的**调用链 span**
+（`kind="span"`）。两者用 `kind` 区分 —— 上下文事件的 `operation` 也叫
+`MODEL_CALL` / `TOOL_CALL`，与 span 同名，不区分就会把两串事件混成一条链。
+
+| 字段 | 含义 |
+|---|---|
+| `event_id` | span 的唯一 id；running 记录与终态记录**共用**它 |
+| `parent_id` | 父 span 的 `event_id`；`null` 表示根 |
+| `run_id` | 所属运行；同一次运行的**所有** span（含子代理）都挂在它下面 |
+| `operation` | `AGENT_RUN` / `MODEL_CALL` / `TOOL_CALL` / `SUBAGENT_TASK` |
+| `status` | `running` / `success` / `error` / `cancelled` / `timeout` |
+| `error_detail` | **受控**的失败原因；见下方「失败原因怎么写」 |
+| `kind` | `span` / `context` |
+
+**形态**：span 发两条记录 —— 一条 `running`、一条终态，共用 `event_id`；
+手工发的事件（上下文事件、子代理事件）一条即终态。消费方按 `event_id`
+分组时，**正常执行路径中每个 running span 应对应唯一终态**；
+异常中断、进程退出或部分 Trace 丢失时，可能出现悬空 span
+（中间件 `before` 抛错时不会执行 `finally_`，见下方「已知限制」）。
+
+> **已知限制**：中间件管线的 `before` 循环在 `try` 之外，该循环抛错时不会执行
+> `finally_` → span 可能停在 `running`（悬空）。这是中间件执行语义的既有问题，
+> 修它要变更「哪些中间件的 finally 该跑」，不在 Trace 阶段范围内。
+> 查询工具 `scripts/trace_query.py` 会把这类悬空 span 原样显示为 `[running]`。
+
+**层级**：`AGENT_RUN` → `MODEL_CALL` → `TOOL_CALL` → `MODEL_CALL` …，
+子代理的 `SUBAGENT_TASK` 挂在发起它的那个 `TOOL_CALL` 之下。
+
+### 终态：停止 vs 超时（TRACE-01）
+
+「用户主动停止」和「模型调用自然超时」在 Agent 层**置位的是同一个取消令牌**
+——模型超时靠 `threading.Timer` 到期时调 `token.cancel()` 实现
+（`src/mini_deerflow/agent.py`）。所以只看 `is_cancelled()` 分不出二者。
+
+Trace 的终态分类因此看**首次取消的原因**（`CancellationToken.cancel_reason()`），
+而不是只看令牌是否置位：
+
+| 情况 | 首次取消原因 | Trace 终态 |
+|---|---|---|
+| 用户点了停止 | `cancelled` | `cancelled` |
+| 模型调用自然超时（定时器到期） | `model_timeout` | `timeout` |
+| 用户先停止，随后模型超时定时器才到期 | `cancelled`（**首次原因胜出**） | `cancelled` |
+| 运行未带取消令牌时模型超时 | —— | `timeout`（按异常 `resource == "model_call_timeout"`） |
+
+首次原因胜出是有意的：用户先点停止、随后定时器才到期时，原因不能被后来的
+超时覆盖 —— 否则用户明明是自己停的，Trace 却记成 `timeout`，直接误导排障。
+
+**取消原因是唯一的底层事实**：API 与 Trace 读**同一个**
+`CancellationToken.cancel_state()`（一次加锁拿到「是否取消 + 首次原因」），
+各自映射到自己的公开状态，不再各判各的：
+
+| 内部事实 | Trace 状态 | SSE 状态（本轮保持兼容） |
+|---|---|---|
+| `cancelled`（用户停止） | `cancelled` | `run.cancelled` |
+| `model_timeout`（模型超时） | `timeout` | `run.cancelled`（兼容映射） |
+
+**SSE 的兼容映射只影响表示层**（终态事件名）。清理 / 恢复 / 持久化路径由
+**取消令牌本身**驱动，与终态事件名无关：
+
+- `api/services/agent_runs.py` 的 `finally` → `unregister_run(run_id, cancelled=令牌是否置位)`
+  → `runtime._cancelled_runs` → `_is_run_alive`（拒绝旧 run 的确认执行）；
+- 「用户停止」与「模型超时」**都置位同一个令牌** → 两种情况的清理行为完全一致。
+
+因此 SSE 把超时兼容映射成 `run.cancelled` 不会让超时的 run 走错清理 / 持久化路径。
+公开映射将来要改成 `run.timed_out` 时，改动是 `agent_runs.py` 里的一行
+（把 `reason == "model_timeout"` 分支改抛 `AgentRunTimeoutError`），
+前端已支持 `run.timed_out` 终态 —— 但那会改变 HTTP 状态码（503 → 504），
+属于契约变更，需与前端 / 客户端一起排期，不在本阶段范围。
+
+### 失败原因怎么写（TRACE-01）
+
+`error_detail` 一律由**受控**规则生成，**不依赖「异常消息本身安全」这个约定**：
+
+| 异常 | `error_detail` |
+|---|---|
+| `ModelError` 的已知子类 | **固定文案**（如 `模型服务端错误` / `模型调用被限流` / `模型鉴权失败` / `模型调用超时`） |
+| `ModelError` 的未知子类 | `模型调用失败` |
+| `BudgetExceededError` 且 `resource` 在**允许列表**内 | `预算耗尽：<resource>（上限: N）` |
+| `BudgetExceededError` 且 `resource` 不在允许列表 | 空串（整条不放行） |
+| `TimeoutError` 家族 | `超时` |
+| 其它异常 | 空串 |
+
+- **不放行 `str(exc)`**：异常类型不构成安全保证 —— 上游服务的错误正文可能带请求信息或敏感串，截断只能限长、不能保证安全。完整原文留在服务端日志（`_LOGGER.exception`）里；异常**类名**另有 `error_type` 字段承载。
+- **预算资源走允许列表**：`resource` 只是**约定**为固定枚举，不是代码保证 —— `lead_agent` 的预算错误实际会传 `lease:<id>:<resource>` 这类动态串。新增预算资源时必须同步加进允许列表（`trace_safety.py::_ALLOWED_BUDGET_RESOURCES`）。
+
+### Trace 写不进去怎么办（两级失败策略）
+
+| 阶段 | 情形 | 行为 |
+|---|---|---|
+| **启动期** | 路径不可写（目录不存在、无权限、路径是目录） | **直接报错**：`RuntimeError: Trace 文件不可写：…`。此时还没产出任何工作，明确失败最省事，也避免「配了 Trace 但什么都没落盘」这种最难排查的状态 |
+| **运行期** | 写入出错（磁盘满、文件系统故障） | **不中断 Agent 运行**，但记一条 **ERROR** 日志（明确写出「本次运行的 Trace 不完整」），并把该 sink 标记为 degraded —— 后续事件直接跳过，不反复失败、不刷日志 |
+
+为什么这样分：Trace 是**显式开启的观测能力**（默认关闭），不是业务事实源 ——
+业务事实（线程消息、确认请求）走 ThreadStore / ConfirmationStore。
+已经完成的用户工作不应因为「调试轨迹写不进去」而作废；
+但「轨迹悄悄少了一半」比失败更难排查，所以运行期失败必须留下 ERROR 记录。
+
+### 在哪看（TRACE-01）
+
+| 要看的东西 | 在哪 |
+|---|---|
+| Web 后端可配置启用 Trace（**默认关闭**） | 环境变量 `MINI_DEERFLOW_TRACE_ENABLED=1` → `ApiSettings.trace_enabled` → `RuntimeConfig.trace_enabled` |
+| JSONL 文件位置 | `MINI_DEERFLOW_TRACE_PATH=<路径>` → `ApiSettings.trace_path` → `RuntimeConfig.trace_path`；不设置则只在进程内存里（退出即丢） |
+| 路径不可写时的表现 | **启动即报错**：`RuntimeError: Trace 文件不可写：<路径>（…）。请确认目录存在且当前用户有写权限，或改用其它 trace_path。` ——不静默降级 |
+| 运行期写入失败（磁盘满等） | **不中断 Agent 运行**，但记 ERROR 日志说明「本次运行的 Trace 不完整」，后续事件跳过 —— 见「Trace 写不进去怎么办」 |
+| 按 `run_id` 查询 | `python scripts/trace_query.py <trace.jsonl> --run-id run-xxxxxxxx`（另有 `--list-runs` 列出文件里所有 run_id、`--status <终态>` 只看某类终态） |
+| 落盘内容 | 只有 id / 父子关系 / operation / status / duration / token 计数等元数据 ——**不含**凭据、完整提示词、文件正文、原始工具参数与结果 |
+
+CLI / 运行时侧不经过 Web 后端，用 `RuntimeConfig(trace_enabled=True, trace_path=...)` 打开。
+
 ## 安全边界
 
 1. **凭据不进摘要**：`ConversationSummary.build()` 会检测

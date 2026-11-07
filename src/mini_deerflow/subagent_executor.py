@@ -61,10 +61,77 @@ from mini_deerflow.middleware import (  # noqa: E402, F401
     BudgetExceededError,
     ChildBudget,
 )
+from mini_deerflow.middleware import OperationType, TraceEvent, TraceSink  # noqa: E402
+from mini_deerflow.middleware import (  # noqa: E402
+    ExecutionContext,
+    classify_terminal_status,
+)
+from mini_deerflow.trace_safety import safe_trace_detail  # noqa: E402
 
 # 预算既可以是 Budget 本体，也可以是 ChildBudget 视图（父子共享 + 局部更严）。
 # 二者接口一致：consume_* 与 max_* 读属性。
 BudgetLike = SubagentBudget | ChildBudget
+
+
+# --- Trace（TRACE-01） ---
+#
+# 子代理**不走中间件管线**（没有 pipeline，模型调用是裸调），因此它的 span
+# 由本模块手工发。形态与中间件产生的 span 略有不同：
+# 手工事件**一条即终态**（含 start / end / duration / status），
+# 中间件的 span 是两段式（running + 终态）。
+# 消费方按 event_id 分组时，两种形态都要能读：终态记录恰为 1 条。
+
+def _emit_subagent_event(
+    sink: TraceSink,
+    *,
+    event_id: str,
+    parent_id: str | None,
+    run_id: str,
+    thread_id: str,
+    operation: str,
+    name: str,
+    status: str,
+    start: float,
+    task_id: str | None = None,
+    error_type: str | None = None,
+    error_detail: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    """手工发一条子代理 Trace 事件（一条即终态）。"""
+    now = time.monotonic()
+    sink.emit(TraceEvent(
+        event_id=event_id,
+        parent_id=parent_id,
+        run_id=run_id,
+        thread_id=thread_id,
+        task_id=task_id,
+        operation=operation,
+        name=name,
+        start=start,
+        end=now,
+        status=status,
+        error_type=error_type,
+        metadata=metadata or {},
+        kind="span",
+        error_detail=error_detail,
+    ))
+
+
+def safe_failure_reason(result: "SubagentResult | None") -> str:
+    """子任务失败原因的**受控**表述。
+
+    只给终态语义与异常**类型名**，绝不放行 `error_message` ——
+    那里可能带第三方 SDK 的原始文本（路径、凭据、用户数据）。
+    """
+    if result is None:
+        return ""
+    if result.terminal_status == TaskStatus.SUCCEEDED:
+        return ""
+    if result.terminal_status == TaskStatus.CANCELLED:
+        return "任务被取消"
+    if result.terminal_status == TaskStatus.TIMED_OUT:
+        return "任务超时"
+    return f"子任务失败（{result.error_type or '未知错误'}）"
 
 
 # --- Cancellation Token ---
@@ -117,8 +184,67 @@ class SubagentRunner:
     parent_granted_capabilities: frozenset = field(default_factory=frozenset)
     # TOOL-02：子任务继承父 Agent 的 project_id
     parent_project_id: str | None = None
+    # TRACE-01：父侧工具 span 的 id —— 子代理的 SUBAGENT_TASK span 挂在它下面
+    parent_span_id: str | None = None
+    # TRACE-01：Trace sink（子代理不走中间件管线，span 手工发）
+    trace_sink: "TraceSink | None" = None
 
     def run(self) -> SubagentResult:
+        """执行子任务并返回结果。
+
+        TRACE-01：整个子任务发一条 `SUBAGENT_TASK` span（一条即终态）。
+        """
+        span_id = uuid.uuid4().hex
+        started = time.monotonic()
+        result: SubagentResult | None = None
+        try:
+            result = self._run_task_body(span_id)
+            return result
+        finally:
+            self._emit_task_span(span_id, started, result)
+
+    def _emit_task_span(
+        self,
+        span_id: str,
+        started: float,
+        result: SubagentResult | None,
+    ) -> None:
+        """发 SUBAGENT_TASK 终态事件。"""
+        sink = self.trace_sink
+        if sink is None:
+            return
+        if result is None:
+            status = "error"
+            error_type = None
+        elif result.terminal_status == TaskStatus.SUCCEEDED:
+            status = "success"
+            error_type = None
+        elif result.terminal_status == TaskStatus.CANCELLED:
+            status = "cancelled"
+            error_type = result.error_type
+        elif result.terminal_status == TaskStatus.TIMED_OUT:
+            status = "timeout"
+            error_type = result.error_type
+        else:
+            status = "error"
+            error_type = result.error_type
+        _emit_subagent_event(
+            sink,
+            event_id=span_id,
+            parent_id=self.parent_span_id,
+            run_id=self.parent_run_id or self.run_id,
+            thread_id=f"subagent-{self.task.task_id}",
+            task_id=self.task.task_id,
+            operation=OperationType.SUBAGENT_TASK.name,
+            name="subagent_task",
+            status=status,
+            start=started,
+            error_type=error_type,
+            error_detail=safe_failure_reason(result),
+            metadata={"depth": self.task.depth},
+        )
+
+    def _run_task_body(self, task_span_id: str) -> SubagentResult:
         """执行子任务并返回结果。"""
         thread_id = f"subagent-{self.task.task_id}"
 
@@ -174,6 +300,10 @@ class SubagentRunner:
                 parent_granted_capabilities=self.parent_granted_capabilities,
                 # TOOL-02：子任务继承父 Agent 的 project_id
                 parent_project_id=self.parent_project_id,
+                # TRACE-01：子代理的模型调用 span 挂在 SUBAGENT_TASK span 下面
+                trace_sink=self.trace_sink,
+                trace_run_id=self.parent_run_id or self.run_id,
+                parent_span_id=task_span_id,
             )
 
             # 检查取消（在开始前）
@@ -277,7 +407,7 @@ class _CancelledError(Exception):
     pass
 
 
-class _DeadlineExceededError(Exception):
+class _DeadlineExceededError(TimeoutError):
     """子任务超时信号。
 
     复审 B2：超时与「主动取消」是**两种不同的终态** ——
@@ -285,6 +415,9 @@ class _DeadlineExceededError(Exception):
     - 超过 `timeout_seconds` 的截止时间 → `TIMED_OUT`。
 
     过去两者共用 `_CancelledError`，超时被标成"被取消"，原因不准确。
+
+    TRACE-01：继承 `TimeoutError` —— 通用分类器据此把终态判成
+    `timeout` 而不是 `error`。
     """
     pass
 
@@ -338,6 +471,10 @@ class _BudgetAwareAgent:
         parent_granted_capabilities: frozenset = frozenset(),
         # TOOL-02：子任务继承父 Agent 的 project_id（项目会话上下文）
         parent_project_id: str | None = None,
+        # TRACE-01：Trace sink / 归属 run_id / 父 span（SUBAGENT_TASK）
+        trace_sink: "TraceSink | None" = None,
+        trace_run_id: str = "",
+        parent_span_id: str | None = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -363,11 +500,63 @@ class _BudgetAwareAgent:
         self._parent_granted_capabilities: frozenset = parent_granted_capabilities
         # TOOL-02：子任务继承父 Agent 的 project_id
         self._parent_project_id: str | None = parent_project_id
+        # TRACE-01：子代理的模型调用也发 span（挂在 SUBAGENT_TASK span 下面）
+        self._trace_sink = trace_sink
+        self._trace_run_id = trace_run_id
+        self._parent_span_id = parent_span_id
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
         if self._deadline is not None and time.monotonic() > self._deadline:
             raise _DeadlineExceededError()
+
+    def _model_call_with_span(
+        self,
+        thread_id: str,
+        model_messages: list[Message],
+        model_tools: list | None,
+    ) -> Decision:
+        """调用模型；TRACE-01：同时发一条 MODEL_CALL span。
+
+        子代理没有中间件管线，span 在这里手工发（一条即终态）。
+        父节点是本子任务的 SUBAGENT_TASK span。
+        """
+        sink = self._trace_sink
+        if sink is None:
+            return self._model.decide(model_messages, model_tools)
+        span_id = uuid.uuid4().hex
+        start = time.monotonic()
+        try:
+            decision = self._model.decide(model_messages, model_tools)
+        except BaseException as exc:
+            _emit_subagent_event(
+                sink,
+                event_id=span_id,
+                parent_id=self._parent_span_id,
+                run_id=self._trace_run_id,
+                thread_id=thread_id,
+                operation=OperationType.MODEL_CALL.name,
+                name="model_decide",
+                status=classify_terminal_status(
+                    ExecutionContext(cancellation_token=self._token), exc
+                ),
+                start=start,
+                error_type=type(exc).__name__,
+                error_detail=safe_trace_detail(exc),
+            )
+            raise
+        _emit_subagent_event(
+            sink,
+            event_id=span_id,
+            parent_id=self._parent_span_id,
+            run_id=self._trace_run_id,
+            thread_id=thread_id,
+            operation=OperationType.MODEL_CALL.name,
+            name="model_decide",
+            status="success",
+            start=start,
+        )
+        return decision
 
     def run(self, thread_id: str, instruction: str) -> str:
         thread = self._store.get(thread_id)
@@ -434,7 +623,7 @@ class _BudgetAwareAgent:
                 self._last_assembled = assembled
             else:
                 model_messages = list(working_messages)
-            decision = self._model.decide(model_messages, model_tools)
+            decision = self._model_call_with_span(thread_id, model_messages, model_tools)
 
             # 复审 B2：模型调用可能耗时很久 —— 返回后、采纳结果前必须
             # **复查取消与截止时间**（与步骤开始处同一套信号）。
@@ -556,6 +745,8 @@ class SubagentManager:
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
         # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问和 project_id 反查）
         thread_store: ThreadStore | None = None,
+        # TRACE-01：Trace sink。子代理不走中间件管线，span 由本模块手工发。
+        trace_sink: "TraceSink | None" = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency 必须 >= 1")
@@ -579,6 +770,8 @@ class SubagentManager:
         self._tool_policy_registry = tool_policy_registry
         # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问）
         self._store = thread_store
+        # TRACE-01：Trace sink（子代理的 span 手工发，不走中间件管线）
+        self._trace_sink = trace_sink
 
         self._lock = threading.Lock()
         self._tasks: dict[str, SubagentTask] = {}
@@ -611,6 +804,8 @@ class SubagentManager:
         parent_granted_capabilities: frozenset = frozenset(),
         # TOOL-02：父 Agent 的 project_id（继承项目会话上下文）
         parent_project_id: str | None = None,
+        # TRACE-01：父侧工具 span 的 id —— 子代理的 SUBAGENT_TASK span 挂在它下面
+        parent_span_id: str | None = None,
     ) -> SubagentTask:
         """提交一个子任务。
 
@@ -681,6 +876,7 @@ class SubagentManager:
             model,
             registry,
             budget,
+            parent_span_id,
         )
         with self._lock:
             self._futures[task_id] = future
@@ -694,6 +890,7 @@ class SubagentManager:
         model: Model | None,
         registry: ToolRegistry | None,
         budget: BudgetLike | None,
+        parent_span_id: str | None = None,
     ) -> None:
         """在 worker 线程中执行任务。"""
         # 先在锁内做状态确认和转换，释放锁后再处理取消分支（避免重入死锁）
@@ -732,6 +929,10 @@ class SubagentManager:
                 parent_granted_capabilities=task.parent_granted_capabilities,
                 # TOOL-02：子任务继承父 Agent 的 project_id
                 parent_project_id=task.parent_project_id,
+                # TRACE-01：子代理的 span 挂在父侧工具 span 下面
+                parent_span_id=parent_span_id,
+                # TRACE-01：Trace sink（子代理的 span 手工发）
+                trace_sink=self._trace_sink,
             )
 
             result = runner.run()

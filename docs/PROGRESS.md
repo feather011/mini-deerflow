@@ -4840,3 +4840,613 @@ This is mcp 2.x, where FastMCP was renamed to MCPServer ...
 - 4 个依赖外部仓库的回归文件：**未验证**（本轮不再申请执行）。
 - 未重跑全量、未开新复审、未触碰 PR #6 / #7。
 
+---
+
+## TRACE-01：把一次运行的执行链真正串起来（2026-11-05）
+
+**会话标识**：claude-worker-20261010-2015
+**基线**：`4c9354b`（`automation/test-01` 的 HEAD）
+**分支**：`automation/trace-01`（独立 worktree：`.claude/worktrees/automation+trace-01`）
+**状态**：实现完成，定向测试通过；**未 commit / push / merge**
+
+### 一、改动前实测到的缺陷（均为源码位置确认，非推测）
+
+| 缺陷 | 位置 | 后果 |
+|---|---|---|
+| 模型调用的 `run_id` 硬编码空串 | `agent.py` `model_ctx` | 同一次运行里模型事件 `run_id=""`、工具事件 `run_id="run-xxx"` → 按 run_id 查不到模型调用 |
+| `parent_span_id` 全仓无写入方 | `middleware.py` `ExecutionContext` | 所有 TraceEvent 的 `parent_id` 恒为 `None`，span 树断裂 |
+| `TraceMiddleware._current_event` 是**实例共享单槽位** | `middleware.py` | `agent_pipeline` 的那个实例被 API 线程池并发共享 → 事件张冠李戴、悬空 running、重复终态 |
+| `duration` 构造时算一次 | `middleware.py` `TraceEvent.__init__` | 终态是事后补 `end`，duration 恒为 `None` |
+| 上下文事件与 span **同名** | `context_assembler.py` / `context_compactor.py` / `history_index.py` / `context_tools.py` | operation 也叫 `MODEL_CALL` / `TOOL_CALL`，两串事件混成一条链 |
+
+SSE 事件流**本来就是对的**（`api/middleware/run_event.py` 用线程局部栈取 run_id）——
+错的只有 Trace 事件流。
+
+### 二、改动内容
+
+| 文件 | 改动 |
+|---|---|
+| `middleware.py` | ① `ExecutionContext` 增加 `trace_event`（span 状态挂 ctx，不再挂实例）；② `TraceEvent` 增加 `kind` / `error_detail`，`duration` 改 property；③ `TraceMiddleware` 重写：`success`/`error` 立即发终态（**新对象**，running 记录不被改写），`finally_` 用 `sys.exc_info()` 兜底收口；④ 新增 `classify_terminal_status`（success / error / cancelled / timeout）；⑤ `execute_with_retry` 每次重试换新 span，重试链可走 |
+| `trace_safety.py`（**新增**） | core 层 `safe_trace_detail(exc)` —— 受控失败原因。放 core 是因为 `api/schemas/streaming.py` 依赖 `middleware`，反向 import 会循环依赖 |
+| `agent.py` | ① `run()` 增 keyword-only `parent_span_id`；② `model_ctx` 补真实 `run_id` + `cancellation_token`；③ 维护 `chain_tail`，形成「模型 → 工具 → 模型」的因果链（同一轮多个工具是并列兄弟） |
+| `runtime.py` | ① `IntegratedAgent.run` 把 AGENT_RUN span 传给 `Agent.run(parent_span_id=...)`；② `create_runtime` 把 `trace_sink` 传给 `SubagentManager` |
+| `subagent_executor.py` | 子代理 span（`SUBAGENT_TASK` + 其 `MODEL_CALL`）手工发，挂在父侧工具 span 之下、用**父运行**的 run_id；`_DeadlineExceededError` 改继承 `TimeoutError` |
+| `subagent_tools.py` | `_SubmitHandler` 从工具 ctx 取 `span_id` → 作为子代理 span 的父节点 |
+| `context_shared.py` | 上下文事件标记 `kind="context"` |
+
+**不动**：SSE 契约（`api/schemas/streaming.py` 一行未改）、预算消费路径、工具语义、
+`RetryMiddleware` 的重试语义、`Agent.run` 返回的那套 `trace: list[dict]`（CLI `--trace` 用的，与 TraceEvent 体系无关）。
+
+### 三、验证
+
+| 项 | 命令 | 结果 |
+|---|---|---|
+| 新增用例 | `PYTHONPATH=src pytest tests/test_trace_chain.py -q` | **9 passed** |
+| 相关定向 | `pytest test_middleware / test_agent / test_budget_lifecycle / test_subagent_executor / test_subagent_integration / test_api_runs / test_phase17_18_closing / test_context_agent -q` | **189 passed** |
+| 联动定向 | `pytest test_api_runs_stream_components / test_cancel_semantics / test_context_* / test_subagent_* -q` | **258 passed / 3 failed**（3 项为既有失败，见下） |
+| 全量 | `PYTHONPATH=src pytest tests -q -p no:randomly` | **3647 passed / 15 failed / 1 skipped / 42 subtests** |
+| 基线对照 | `git archive 4c9354b` 副本跑全量 | **3631 passed / 22 failed** |
+
+- **全量失败集合是基线的子集**（逐项差分确认）：基线多出的 7 项全在
+  `test_harness_runner_integration.py`，原因是归档副本缺本地凭据、真实 provider 调用报
+  `401 Invalid API Key` —— 与本轮改动无关。
+- 15 项失败为**既有**失败（`test_mcp.py` 11、`test_subagent_allowed_tools.py` 3、
+  `test_phase21b_events.py` 1），基线同样失败，本轮未触碰。
+- ⚠️ `test_tool07_process_tree_recovery.py::test_并发_不同项目共用同一Runner_回收互不串`
+  在全量跑里**偶发**失败一次（隔离复跑 5 passed）—— 该用例真起子进程、等 30s 心跳文件，
+  机器负载高时不稳定，与 Trace 改动无关（它不走中间件管线）。
+- ⚠️ **worktree 里的测试必须显式设 `PYTHONPATH=src`**：本项目是可编辑安装，
+  `import mini_deerflow` 默认指向**主工作区**的 `src/` —— 不设就会在错误的代码上跑测试。
+  本轮一度踩过（结论完全失真），已记入长期记忆。
+
+### 四、「撤掉修复即失败」验证
+
+逐项临时撤销 → 对应用例必须失败 → 还原 → 复跑全绿：
+
+| 撤销项 | 结果 |
+|---|---|
+| D1 span 状态改回实例共享槽位 | 新增的「交错两次调用」用例失败（run-a 只有 1 条记录、终态写进了 run-b） |
+| D2 终态分类恒为 `error` | 取消用例、超时用例各失败 |
+| D4 `model_ctx.run_id` 回到空串 | 真实 API 链用例、并发用例各失败 |
+| D5 父子关联置空 | 真实 API 链用例失败（找不到挂在 AGENT_RUN 下的模型 span） |
+| D6 重试不换新 span | 重试用例失败（两次 attempt 共用同一 event_id） |
+
+### 五、已知限制（登记，本轮不改）
+
+1. **模型超时 vs 用户停止**：Agent 层两者都是 `BudgetExceededError`，靠 `resource` 区分；
+   用户在模型调用期间点停止，抛的也是 `model_call_timeout` → Trace 判 `timeout`、
+   API 判 `cancelled`。**Trace 与 API 口径在此不一致**（API 先看令牌、Trace 先看资源）。
+   生产语义未改，只在此记录。
+   —— **2026-11-05 第二轮返修后**：Trace 侧已修（取消令牌记录首次取消原因，
+   用户停止记 `cancelled`、真超时记 `timeout`）；**API 侧口径分歧仍在**，
+   见下文「TRACE-01 独立复审返修」第一节。
+2. **步数预算耗尽 vs 用户停止**：都是 `BudgetExceededError("steps")`，靠取消令牌是否置位区分
+   —— 与 API 层既有口径一致。
+3. **子代理的工具调用**暂不单独成 span（只发 `SUBAGENT_TASK` 与其模型调用）。
+4. **`RetryMiddleware` 的 `max_attempts` 仍不生效**（`before` 每次把计数归零）—— 既有缺陷，
+   属重试语义而非 Trace，本轮只记录。
+5. **父 Agent 目前无法通过工具路径派子代理**：`subagent_submit` 需要
+   `SUBAGENT_DELEGATE` 能力，而 `Agent._do_tool_call` 的默认能力集合里没有它
+   —— 授权模型既有缺口，与 Trace 无关。因此子代理用例走的是
+   「真实工具 handler + 真实 Manager + 真实 Runner」路径，而非完整 Agent 派发。
+6. **Trace 事件只在 `trace_enabled=True` 时产生**（默认关）。
+7. **中间件 `before` 抛错的路径**：`MiddlewarePipeline.execute` 的 `before` 循环在 `try` 之外，
+   该循环抛错时不会执行 `finally_` → span 可能停在 running。既有结构问题；
+   修它要变更中间件执行语义（哪些中间件的 finally 该跑），本轮不改。
+
+---
+
+## TRACE-01 独立复审返修（2026-11-05，第二轮）
+
+**会话标识**：claude-worker-20261010-2015
+**基线**：`4c9354b`（同上一节；本轮未换基线）
+**分支**：`automation/trace-01`（独立 worktree）
+**状态**：返修完成，定向测试通过；**未 commit / push / merge**
+
+**复审结论**：实现已完成、作者自测通过，但**不能记为独立复审通过**。收口只看两项，不扩大范围：
+① 「用户主动停止」被 Trace 记成 `timeout`，会直接误导排障；
+② 「日志和 Trace 在哪看」的交付证据没有出现。
+
+### 一、修复项 1：停止 vs 超时的终态分类
+
+**根因（源码确认，非推测）**：模型超时是用 `threading.Timer` 实现的，定时器到期时调用
+`cancellation_token.cancel()`（`src/mini_deerflow/agent.py`）——**真正超时后取消令牌同样是置位的**。
+所以单看 `is_cancelled()` 分不出「用户点了停止」与「模型调用自然超时」。
+
+**修法**：让取消令牌记录**首次**取消的原因，模型超时定时器显式传 `reason="model_timeout"`，
+用户停止用默认 `reason="cancelled"`；首次原因胜出（用户先停止、随后定时器才到期时仍记「用户停止」）。
+
+| 文件 | 改动 |
+|---|---|
+| `src/mini_deerflow/middleware.py` | `CancellationToken` 增 `cancel_reason()`（`cancel(reason=...)` 首次胜出，线程安全）；`classify_terminal_status` 改为看**首次取消原因**：原因非 `model_timeout` 的取消 → `cancelled`；原因 `model_timeout` → `timeout`；`resource == "model_call_timeout"` → `timeout`；`TimeoutError` 家族 → `timeout`；其余 → `error` |
+| `src/mini_deerflow/agent.py` | 模型超时定时器改为 `cancellation_token.cancel(reason="model_timeout")` |
+
+**未改**：Agent 异常语义、`api/schemas/streaming.py`（SSE 契约一行未动）、
+`Agent.run` 返回的那套 `trace: list[dict]`。
+
+**两个真实入口对照**（`tests/test_trace_chain.py` 新增用例）：
+
+| 入口 | 做法 | 断言 |
+|---|---|---|
+| 模型调用期间**用户停止** | 真实 API：`POST /api/threads/t-stop/runs/stream` 起流 → 等 Trace 出现 running 的 `MODEL_CALL`（证明模型调用已开始）→ `POST /api/threads/t-stop/runs/stop` | SSE 响应含 `run.cancelled`（API 口径）**且** `AGENT_RUN` span 的 status 为 `cancelled`（Trace 口径） |
+| 模型调用**自然超时** | `RuntimeConfig(trace_enabled=True, model_timeout_seconds=0.1)` + 慢模型（`delay=1.0`） | `token.cancel_reason() == "model_timeout"` **且** `AGENT_RUN` span 的 status 为 `timeout` |
+
+另加一条：首次原因胜出（先 `cancel()` 再 `cancel(reason="model_timeout")` → 仍是 `cancelled`）。
+
+**「撤掉修复即失败」验证**：临时把 `classify_terminal_status` 里「已确认取消优先」分支
+改成 `if False:  # TEMP-REVERT` → `test_模型调用期间用户停止_终态为cancelled` **失败**
+（`1 failed, 13 passed`）；随后用备份逐字还原（`grep -c "TEMP-REVERT"` = 0）→ 复跑 **14 passed**。
+
+**已知口径分歧（未修，只记录）**：API 层判「用户停止」是**先看令牌是否置位**
+（`api/services/agent_runs.py`），因此**真正超时**时 API 报 `cancelled`（SSE 终态 `run.cancelled`），
+而 Trace 报 `timeout`。修 API 会变动 SSE 终态类型（`run.cancelled` ↔ `run.timed_out`），
+超出本阶段范围（不改 SSE 契约）。
+—— **2026-11-05 第三轮已处理**：取消原因升级为唯一底层事实，API 与 Trace 读同一份；
+SSE 公开事件名仍保持 `run.cancelled`（兼容映射，只影响表示层）。
+见下文「TRACE-01 复审收口：统一底层事实」。
+
+### 二、修复项 2：「日志和 Trace 在哪看」的交付证据
+
+逐项核对结果与补齐内容：
+
+| 原定要求 | 核对结果 | 本轮补齐 |
+|---|---|---|
+| Web 后端可配置启用 Trace，**默认关闭** | **仓库原本没有 Web 侧入口**（只有 CLI/运行时用的 `RuntimeConfig.trace_enabled/trace_path`） | 新增 `ApiSettings.trace_enabled` / `trace_path`（默认 `False` / `None`）+ 环境变量 `MINI_DEERFLOW_TRACE_ENABLED` / `MINI_DEERFLOW_TRACE_PATH`，在 `api/app.py` 的 `_default_runtime_factory` 里装配进 `RuntimeConfig` |
+| JSONL 文件位置明确 | `JSONLTraceSink` 已有，但路径无效时抛裸异常、父目录不存在直接失败 | 改为自动建父目录 + **构造阶段明确报错**：`RuntimeError: Trace 文件不可写：<路径>（…）。请确认目录存在且当前用户有写权限，或改用其它 trace_path。`（不静默降级） |
+| 路径不可写时明确报错 | 同上 | 同上；覆盖两种入口：直接构造 `JSONLTraceSink(<目录>)`、以及 `create_runtime(config=RuntimeConfig(trace_enabled=True, trace_path=<目录>))` |
+| 按 `run_id` 查询 | **仓库原本没有任何查询工具** | 新增 `scripts/trace_query.py`：`--run-id` 打印这次运行的调用链（按 `parent_id` 还原层级）、`--list-runs` 列出文件里所有 run_id、`--status <终态>` 只看某类终态 |
+| 安全输出 | Trace 记录本身不含凭据/提示词/正文/工具参数 | 新增用例直接断言落盘全文**不含** `sk-` / `Bearer ` / `Authorization` / `password=` / 用户提示词正文 |
+
+**实际取证**（真实 `create_app(settings)` + `TestClient` 跑一次，取证脚本在仓库外的
+临时目录 `<临时取证目录>/`（下文用 `<临时取证目录>` 代指），演示脚本不属于产品代码）：
+
+```
+[配置] trace_enabled=True trace_path=<临时取证目录>\trace.jsonl
+[启动] 创建线程: 200
+[运行] HTTP 200
+[运行] run_id = run-58f9722cd10d
+[落盘] 文件位置 = <临时取证目录>\trace.jsonl  存在 = True
+[落盘] 记录数 = 5
+   kind=span    op=AGENT_RUN   status=running  run_id=run-58f9722cd10d parent=None      id=f651a0b7
+   kind=span    op=AGENT_RUN   status=success  run_id=run-58f9722cd10d parent=None      id=f651a0b7  duration=0.001
+   kind=span    op=MODEL_CALL  status=running  run_id=run-58f9722cd10d parent=f651a0b7 id=dac6021a
+   kind=span    op=MODEL_CALL  status=success  run_id=run-58f9722cd10d parent=f651a0b7 id=dac6021a  duration=0.0
+   kind=context op=MODEL_CALL  status=success  run_id=run-58f9722cd10d parent=None      id=ff6a7fb5  duration=0.0
+```
+
+按 `run_id` 查询（`scripts/trace_query.py`）：
+
+```
+$ python scripts/trace_query.py <临时取证目录>/trace.jsonl --run-id run-58f9722cd10d
+run_id=run-58f9722cd10d：5 条记录 / 3 个 span
+- AGENT_RUN/agent_run [success] id=f651a0b7... 0.001s
+  - MODEL_CALL/model_decide [success] id=dac6021a... 0.000s
+- MODEL_CALL/context.assembled [success] id=ff6a7fb5... 0.000s (context)
+
+$ python scripts/trace_query.py <临时取证目录>/trace.jsonl --list-runs
+run-58f9722cd10d	5 条记录
+```
+
+路径不可写的实际报错：
+
+```
+RuntimeError: Trace 文件不可写：<临时取证目录>/trace-is-a-dir（Permission denied）。
+请确认目录存在且当前用户有写权限，或改用其它 trace_path。
+```
+
+落盘全文已逐行核对：只有 id / 父子关系 / operation / status / duration / token 计数，
+**无**凭据、**无**完整提示词、**无**文件正文、**无**原始工具参数与结果。
+
+### 三、本轮改动文件
+
+| 文件 | 状态 | 改动 |
+|---|---|---|
+| `src/mini_deerflow/middleware.py` | 改 | 取消原因记录 + 终态分类重写；`JSONLTraceSink` 不可写路径明确报错 |
+| `src/mini_deerflow/agent.py` | 改 | 模型超时定时器传 `reason="model_timeout"` |
+| `src/mini_deerflow/api/config.py` | 改 | 新增 `ApiSettings.trace_enabled` / `trace_path` + 环境变量解析 |
+| `src/mini_deerflow/api/app.py` | 改 | `RuntimeConfig` 装配 trace 配置 |
+| `scripts/trace_query.py` | **新增** | 按 `run_id` 查询 Trace JSONL |
+| `tests/test_trace_chain.py` | 改 | 9 → **14** 个用例（新增 3 条终态分类 + 2 条交付证据） |
+| `.env.example` | 改 | 新增 Trace 配置段（含查询命令用法） |
+| `docs/context-engineering.md` | 改 | 新增「终态：停止 vs 超时」「在哪看」两小节 |
+| `docs/PROGRESS.md` | 改 | 本节 |
+
+### 四、本轮测试结果（作者证据）
+
+未重跑全量；以下均为**定向**复跑。
+
+| 范围 | 结果 |
+|---|---|
+| `tests/test_trace_chain.py` | **14 passed** |
+| `test_middleware / test_cancel_semantics / test_api_runs / test_api_runs_stream_components / test_agent / test_budget_lifecycle` | **179 passed** |
+| `test_api_e2e / test_api_errors / test_api_files / test_api_health / test_api_lifespan / test_api_runs / test_api_runs_stream / test_api_runs_stream_components / test_api_threads / test_phase21b_events / test_project_execute_e2e` | **298 passed / 1 failed** |
+| `test_subagent_executor / test_subagent_integration / test_subagent_allowed_tools / test_context_agent / test_context_compactor / test_context_history / test_context_task_notes / test_phase17_18_closing / test_confirmation_lifecycle` | **269 passed / 3 failed** |
+| `test_cli / test_cli_memory / test_cli_skills` | **84 passed** |
+| **合计** | **844 passed / 4 failed** |
+
+4 项失败**全部是既有失败**，与本轮改动无关：
+
+- `test_phase21b_events.py::test_工具失败_只发_tool_failed_唯一终态为_run_failed`
+  —— 已用基线归档副本（`git archive 4c9354b`）复跑，**同样失败**。
+- `test_subagent_allowed_tools.py` 3 项 —— 与本轮 TRACE-01 改动无交集（同上节「已知限制」登记的既有失败）。
+
+### 五、本轮明确不做（复审指令）
+
+| 不做 | 原因 |
+|---|---|
+| 子代理授权缺口（父 Agent 无法经工具路径派子代理） | 记录后续，不在本轮顺手修 |
+| `RetryMiddleware` 重试次数既有问题 | 记录后续，不在本轮顺手修 |
+| 子代理工具独立 span | 记录后续，不在本轮顺手修 |
+| 偶发进程回收失败（`test_tool07_process_tree_recovery`） | **保留记录**；隔离重跑通过不能证明抖动消失，也不据此要求再次全量 |
+| 改 API 层取消/超时口径 | 会变动 SSE 终态类型，超出本阶段范围，只记录分歧 |
+| 把 `docs/PROGRESS.md` 手工合回主工作区 | PROGRESS 留在 worktree 内，等协调窗口/用户处理 |
+| 错误基点留下的旧分支 `worktree-automation+trace-01` | 暂不处理 |
+| 重跑全量 / commit / push / merge | 复审指令明确排除 |
+
+---
+
+## TRACE-01 复审收口：统一底层事实（2026-11-05，第三轮）
+
+**会话标识**：claude-worker-20261010-2015
+**基线**：`4c9354b`（同前两节；本轮未换基线）
+**分支**：`automation/trace-01`（独立 worktree）
+**状态**：收口改动完成，定向测试通过；**未 commit / push / merge**
+
+**复审判断**：TRACE-01 **有条件通过，暂不关闭**；唯一需要重点处理的是
+「同一次运行在两个观测渠道出现不同终态」。复审要求：
+
+1. 把**取消原因**作为统一的底层事实，API 与 Trace 分别映射各自的公开状态，
+   而不是各自独立判断；
+2. 这一轮**不一定要改变 SSE 的公开事件名** ——
+   内部事实 `model_timeout` / Trace 状态 `timeout` / SSE 兼容状态 `run.cancelled`；
+3. **确认 API 是否存在依赖 `cancelled` 状态执行清理、恢复或持久化的逻辑**：
+   只属于表示层兼容 → 明确记录为已知限制；
+   会影响实际运行语义 → 必须在关闭 TRACE-01 前处理。
+
+### 一、依赖面核查结论：只属于表示层兼容
+
+逐处核查 API 层所有以「取消」为条件的路径：
+
+| 位置 | 判定依据 | 依赖终态分类？ |
+|---|---|---|
+| `api/services/agent_runs.py` 的 `finally` → `unregister_run(run_id, cancelled=令牌是否置位)` → `runtime._cancelled_runs` | 判的是**取消令牌**，不是终态事件名 | 否 |
+| `runtime._is_run_alive`（确认执行准入） | 判 coordinator 占用 + `_cancelled_runs` + 令牌 | 否 |
+| `runtime.unregister_run` 唤醒挂起的确认请求 | 与 cancelled 标记同一路径 | 否 |
+| `api/schemas/streaming.py` `terminal_status_from_exception` → SSE 事件名 | 只决定**事件名** | 是（仅表示层） |
+| `api/routes/runs.py` 异常 → HTTP 状态码 | 503 / 504 | 是（仅表示层） |
+
+**关键点**：「用户主动停止」与「模型调用超时」置位的是**同一个**令牌
+（模型超时靠定时器调 `token.cancel()`），因此两种情况的
+**清理 / 恢复 / 持久化行为完全一致** —— SSE 把超时兼容映射成 `run.cancelled`
+不会让超时的 run 走错清理路径。
+
+→ **结论：属于表示层兼容**，按复审指令记录为已知限制，本阶段不改 SSE 契约
+（改契约会同时变动 HTTP 状态码 503 → 504，需与前端 / 客户端一起排期）。
+
+### 二、实现：取消原因成为唯一底层事实
+
+| 文件 | 改动 |
+|---|---|
+| `src/mini_deerflow/middleware.py` | ① `CancellationToken` 新增 `cancel_state()`：**一次加锁**拿到「是否取消 + 首次原因」的一致快照；② `classify_terminal_status` 改用该快照（不再分两次读） |
+| `src/mini_deerflow/api/services/agent_runs.py` | ① `AgentRunCancelledError` 增加 `reason` 属性 —— 底层事实随异常一路带到 SSE 层，将来切换公开映射不必重新推导；② 终态映射改读 `cancel_state()`：`reason == "model_timeout"` → `AgentRunCancelledError(reason="model_timeout")`（**公开事件名保持 `run.cancelled`**）并打 WARNING 日志记录事实；`reason == "cancelled"` → `reason="cancelled"`；**无取消令牌** + `model_call_timeout` → 仍走 `AgentRunTimeoutError`（既有行为不变）；③ `finally` 的清理判定改用一致快照 |
+
+**并发竞争修掉了**：原先 `classify_terminal_status` 分两次读
+（`is_cancelled()` 与 `cancel_reason()` 各加一次锁），两次读之间可能插入一次
+`cancel()` → 读到「没取消 + 有原因」的不自洽组合 → 「用户停止」被误判成 `error`。
+现在一次加锁拿到一致快照。
+
+**「撤掉修复即失败」**：临时把 `classify_terminal_status` 改回分两次读
+（`# TEMP-REVERT`）→ `test_终态分类_读一次一致快照而不是分两次读` **失败**
+（`1 failed, 20 passed`）；随后用备份逐字还原（`grep -c "TEMP-REVERT"` = 0）→ 复跑 **21 passed**。
+
+### 三、新增测试（14 → 21）
+
+| 用例 | 断言 |
+|---|---|
+| `test_终态分类_读一次一致快照而不是分两次读` | 分类只调 `cancel_state()` 一次；**不**单独调 `is_cancelled()` / `cancel_reason()` |
+| `test_取消状态快照_未取消与已取消都自洽` | `(False, None)` → `(True, "model_timeout")` |
+| `test_取消状态快照_并发取消下仍然自洽` | 并发取消下 2000 次快照，`是否取消` 与 `有原因` 永远同时成立 |
+| `test_API层_模型超时_内部事实为model_timeout` | `AgentRunCancelledError.reason == "model_timeout"` |
+| `test_API层_用户停止_内部事实为cancelled` | `AgentRunCancelledError.reason == "cancelled"` |
+| `test_API层_没有取消令牌时的模型超时_仍报超时` | 仍抛 `AgentRunTimeoutError`（既有行为不变） |
+| `test_模型超时_同一底层事实_Trace记timeout而SSE保持兼容run_cancelled` | 端到端：SSE 含 `run.cancelled`、**不含** `run.timed_out`；同一事实 Trace 记 `timeout` |
+
+### 四、本轮测试结果（作者证据，未重跑全量）
+
+| 范围 | 结果 |
+|---|---|
+| `tests/test_trace_chain.py` | **21 passed** |
+| `test_middleware / test_cancel_semantics / test_api_runs / test_api_runs_stream / test_api_runs_stream_components / test_agent / test_budget_lifecycle` | **196 passed** |
+| `test_api_e2e / test_api_errors / test_api_files / test_api_health / test_api_lifespan / test_api_threads / test_phase21b_events / test_project_execute_e2e / test_confirmation_lifecycle` | **219 passed / 1 failed** |
+| `test_subagent_executor / test_subagent_integration / test_subagent_allowed_tools / test_context_agent / test_context_compactor / test_context_history / test_context_task_notes / test_phase17_18_closing / test_cli / test_cli_memory / test_cli_skills` | **309 passed / 3 failed** |
+| **合计** | **745 passed / 4 failed** |
+
+4 项失败与前两轮**完全相同**，均为既有失败：
+`test_phase21b_events.py` 1 项（已用 `git archive 4c9354b` 基线副本复跑确认同样失败）、
+`test_subagent_allowed_tools.py` 3 项（与 TRACE-01 无交集）。
+
+### 五、边界与未做
+
+- SSE 公开事件名**未改**（模型超时仍是 `run.cancelled`）—— 复审指令明确本轮可保留；
+  底层事实已通过 `AgentRunCancelledError.reason` 保留，将来切换是一行改动。
+- Agent 异常语义、SSE 契约（`api/schemas/streaming.py`）、前端、CLI 均未动。
+- 子代理授权缺口、重试次数既有问题、子代理工具独立 span：仍为范围外，只记录。
+- 偶发进程回收失败：保留记录，不据此要求再次全量。
+- PROGRESS 留在 worktree 内，未手工合回主工作区；错误基点留下的旧分支未处理。
+- 未 commit / push / merge；未重跑全量。
+
+---
+
+## TRACE-01 复审收口：安全边界与失败策略（2026-11-05，第四轮）
+
+**会话标识**：claude-worker-20261010-2015
+**基线**：`4c9354b`（同前三节；本轮未换基线）
+**分支**：`automation/trace-01`（独立 worktree）
+**状态**：收口完成，定向测试通过；**未 commit / push / merge**
+
+**复审裁定**：TRACE-01 = **PASS WITH CONDITIONS**。第三轮取消语义改动通过、SSE 兼容映射接受；
+**唯一需要处理的两项**：① 异常详情的安全边界不够严格；② Trace 写入失败会不会中断 Agent 执行。
+另有一条客观限制：复审方只看到代码摘录而非完整 patch，第一、二轮的 Trace 树结构、子代理关联、
+查询 CLI 尚不能签发独立验收。
+
+### 一、异常详情安全边界收口
+
+**问题**：`safe_trace_detail()` 里 `str(ModelError)` 的安全假设站不住 ——
+异常类型不构成安全保证（上游错误正文可能带请求信息或敏感串），`_truncate` 只能限长。
+同理 `BudgetExceededError.resource` 只是**约定**为固定枚举 —— 实证：
+`lead_agent/budget_ledger.py:286-299` 实际抛的是
+`BudgetExceededError(f"lease:{lease_id}:{resource}", …)`，是**动态字符串**。
+
+**修法**：
+
+| 异常 | `error_detail` |
+|---|---|
+| `ModelError` 已知子类 | **固定文案**（按具体子类：`模型配置错误` / `模型调用超时` / `模型鉴权失败` / `模型调用被限流` / `模型服务端错误` / `模型返回内容为空` / `模型响应不符合约定`） |
+| `ModelError` 未知子类 | `模型调用失败` |
+| `BudgetExceededError` 且 `resource` 在允许列表内 | `预算耗尽：<resource>（上限: N）` |
+| `BudgetExceededError` 且 `resource` 不在允许列表 | 空串（整条不放行） |
+| `TimeoutError` 家族 | `超时` |
+| 其它异常 | 空串 |
+
+- 异常**类名**另有 `error_type` 字段承载 → 类型信息不丢；原始消息只在服务端日志里。
+- 允许列表：`_ALLOWED_BUDGET_RESOURCES`（`steps` / `model_calls` / `model_call_timeout` /
+  `tool_calls` / `tool_call_cancelled` / `subagent_tasks` / `subagent_depth` / `summary_calls`）。
+  新增预算资源必须同步加进去 —— 这是有意的闸门。
+
+**既有测试的契约变更**：`test_失败_终态为error且保留安全原因` 原本断言
+`error_detail == "供应商返回 500"`（即依赖被否定的安全假设）→ 改为断言
+`error_detail == "模型服务端错误"` 且 `"供应商返回 500"` 不出现在落盘事件里。
+
+**未改**：SSE 侧的 `api/schemas/streaming.py::safe_failure_detail` **仍用同样的约定**。
+它面向客户端、属既有契约，本轮不动 —— 但同一信任假设在那里同样存在，登记待后续统一。
+
+### 二、Trace 写入失败策略（先实测再定策略）
+
+**实测（改之前的真实行为）**：把 JSONL sink 的底层文件换成「写入即抛
+`OSError(28, No space left on device)`」的对象，再跑一次真实 Agent 运行：
+
+```
+[准备] 已把 JSONL sink 的底层文件换成写入即失败的对象：True
+[结果] 运行**失败**：OSError: [Errno 28] No space left on device
+```
+
+→ 改之前是**未文档化的 fail-fast**：观测故障会直接打断用户运行
+（`MiddlewarePipeline.execute` 的 `before` 循环在 `try` 之外，写失败直接冒出来）。
+
+**收口后的两级策略**：
+
+| 阶段 | 行为 |
+|---|---|
+| 启动期（构造时路径不可写） | **直接报错**（不变）。还没产出工作，明确失败最省事 |
+| 运行期（写入出错） | **不中断 Agent 运行**；记一条 ERROR 日志（明确写出「本次运行的 Trace 不完整」），把 sink 标记为 degraded，后续事件跳过（不反复失败、不刷日志）；`flush()` / `close()` 同样只记 ERROR 不抛 |
+
+**依据**：Trace 是**显式开启的观测能力**（默认关闭），不是业务事实源 ——
+业务事实（线程消息、确认请求）走 ThreadStore / ConfirmationStore。
+已完成的用户工作不应因为「调试轨迹写不进去」而作废；
+但「轨迹悄悄少了一半」比失败更难排查，所以运行期失败必须留下 ERROR 记录。
+
+**同一探针在改之后**：
+
+```
+Trace 写入失败，本次运行的 Trace 不完整（后续事件不再写入）：path=… errno=28 err=No space left on device
+[结果] 运行**完成**，answer = "当前只支持计算功能，请输入以'计算'开头的表达式。"
+```
+
+### 三、新增用例（21 → 29）
+
+| 用例 | 断言 |
+|---|---|
+| `test_失败原因_未知ModelError子类不放行原始消息` | 未知子类 → `模型调用失败`；原始消息里的 `sk-live` / `echo` 都不出现 |
+| `test_失败原因_ModelError按子类给固定文案` | 7 个已知子类各自的固定文案 |
+| `test_失败原因_预算resource不在允许列表则不放行` | `lease:abc123:model_calls` → 空串 |
+| `test_失败原因_允许列表内的预算resource仍然可见` | `model_calls` / `steps` / `model_call_timeout` 照常可见 |
+| `test_失败原因_未知异常一律空串` | `RuntimeError("SECRET_TOKEN /etc/passwd")` → 空串 |
+| `test_Trace写入失败_不中断Agent运行_但记ERROR且不再重试` | 真实 runtime 运行**完成**；有 ERROR 记录；只尝试写 1 次；内存 sink 仍收到事件 |
+| `test_Trace写入失败_关闭时不抛异常` | `flush()` / `close()` 不抛 |
+| `test_Trace路径不可写_构造阶段仍然明确报错` | 启动期策略不变 |
+
+**「撤掉修复即失败」**：临时把 `JSONLTraceSink.emit()` 改回「写失败即抛」
+（`# TEMP-REVERT`），并把未知 `ModelError` 分支改回放行 `str(exc)`
+→ **3 failed / 26 passed**（三个新用例失败）；
+随后用备份逐字还原（两个文件的 `grep -c "TEMP-REVERT"` 均为 0）→ 复跑 **29 passed**。
+
+### 四、本轮测试结果（作者证据，未重跑全量）
+
+| 范围 | 结果 |
+|---|---|
+| `tests/test_trace_chain.py` | **29 passed** |
+| `test_middleware / test_cancel_semantics / test_api_runs / test_api_runs_stream / test_api_runs_stream_components / test_agent / test_budget_lifecycle` | **196 passed** |
+| `test_api_e2e / test_api_errors / test_api_files / test_api_health / test_api_lifespan / test_api_threads / test_phase21b_events / test_project_execute_e2e / test_confirmation_lifecycle / test_subagent_executor / test_subagent_integration / test_subagent_allowed_tools / test_context_agent / test_context_compactor / test_context_history / test_context_task_notes / test_phase17_18_closing / test_cli / test_cli_memory / test_cli_skills` | **528 passed / 4 failed** |
+| **合计** | **753 passed / 4 failed** |
+
+4 项失败与前三轮**完全相同**，均为既有失败：`test_phase21b_events.py` 1 项
+（已用 `git archive 4c9354b` 基线副本复跑确认同样失败）、`test_subagent_allowed_tools.py` 3 项
+（与 TRACE-01 无交集）。
+
+### 五、本轮未做
+
+- SSE 侧 `safe_failure_detail` 的同源信任假设未收口（属既有客户端契约，另行排期）。
+- SSE 公开事件名未改；Agent 异常语义未改。
+- 子代理授权缺口、重试次数既有问题、子代理工具独立 span：仍为范围外，只记录。
+- 偶发进程回收失败：保留记录。
+- PROGRESS 留在 worktree 内；旧分支未处理。
+- 未 commit / push / merge；未重跑全量。
+
+---
+
+## TRACE-01 最终收口：查询工具诊断与文档一致性（2026-11-05，第五轮）
+
+**会话标识**：claude-worker-20261010-2015
+**基线**：`4c9354b`（同前四节；本轮未换基线）
+**分支**：`automation/trace-01`（独立 worktree）
+**状态**：收口完成，定向测试通过；**未 commit / push / merge**
+
+**复审裁定**：第四轮两项安全与失败策略**条件已闭合**；`close()` 后静默丢弃事件**接受现状**
+（正常关闭 ≠ 运行中故障，不新增 WARNING，避免日志噪声）。
+同时点出两处**最终收口级别**的修正（不构成新一轮返修）：
+
+1. 查询工具对**重复终态**与**父子引用成环**应给出警告，而不是静默处理 ——
+   这两种形态恰恰是 TRACE-01 要防的「调用链不可信」，静默取第一条会把它们藏起来；
+2. `docs/context-engineering.md` 的「有 running 记录的必有终态」与本文件已登记的
+   「中间件 `before` 抛错 → 不执行 `finally_` → 可能留下悬空 span」**表述冲突**。
+
+### 一、查询工具：只诊断，不修复
+
+**原则**：保留原始事件，**不尝试自动修复异常数据**；在 stderr 给出警告；
+**原始文件内容一字不改**。
+
+| 异常形态 | 改前 | 改后 |
+|---|---|---|
+| 同一 `event_id` 多条终态 | 静默取第一条 | stderr 警告（列出 event_id 与各条 status），显示仍保留第一条，**文件不改** |
+| `parent_id` 成环 | 环上 span **不在任何根链上 → 被静默丢弃** | stderr 警告（打印环路径 `a → b → a`）；环上 span 在「不在任何父链上」一节**单独列出**，不丢弃 |
+| 尾部损坏的 JSON 行 | 跳过 + stderr 警告 | 不变 |
+| 有 running 无终态（悬空） | 显示 `[running]` | 不变（建议以后明确标识，本轮不动） |
+| 父节点缺失 | 当作根节点 | 不变 |
+
+**实现**（`scripts/trace_query.py`）：
+
+- 新增 `_find_cycles(events)`：按 `parent_id` 反向映射做迭代式环检测，
+  返回每条环的 event_id 路径（自环 `a → a` 也能识别）。
+- `_terminals()` 增加重复终态警告。
+- `_print_tree()` 增加 `on_path` 递归保护（回到已显示的 span 时打印 `↺` 标记并停止下钻，
+  避免无限递归），并把「不在任何父链上」的 span 单独列出。
+
+**新增用例（29 → 31）**：
+
+| 用例 | 断言 |
+|---|---|
+| `test_查询工具_重复终态给出警告_但不修改原始文件` | stderr 含「终态」与 `e1`；**文件内容一字未改**；span 仍显示 |
+| `test_查询工具_父子引用成环给出警告_且环上span不被丢弃` | stderr 含「成环」；**文件内容一字未改**；`id=a` / `id=b` 都在输出里 |
+
+**「撤掉修复即失败」**：临时把两处警告改成 `if False:  # TEMP-REVERT` →
+**2 failed / 29 deselected**（正是这两个新用例）；
+随后用备份文件逐字还原（`grep -c "TEMP-REVERT"` = 0）→ 复跑 **31 passed**。
+
+### 二、文档一致性修正
+
+`docs/context-engineering.md` 的「调用链 span」一节，原文：
+
+> 消费方按 `event_id` 分组时，**终态记录恰为 1 条**、有 `running` 记录的必有终态。
+
+与本文件「已知限制 7」登记的「中间件 `before` 抛错 → 不执行 `finally_` → span 可能停在
+running」冲突。改为：
+
+> **正常执行路径中每个 running span 应对应唯一终态**；
+> 异常中断、进程退出或部分 Trace 丢失时，可能出现悬空 span。
+
+并补一条「已知限制」说明（中间件 `before` 循环在 `try` 之外；属中间件执行语义的既有问题，
+修它要变更「哪些中间件的 finally 该跑」，不在 Trace 阶段范围），同时点明查询工具会把
+这类悬空 span 原样显示为 `[running]`。
+
+### 三、本轮测试结果（作者证据，未重跑全量）
+
+| 范围 | 结果 |
+|---|---|
+| `tests/test_trace_chain.py` | **31 passed** |
+| 其余定向范围 | 与第四轮相同（未重跑；本轮只改 `scripts/trace_query.py`、新增 2 个用例、修正 1 段文档） |
+
+### 四、本轮未做
+
+- `close()` 后到达的事件：接受现状，**不新增 WARNING**（复审裁定）。
+- 悬空 span 的显式标识（如 `[running]` 之外加标记）：复审建议「以后明确标识」，本轮只记录。
+- `_print_tree(..., only_status=...)` 的死参数：复审判定「不阻塞」，本轮**不动**。
+- 生产代码未改（`middleware.py` / `trace_safety.py` / `agent.py` / `api/` / `subagent_*` 一行未动）。
+- 未 commit / push / merge；未重跑全量。
+
+### 五、后续技术债（复审登记，不在 TRACE-01 范围）
+
+| 项 | 现状 | 风险 | 后续 |
+|---|---|---|---|
+| `JSONLTraceSink.close()` 的资源释放 | `flush()` 与 `close()` 在**同一个 try** 里；前者抛异常时后者不执行 | 文件句柄可能未及时释放 | 把实际关闭动作放进独立的异常处理或 `finally` |
+| `trace_query.py` 的树遍历是**递归** | `walk()` 逐层递归下钻 | 极端长的 span 链可能触及 Python 递归深度限制 | 需要支持超长 Trace 时改为迭代遍历 |
+
+两项均**不影响**本轮 Trace 主链路的正确性，复审明确不为此开启新一轮返修。
+
+### 六、复审最终结论
+
+**TRACE-01：PASS（代码复审通过）** —— 同意结束返修阶段，进入提交与 PR 审查流程。
+
+复审方独立验证了 `trace_query.py` 的 219 行实现（语法检查 + 构造异常 Trace 实跑：
+`a → b → a` 环、同 span 两条终态、对应 running 记录），确认退出码 0、两类警告正确、
+环上 span 未被丢弃、原始文件未被修改。
+
+复审方未拥有完整仓库环境，**未**独立执行 31 个 pytest 用例与 753 项回归 ——
+本文件记录的测试结果仍为**作者证据**。
+
+---
+
+## TRACE-01 提交前核对（2026-11-05）
+
+提交 `automation/trace-01` 前逐项核对：
+
+| 项 | 结果 |
+|---|---|
+| 暂存文件范围 | 15 个（12 改 + 3 新增），与复审通过的 diff **逐字一致**（差异仅为下列路径中性化） |
+| `.mini-deerflow/`（运行时产物） | **未纳入**（保持未跟踪，不进版本库） |
+| 凭据扫描 | 新增行中无真实凭据；仅两处是测试断言里的字面量（`sk-` / `Bearer ` 等作为「禁止出现」的检查项） |
+| 本机绝对路径 | PROGRESS.md 第二轮取证记录里的本机临时目录已中性化为 `<临时取证目录>`（仓库外的临时目录，不属于产品代码） |
+| 既有失败基线 | 4 项失败（`test_phase21b_events` 1 项 + `test_subagent_allowed_tools` 3 项）均为既有失败，已用 `git archive 4c9354b` 基线副本确认；已写入提交信息 |
+| 临时测试文件 | 无（取证脚本都在仓库外的临时目录，不进入仓库） |
+
+`README-复审导读.md` 与 `.patch` / `.patch.stat` 是**交付给复审方**的材料，放在仓库外的
+临时复审目录，**不属于产品代码，不进入提交**。
+
+---
+
+## V1 整合收口（2026-11-07）
+
+- 任务 ID：V1-CLOSEOUT-01
+- 目的：把已完成的 TOOL-02~07 / TEST-01 / HANDOVER-01 / GUARD-01 / TRACE-01
+  与本轮 V1 修复整合成一条可合入 master 的主线，**保留原提交历史**。
+- 分支：`integration/v1-closeout`（独立 worktree），基线 `origin/master`（`914380b`）。
+
+### 纳入的来源分支（完整 SHA）
+
+| 来源分支 | SHA | 纳入方式 |
+|---|---|---|
+| `origin/master` | `914380b6715f84832eb447e67305e05bdb800d58` | 整合基线 |
+| `origin/automation/tool-07` | `4c9354be62df581f3a44dc88091143b73b3a7291` | `--no-ff` 合并 |
+| `origin/automation/test-01` | `528babd3a0104b32f6727402a7c73d87bae55c1a` | `--no-ff` 合并 |
+| `origin/automation/handover-01` | `ad4e598ab17fbdbd00be26938f1fa7acbcbc28fe` | `--no-ff` 合并（含本轮 V1 修复 `ad4e598`） |
+| `origin/automation/trace-01` | `9b73c244daa9fe91d3fedd06a751133fd88daa44` | `--no-ff` 合并 |
+
+### 早期分支核对
+
+- `tool-02` / `tool-03` / `tool-04` / `tool-05`：**已被 tool-07 完全包含**
+  （各自相对 tool-07 无独有提交）→ 不重复搬代码。
+- `tool-06`：唯一独有提交 `23991f8` 是**旧版**产品演示脚本。
+  tool-07 上已有更新版（`0d7eaae` → `3009023` → `cabc63d`，6 个演示场景，
+  额外覆盖「未配置 harness」与「真实子进程超时」）→ **不用旧脚本覆盖新版**。
+- ChatGPT 的整合提交 `2c81f8f` 仅存在于其隔离环境，**未寻找、未依赖**；
+  整合全部使用本机可取得的原始分支。
+
+### 冲突处理（2 处）
+
+| 文件 | 冲突 | 处理 |
+|---|---|---|
+| `src/mini_deerflow/agent.py` | Guard 的 `guard_verdicts` 与 Trace 的 `chain_tail` 局部变量声明 | **两侧都保留**（各自独立变量，互不干扰） |
+| `docs/PROGRESS.md` | 两边各自把章节追加到文件末尾 | **双方历史都保留**：HANDOVER/Guard/交付记录在前，TRACE-01 系列在后 |
+
+### 整合验证
+
+见本轮交付汇报。**未跑全量后端套件**，未开多 Agent 复审。
