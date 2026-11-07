@@ -5425,6 +5425,7 @@ running」冲突。改为：
 | 来源分支 | SHA | 纳入方式 |
 |---|---|---|
 | `origin/master` | `914380b6715f84832eb447e67305e05bdb800d58` | 整合基线 |
+| `origin/automation/tool-06` | `23991f8ea2d6e07dbb94deee9c78fb214d4227a1` | `--no-ff` 合并（取新版演示脚本，见下） |
 | `origin/automation/tool-07` | `4c9354be62df581f3a44dc88091143b73b3a7291` | `--no-ff` 合并 |
 | `origin/automation/test-01` | `528babd3a0104b32f6727402a7c73d87bae55c1a` | `--no-ff` 合并 |
 | `origin/automation/handover-01` | `ad4e598ab17fbdbd00be26938f1fa7acbcbc28fe` | `--no-ff` 合并（含本轮 V1 修复 `ad4e598`） |
@@ -5473,6 +5474,10 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
 | 前端 `npm run typecheck` | **通过** |
 | 前端 `npx vitest run` | **43 files / 541 tests passed** |
 | 浏览器实机（Playwright，刷新后） | 正文 + diff + verification + guard **同时存在**；判定「已关联检查通过」，逐条退出码 `0 / 0` 与 API 读回一致；pill 显示「历史结果」 |
+
+**记录**：合并 tool-06 的提交信息里把其 head 写成了父提交 `ae556cf`，
+实际 head 是 `23991f8`（合并的第二父提交就是 `23991f8`，合并本身正确）；
+按「不改写历史」的要求**不 amend**，在此更正。
 
 **15 项失败全部是既有失败，与整合无关** —— 已用两个干净基线 worktree
 （`origin/master` `914380b` 与 `origin/automation/tool-07` `4c9354b`）
