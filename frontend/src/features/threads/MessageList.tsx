@@ -4,7 +4,8 @@
  * 职责：
  * - 按顺序展示服务端消息（MessageDetail.messages）
  * - 乐观渲染用户消息（optimisticMsg），在服务端历史回来后去重合并
- * - 纯文本安全渲染（不使用 dangerouslySetInnerHTML）
+ * - assistant 消息按 Markdown 渲染（MarkdownMessage），user/tool/system 按原文展示
+ * - 渲染全程不使用 dangerouslySetInnerHTML（原始 HTML 不会被执行）
  * - role 视觉区分（user / assistant）
  * - 提交状态通过 data-submit-status 属性透传给 CSS（不污染 content）
  * - 滚动到底部
@@ -12,6 +13,7 @@
 import { useEffect, useRef } from 'react'
 import type { MessageResponse } from '../../shared/types/threads'
 import type { OptimisticMessage, MessageResponseLocal } from './types'
+import { MarkdownMessage } from './MarkdownMessage'
 import styles from './MessageList.module.css'
 
 interface MessageListProps {
@@ -56,12 +58,18 @@ function MessageItem({
         {isUser ? '你' : isAssistant ? 'Agent' : message.role}
       </div>
       <div className={styles.content}>
-        {message.content.split('\n').map((line, i) => (
-          <span key={i}>
-            {line}
-            {i < message.content.split('\n').length - 1 && <br />}
-          </span>
-        ))}
+        {/* assistant 走 Markdown 渲染（流式/最终/历史共用同一组件）；
+            其余角色按原文展示，不解析 Markdown 标记 */}
+        {isAssistant ? (
+          <MarkdownMessage content={message.content} />
+        ) : (
+          message.content.split('\n').map((line, i) => (
+            <span key={i}>
+              {line}
+              {i < message.content.split('\n').length - 1 && <br />}
+            </span>
+          ))
+        )}
       </div>
     </div>
   )

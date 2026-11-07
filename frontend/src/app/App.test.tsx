@@ -10,6 +10,7 @@
  */
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
+import { userEvent } from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import App from './App'
@@ -67,5 +68,17 @@ describe('App Shell', () => {
     render(<App />, { wrapper: TestWrapper })
     expect(screen.getByRole('tab', { name: 'Uploads' })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: 'Artifacts' })).toBeInTheDocument()
+  })
+
+  it('真实数据源：打开任务面板也不显示「模拟数据」标识', async () => {
+    const user = userEvent.setup()
+    render(<App />, { wrapper: TestWrapper })
+
+    await user.click(screen.getByRole('button', { name: '查看任务' }))
+
+    // 面板确实打开了
+    expect(screen.getByRole('complementary', { name: '任务审查面板' })).toBeInTheDocument()
+    // 但顶栏不能把真实 harness 结果标成演示数据
+    expect(screen.queryByText('交互原型 · 模拟数据')).toBeNull()
   })
 })

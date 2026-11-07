@@ -424,7 +424,10 @@ def test_summary_uses_separate_budget_from_decisions() -> None:
         budget=decision_budget,
         context_assembler=assembler,
     )
-    agent.run(THREAD, "现在的问题")
+    # BUDGET-01：预算是**运行级**的 —— Agent 持有的是额度上限模板，实际计数
+    # 落在「本次运行」的计数器上。这里显式传入本次运行的计数器，使断言
+    # 观测的对象就是计数对象（断言本身未放宽）。
+    agent.run(THREAD, "现在的问题", budget=decision_budget)
 
     # 摘要消耗只记在 summary_budget 上，决策额度只被那一次正常 decide 占用——
     # 两类调用互不串账，才是「独立 Budget」的含义。

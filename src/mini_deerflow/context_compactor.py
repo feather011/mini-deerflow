@@ -32,7 +32,7 @@ from mini_deerflow.context_state import (
 )
 from mini_deerflow.message_group import MessageGroup
 from mini_deerflow.middleware import TraceSink
-from mini_deerflow.models import FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.models import FinalAnswer, Message, Model, ToolCall, ToolCalls
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.token_counter import TokenCounter
 
@@ -203,6 +203,12 @@ class ContextCompactor:
         if isinstance(decision, ToolCall):
             raise SummaryInvalidResponseError(
                 f"摘要模型返回了 ToolCall({decision.name}) 而非文本",
+                attempts=1,
+            )
+        if isinstance(decision, ToolCalls):
+            names = ", ".join(c.name for c in decision.calls)
+            raise SummaryInvalidResponseError(
+                f"摘要模型返回了 {len(decision.calls)} 个工具调用({names})而非文本",
                 attempts=1,
             )
         if not isinstance(decision, FinalAnswer):

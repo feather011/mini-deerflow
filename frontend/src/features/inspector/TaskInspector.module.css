@@ -225,6 +225,14 @@
   padding: 6px 0;
 }
 
+.diffTruncated {
+  padding: 6px 10px;
+  font-size: 10px;
+  color: var(--color-text-muted, #6b7280);
+  background: var(--color-bg-subtle, #f9fafb);
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+}
+
 .diffLine {
   display: flex;
   white-space: pre;
@@ -309,6 +317,33 @@
   color: var(--color-text-muted, #6b7280);
   line-height: 1.8;
   margin-top: 8px;
+}
+
+/* 逐条验证命令：命令 / 结构化退出码 / 结果 */
+.verificationTable {
+  width: 100%;
+  margin-top: 10px;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.verificationTable th,
+.verificationTable td {
+  padding: 5px 6px;
+  text-align: left;
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+  vertical-align: top;
+}
+
+.verificationTable th {
+  color: var(--color-text-muted, #6b7280);
+  font-weight: 500;
+}
+
+.verificationCommand {
+  font-family: Consolas, 'SFMono-Regular', monospace;
+  font-size: 10px;
+  overflow-wrap: anywhere;
 }
 
 /* ---- 过程页签 ---- */

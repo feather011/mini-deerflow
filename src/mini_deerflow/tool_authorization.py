@@ -107,6 +107,35 @@ class ToolAuthorizationError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# 会话默认能力推导（与 Agent 两处 inline 判定保持同一语义）
+# ---------------------------------------------------------------------------
+
+
+def session_capabilities(project_id: str | None) -> frozenset:
+    """按会话类型推导可信默认能力集合。
+
+    - 普通会话（project_id=None）：计算 + 会话历史读写 + **网络只读**
+    - 项目会话：在普通会话能力之上再加项目读 / 派发执行
+    - `NETWORK_READ` 属于 TOOL-06：已授权的网络只读工具（web_search / web_read）
+      在普通会话与项目会话都可用，且**不因此**获得写入/命令/项目能力。
+    """
+    from mini_deerflow.tool_contracts import ToolCapability
+
+    base = {
+        ToolCapability.COMPUTE,
+        ToolCapability.SESSION_HISTORY_READ,
+        ToolCapability.SESSION_STATE_WRITE,
+        ToolCapability.NETWORK_READ,
+    }
+    if project_id is not None:
+        base |= {
+            ToolCapability.PROJECT_READ,
+            ToolCapability.PROJECT_EXEC_DELEGATE,
+        }
+    return frozenset(base)
+
+
+# ---------------------------------------------------------------------------
 # check_tool_access() — Agent._do_tool_call 集成点
 # ---------------------------------------------------------------------------
 

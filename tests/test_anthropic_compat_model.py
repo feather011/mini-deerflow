@@ -14,6 +14,7 @@ import pytest
 
 from mini_deerflow.anthropic_compat_model import (
     AnthropicCompatModel,
+    extract_system_prompt,
     provider_messages_from,
 )
 from mini_deerflow.model_config import ModelSettings
@@ -35,16 +36,44 @@ KEY = "sk-UNIT-TEST-SECRET-KEY"
 # ---------------------------------------------------------------------------
 
 
+class FakeStream:
+    """`client.messages.stream()` 的最小替身。
+
+    `stream_decide()` 用 `with ... as stream:` 逐事件迭代；这里给一个
+    只含 `message_stop` 的空流，让它立刻结束 —— 本组用例要断言的是
+    **发出去的请求参数**，不是 token 增量。
+    """
+
+    def __init__(self, kwargs: dict[str, Any]) -> None:
+        self._kwargs = kwargs
+
+    def __enter__(self) -> "FakeStream":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> bool:
+        return False
+
+    def __iter__(self) -> Any:
+        yield SimpleNamespace(type="message_stop")
+
+
 class FakeMessages:
     def __init__(self, result: Any) -> None:
         self._result = result
         self.calls: list[dict[str, Any]] = []
+        self.stream_calls: list[dict[str, Any]] = []
 
     def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
+
+    def stream(self, **kwargs: Any) -> FakeStream:
+        self.stream_calls.append(kwargs)
+        if isinstance(self._result, Exception):
+            raise self._result
+        return FakeStream(kwargs)
 
 
 class FakeClient:
@@ -105,9 +134,165 @@ class TestMessage转换:
             provider_messages_from([])
 
     def test_不支持的角色_抛领域错误(self) -> None:
+        """真正不支持的角色仍要报错，不能默默变成别的角色发出去。"""
         with pytest.raises(ModelError) as exc:
-            provider_messages_from([Message(role="system", content="x")])
-        assert "system" in str(exc.value)
+            provider_messages_from([Message(role="system_admin", content="x")])
+        assert "system_admin" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# system 消息 → 顶层 system 字段
+# ---------------------------------------------------------------------------
+
+
+class TestSystem消息:
+    """`role="system"` 必须抽到 Anthropic 协议的顶层 `system=` 字段。
+
+    背景：`ContextAssembler` 一直会生成 system 消息（摘要 / 任务笔记 /
+    记忆 / Skill 上下文），而适配器过去把 system 当成"不支持的角色"直接
+    抛错 —— 结果是：只要线程里有这些上下文，请求在**发送前**就失败，
+    摘要、记忆与 Skill 上下文**从来没有真的发给过模型**。
+    """
+
+    def test_system_不出现在_messages_里(self) -> None:
+        payload = provider_messages_from([
+            Message(role="system", content="摘要段"),
+            Message(role="user", content="问题"),
+        ])
+        assert [m["role"] for m in payload] == ["user"]
+        assert payload[0]["content"] == "问题"
+
+    def test_没有_system_时不产出_system_字段(self) -> None:
+        """普通对话不带 system —— 不该改变既有的请求形状。"""
+        payload = provider_messages_from([
+            Message(role="user", content="你好"),
+            Message(role="assistant", content="你好"),
+        ])
+        assert [m["role"] for m in payload] == ["user", "assistant"]
+
+    def test_多条_system_按顺序拼接(self) -> None:
+        """assembler 产出的摘要/笔记/记忆/Skill 是**多条**独立 system 消息。"""
+        payload = provider_messages_from([
+            Message(role="system", content="摘要段"),
+            Message(role="system", content="记忆段"),
+            Message(role="user", content="问题"),
+        ])
+        assert [m["role"] for m in payload] == ["user"]
+
+    def test_extract_system_prompt_按原顺序拼接(self) -> None:
+        """拼接顺序 = 产出顺序；空段被忽略；无 system 返回 None。"""
+        assert extract_system_prompt([
+            Message(role="system", content="摘要段"),
+            Message(role="system", content="任务笔记段"),
+            Message(role="system", content="记忆段"),
+            Message(role="user", content="问题"),
+        ]) == "摘要段\n\n任务笔记段\n\n记忆段"
+
+        assert extract_system_prompt([
+            Message(role="system", content="摘要段"),
+            Message(role="system", content="   "),
+            Message(role="user", content="问题"),
+        ]) == "摘要段"
+
+        assert extract_system_prompt([
+            Message(role="user", content="问题"),
+        ]) is None
+
+
+# ---------------------------------------------------------------------------
+# 顶层 system 字段的组装
+# ---------------------------------------------------------------------------
+
+
+class Test顶层System字段:
+    """顶层 `system` 字段的组装：**实际调用 decide() / stream_decide()**，
+    捕获真正发出去的请求参数来断言。
+
+    不直接调 `provider_messages_from` —— 那样只能证明 messages 数组里
+    没有 system，证明不了「顶层 system 字段真的带上了、且顺序正确」。
+    """
+
+    def _model(self) -> AnthropicCompatModel:
+        return AnthropicCompatModel(
+            ModelSettings(provider="minimax", api_key=KEY),
+            client=FakeClient(text_response("ok")),
+        )
+
+    def test_decide_把_system_放进顶层字段(self) -> None:
+        model = self._model()
+        model.decide([
+            Message(role="system", content="摘要段"),
+            Message(role="user", content="问题"),
+        ])
+        sent = model._client.messages.calls[0]
+        assert sent["system"] == "摘要段"
+        assert all(m["role"] != "system" for m in sent["messages"])
+
+    def test_没有_system_时_不传_system_字段(self) -> None:
+        """不传 system 时请求形状与 21A 完全一致（旧的纯文本路径不受影响）。"""
+        model = self._model()
+        model.decide([Message(role="user", content="问题")])
+        sent = model._client.messages.calls[0]
+        assert "system" not in sent
+
+    def test_多条_system_按原顺序拼接(self) -> None:
+        """assembler 产出的摘要/笔记/记忆/Skill 是**多条**独立 system 消息。
+
+        拼接顺序必须与产出顺序一致 —— 摘要在前、记忆在后，顺序错了
+        模型看到的上下文优先级就反了。
+        """
+        model = self._model()
+        model.decide([
+            Message(role="system", content="摘要段"),
+            Message(role="system", content="任务笔记段"),
+            Message(role="system", content="记忆段"),
+            Message(role="system", content="Skill段"),
+            Message(role="user", content="问题"),
+        ])
+        sent = model._client.messages.calls[0]
+        assert sent["system"] == "摘要段\n\n任务笔记段\n\n记忆段\n\nSkill段"
+
+    def test_stream_路径_同样带上_system(self) -> None:
+        """流式与非流式共用同一套 system 抽取，不能只修一条路径。"""
+        model = self._model()
+        list(model.stream_decide([
+            Message(role="system", content="摘要段"),
+            Message(role="user", content="问题"),
+        ]))
+        # 断言**流式请求本身**的参数（stream_decide 末尾还会调一次
+        # decide()，那次的调用记录在 messages.calls 里，不是流式请求）
+        sent = model._client.messages.stream_calls[0]
+        assert sent["system"] == "摘要段"
+        assert all(m["role"] != "system" for m in sent["messages"])
+
+    def test_stream_路径_多条_system_按原顺序拼接(self) -> None:
+        """流式路径的多段拼接顺序同样要正确。"""
+        model = self._model()
+        list(model.stream_decide([
+            Message(role="system", content="摘要段"),
+            Message(role="system", content="记忆段"),
+            Message(role="user", content="问题"),
+        ]))
+        sent = model._client.messages.stream_calls[0]
+        assert sent["system"] == "摘要段\n\n记忆段"
+
+    def test_stream_路径_没有_system_时不传_system_字段(self) -> None:
+        """无 system 时流式请求形状同样不变。"""
+        model = self._model()
+        list(model.stream_decide([Message(role="user", content="问题")]))
+        sent = model._client.messages.stream_calls[0]
+        assert "system" not in sent
+
+    def test_空白的_system_段被忽略(self) -> None:
+        """空白段不该在 system 里留下多余空行。"""
+        model = self._model()
+        model.decide([
+            Message(role="system", content="摘要段"),
+            Message(role="system", content="   "),
+            Message(role="user", content="问题"),
+        ])
+        sent = model._client.messages.calls[0]
+        assert sent["system"] == "摘要段"
 
 
 # ---------------------------------------------------------------------------

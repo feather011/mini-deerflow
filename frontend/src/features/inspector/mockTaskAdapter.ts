@@ -165,6 +165,20 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       command: 'python -m pytest tests/test_pagination.py -q',
       output: '4 passed in 0.18s',
       note: '示例命令证据，不代表所有验收条件已经确认；业务验收等待用户审查。',
+      guard: {
+        verdict: 'verified',
+        label: '验证通过',
+        reason: '验证命令退出码都是 0，且与验收条件对得上。',
+        acceptance_covered: true,
+      },
+      entries: [
+        {
+          command: 'python -m pytest tests/test_pagination.py -q',
+          exit_code: 0,
+          passed: true,
+          output: '4 passed in 0.18s',
+        },
+      ],
     },
     files: [paginationPy, paginationTestPy],
     run_id_marker: 'mock-8f2a',
@@ -183,10 +197,17 @@ const DEMO_TASKS: Record<string, TaskResult> = {
     // 关键样例：执行完成，但本轮没有运行任何验证命令
     status: 'completed',
     validation: {
-      status: 'not_run',
+      status: 'unverified',
       command: null,
       output: null,
       note: '本轮未运行任何验证命令；没有命令证据不显示测试通过。',
+      guard: {
+        verdict: 'unverified',
+        label: '有改动但未验证',
+        reason: '本轮没有执行任何验证命令，无法确认验收条件已满足',
+        acceptance_covered: null,
+      },
+      entries: [],
     },
     files: [reportPy],
     run_id_marker: 'mock-1c4d',
@@ -206,6 +227,8 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       command: 'python -m pytest tests/test_search.py -q',
       output: null,
       note: '验证运行中；出结果前不显示通过或失败。',
+      guard: null,
+      entries: [],
     },
     files: [searchPy],
     run_id_marker: 'mock-5b90',
@@ -225,6 +248,20 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       command: 'python -m pytest tests/test_discount.py -q',
       output: '1 failed, 3 passed in 0.09s',
       note: '验证失败：test_bulk_discount 期望旧口径，需要确认业务预期后再改测试或改实现。',
+      guard: {
+        verdict: 'failed',
+        label: '验证失败',
+        reason: '1 条验证命令退出码非 0：python -m pytest tests/test_discount.py -q',
+        acceptance_covered: true,
+      },
+      entries: [
+        {
+          command: 'python -m pytest tests/test_discount.py -q',
+          exit_code: 1,
+          passed: false,
+          output: '1 failed, 3 passed in 0.09s',
+        },
+      ],
     },
     files: [discountPy],
     run_id_marker: 'mock-3e77',
@@ -245,6 +282,8 @@ const DEMO_TASKS: Record<string, TaskResult> = {
       command: null,
       output: null,
       note: '任务被停止，验证未完成；没有完整命令结果不显示通过。',
+      guard: null,
+      entries: [],
     },
     files: [notesMd],
     run_id_marker: 'mock-a012',
@@ -259,10 +298,17 @@ const DEMO_TASKS: Record<string, TaskResult> = {
     title: '梳理接入方案（未改代码）',
     status: 'completed',
     validation: {
-      status: 'not_run',
+      status: 'unverified',
       command: null,
       output: null,
       note: '本轮为只读梳理，没有代码变更，也未运行验证命令。',
+      guard: {
+        verdict: 'unverified',
+        label: '未验证',
+        reason: '本轮没有执行任何验证命令，无法确认验收条件已满足',
+        acceptance_covered: null,
+      },
+      entries: [],
     },
     files: [],
     run_id_marker: 'mock-9d31',
@@ -275,6 +321,8 @@ const DEMO_TASKS: Record<string, TaskResult> = {
 
 /** 模拟适配器：按 threadId 归属取任务；未登记的 id 与 null 返回 null */
 export const mockTaskAdapter: TaskAdapter = {
+  // 演示数据：UI 据此标注"模拟数据"
+  dataSource: 'mock',
   getTask(threadId: string | null): TaskResult | null {
     if (!threadId) return null
     return DEMO_TASKS[threadId] ?? null

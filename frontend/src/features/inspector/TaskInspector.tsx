@@ -26,6 +26,9 @@ import { useSSEContext } from '../../app/SSEContext'
 import type { RunEvent } from '../../shared/types/events'
 import styles from './TaskInspector.module.css'
 import {
+  GUARD_MISSING_META,
+  GUARD_VERDICT_META,
+  TASK_HISTORY_META,
   TASK_STATUS_META,
   VALIDATION_STATUS_META,
 } from './constants'
@@ -78,7 +81,16 @@ export function TaskInspector({
 
   if (!open) return <></>
 
-  const statusMeta = task ? TASK_STATUS_META[task.status] : null
+  // 状态 pill：
+  // - 有进行中的 Run → 显示运行状态
+  // - 没有进行中的 Run，但**有历史执行结果**（刷新后的常态）→ 显示「历史结果」
+  //   （显示「暂无运行」等于把"有历史结果"说成"从未执行过"，与面板下方的
+  //    变更/验证证据自相矛盾）
+  const statusMeta = task
+    ? task.status === 'no_run' && task.last_result_status != null
+      ? TASK_HISTORY_META
+      : TASK_STATUS_META[task.status]
+    : null
 
   return (
     <aside className={styles.panel} aria-label="任务审查面板">
@@ -183,7 +195,11 @@ function ChangesTab({
 
   return (
     <div>
-      <p className={styles.summary}>{files.length} 个本轮变更文件 · 原有修改单独保留</p>
+      <p className={styles.summary}>
+        {task.last_result_status != null && task.status === 'no_run'
+          ? `${files.length} 个最近一次运行的变更文件 · 原有修改单独保留`
+          : `${files.length} 个本轮变更文件 · 原有修改单独保留`}
+      </p>
       <ul className={styles.fileList}>
         {files.map((file, index) => (
           <li key={file.path}>
@@ -202,16 +218,27 @@ function ChangesTab({
           </li>
         ))}
       </ul>
-      <DiffView file={files[fileIndex] as ChangedFile} />
+      <DiffView file={files[fileIndex] as ChangedFile} isCurrentRun={task.status !== 'no_run'} />
     </div>
   )
 }
 
 /** unified diff 渲染：add/remove/context 三色行 + 新旧行号 */
-function DiffView({ file }: { file: ChangedFile }) {
+function DiffView({
+  file,
+  isCurrentRun,
+}: {
+  file: ChangedFile
+  isCurrentRun: boolean
+}) {
   return (
     <div className={styles.diff}>
-      <div className={styles.diffHead}>{file.path} · 本轮变化</div>
+      <div className={styles.diffHead}>
+        {file.path} · {isCurrentRun ? '本轮变化' : '最近一次运行的变化'}
+      </div>
+      {file.diff_truncated && (
+        <div className={styles.diffTruncated}>diff 正文过长，已截断显示</div>
+      )}
       <div className={styles.diffLines}>
         {file.diff.map((line, index) => (
           <div
@@ -232,11 +259,18 @@ function DiffView({ file }: { file: ChangedFile }) {
   )
 }
 
-/** 验证页签：验证状态卡；没有命令证据不显示测试通过 */
+/** 验证页签：展示后端 guard 的判定 + 逐条命令的结构化退出码 */
 function ValidationTab({ task }: { task: TaskResult }) {
   const { validation } = task
-  const meta = VALIDATION_STATUS_META[validation.status]
-  const completedUnverified = task.status === 'completed' && validation.status === 'not_run'
+  const guard = validation.guard
+
+  // 结论只有一个来源：后端 guard。
+  // 没有 guard（旧记录）→ 明确「未判定」；连命令证据都没有 → 「未运行」。
+  const meta = guard
+    ? GUARD_VERDICT_META[guard.verdict]
+    : validation.entries.length > 0
+      ? GUARD_MISSING_META
+      : VALIDATION_STATUS_META[validation.status]
 
   return (
     <div>
@@ -249,20 +283,57 @@ function ValidationTab({ task }: { task: TaskResult }) {
           >
             {meta.label}
           </span>
-          {validation.command && (
-            <code className={styles.validationCommand}>{validation.command}</code>
+          {guard?.acceptance_covered === false && (
+            <span className={styles.pill} data-tone="warning">
+              验收条件未关联
+            </span>
           )}
         </div>
+        <p className={styles.validationNote}>
+          {guard ? guard.reason : validation.note}
+        </p>
+        {guard?.label && (
+          <p className={styles.validationNote}>后端判定标签：{guard.label}</p>
+        )}
+        {validation.entries.length > 0 && (
+          <table className={styles.verificationTable}>
+            <thead>
+              <tr>
+                <th>命令</th>
+                <th>退出码</th>
+                <th>结果</th>
+              </tr>
+            </thead>
+            <tbody>
+              {validation.entries.map((entry, index) => (
+                <tr key={index}>
+                  <td>
+                    <code className={styles.verificationCommand}>
+                      {entry.command || '(未记录命令)'}
+                    </code>
+                  </td>
+                  <td data-testid="verification-exit-code">
+                    {entry.exit_code === null ? '缺失' : entry.exit_code}
+                  </td>
+                  <td>
+                    {entry.passed === null
+                      ? '未判定'
+                      : entry.passed
+                        ? '通过'
+                        : '失败'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
         {validation.output && (
           <pre className={styles.validationOutput}>{validation.output}</pre>
         )}
-        <p className={styles.validationNote}>{validation.note}</p>
       </div>
-      {completedUnverified && (
-        <p className={styles.validationHint}>
-          执行完成不等于业务验收通过；没有命令证据不显示测试通过。
-        </p>
-      )}
+      <p className={styles.validationHint}>
+        执行完成不等于业务验收通过；没有命令证据不显示测试通过。
+      </p>
       <p className={styles.validationHint}>业务验收：等待用户审查。</p>
     </div>
   )

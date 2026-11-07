@@ -211,6 +211,13 @@ class ToolRegistry:
             raise DuplicateToolError(f"工具已存在: {tool.name}")
         self._tools[tool.name] = tool
 
+    def unregister(self, name: str) -> bool:
+        """从 registry 移除指定工具。返回是否真的移除了。
+
+        TOOL-03 R4 round 3：MCP manager 复用 registry 时需要清掉自己的旧工具。
+        """
+        return self._tools.pop(name, None) is not None
+
     def register_many(self, tools: Sequence[Tool]) -> None:
         """批量原子注册工具。
 

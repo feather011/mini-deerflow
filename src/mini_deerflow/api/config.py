@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -82,6 +83,37 @@ class ApiSettings:
     harness_timeout_seconds: float = 600.0
     """单次 project_execute 任务的硬超时（秒），超时后强制终止进程树。"""
 
+    # ---- TOOL-06：网络只读工具 ----
+    web_read_timeout_s: float = 10.0
+    """web_read HTTP 总超时（秒）。"""
+    web_allow_loopback: bool = False
+    """放行 loopback 主机（127.0.0.1 / ::1）；CI 跑本地 fixture 时需显式置 True。
+    生产不应开启。"""
+    web_allowed_hosts: tuple[str, ...] = ()
+    """URL 主机白名单（精确匹配，不区分大小写）；不在白名单时按其它策略拒绝。"""
+    web_search_provider_kind: str = "unavailable"
+    """搜索 Provider 种类：
+    - "unavailable"：默认，未配置外部服务
+    - "fake"：内置 fake provider（CI/测试用，按 env JSON 提供固定结果）
+    - "mcp"：复用 MCP 接入，要求 mcp_servers 中存在 type=web_search 的 server
+    """
+    web_search_fake_results: tuple[tuple[str, str, str], ...] = ()
+    """fake provider 的固定结果（title, url, snippet）。"""
+    web_search_mcp_server: str | None = None
+    """MCP 搜索服务器名（mcp_servers 中的 server.name）。设置后，kind=mcp 走 MCP 工具。
+    格式：mcp__<server>__<tool> 形式的工具会被适配为搜索 Provider。"""
+    web_search_mcp_tool: str = "search"
+    """MCP 搜索工具名（默认 search）；模型通过 mcp__<server>__<tool> 暴露。"""
+
+    # ---- TRACE-01：Trace 采集与落盘 ----
+    trace_enabled: bool = False
+    """是否启用 Trace 事件采集。默认 False（不启用时不产生任何 Trace 事件）。
+
+    启用后可在 `trace_path` 指定 JSONL 落盘路径；不指定则只在内存里
+    （进程退出即丢，仅供进程内调试）。"""
+    trace_path: str | None = None
+    """Trace JSONL 输出路径。None = 不落盘（仅内存）。路径不可写时启动即报错。"""
+
     def __post_init__(self) -> None:
         """从环境变量覆盖各字段。"""
         # 使用 object.__setattr__ 因为 frozen=True
@@ -108,6 +140,17 @@ class ApiSettings:
         env_list = _get_env("MAX_LIST_ENTRIES", None)
         if env_list is not None:
             object.__setattr__(self, "max_list_entries", int(env_list))
+        # TRACE-01：Trace 采集与落盘
+        env_trace_enabled = _get_env("TRACE_ENABLED", None)
+        if env_trace_enabled is not None and env_trace_enabled.strip():
+            object.__setattr__(
+                self,
+                "trace_enabled",
+                env_trace_enabled.strip().lower() in ("1", "true", "yes", "on"),
+            )
+        env_trace_path = _get_env("TRACE_PATH", None)
+        if env_trace_path is not None and env_trace_path.strip():
+            object.__setattr__(self, "trace_path", env_trace_path.strip())
         # Thread 持久化：未设置或空白 → 保持内存实现（默认行为不变）
         env_db = _get_env("DB_PATH", None)
         if env_db is not None and env_db.strip():
@@ -130,6 +173,74 @@ class ApiSettings:
                 raise ValueError(
                     f"环境变量 MINI_DEERFLOW_HARNESS_TIMEOUT_SECONDS 必须为数字，当前值: {env_harness_timeout!r}"
                 ) from exc
+        # TOOL-06：网络只读
+        env_web_timeout = _get_env("WEB_READ_TIMEOUT_S", None)
+        if env_web_timeout is not None and env_web_timeout.strip():
+            try:
+                object.__setattr__(
+                    self, "web_read_timeout_s", float(env_web_timeout.strip())
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"环境变量 MINI_DEERFLOW_WEB_READ_TIMEOUT_S 必须为数字，当前值: {env_web_timeout!r}"
+                ) from exc
+        env_web_loopback = _get_env("WEB_ALLOW_LOOPBACK", None)
+        if env_web_loopback is not None and env_web_loopback.strip():
+            object.__setattr__(
+                self,
+                "web_allow_loopback",
+                env_web_loopback.lower() in ("true", "1", "yes"),
+            )
+        env_web_hosts = _get_env("WEB_ALLOWED_HOSTS", None)
+        if env_web_hosts is not None and env_web_hosts.strip():
+            seen: set[str] = set()
+            hosts: list[str] = []
+            for raw in env_web_hosts.split(","):
+                h = raw.strip().lower()
+                if not h or h in seen:
+                    continue
+                seen.add(h)
+                hosts.append(h)
+            object.__setattr__(self, "web_allowed_hosts", tuple(hosts))
+        # TOOL-06 R4：搜索 Provider 种类
+        env_web_kind = _get_env("WEB_SEARCH_PROVIDER_KIND", None)
+        if env_web_kind is not None and env_web_kind.strip():
+            kind = env_web_kind.strip().lower()
+            if kind not in ("unavailable", "fake", "mcp"):
+                raise ValueError(
+                    "环境变量 MINI_DEERFLOW_WEB_SEARCH_PROVIDER_KIND "
+                    f"必须为 unavailable/fake/mcp，当前值: {kind!r}"
+                )
+            object.__setattr__(self, "web_search_provider_kind", kind)
+        env_web_fake = _get_env("WEB_SEARCH_FAKE_RESULTS", None)
+        if env_web_fake is not None and env_web_fake.strip():
+            # JSON 数组，每个元素 [title, url, snippet]
+            try:
+                parsed = json.loads(env_web_fake)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"环境变量 MINI_DEERFLOW_WEB_SEARCH_FAKE_RESULTS 不是合法 JSON: {exc}"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise ValueError("WEB_SEARCH_FAKE_RESULTS 必须是 JSON 数组")
+            triples: list[tuple[str, str, str]] = []
+            for item in parsed:
+                if (
+                    not isinstance(item, list)
+                    or len(item) != 3
+                    or not all(isinstance(x, str) for x in item)
+                ):
+                    raise ValueError(
+                        "WEB_SEARCH_FAKE_RESULTS 元素必须是 [title, url, snippet] 三元组"
+                    )
+                triples.append((item[0], item[1], item[2]))
+            object.__setattr__(self, "web_search_fake_results", tuple(triples))
+        env_web_mcp_server = _get_env("WEB_SEARCH_MCP_SERVER", None)
+        if env_web_mcp_server is not None and env_web_mcp_server.strip():
+            object.__setattr__(self, "web_search_mcp_server", env_web_mcp_server.strip())
+        env_web_mcp_tool = _get_env("WEB_SEARCH_MCP_TOOL", None)
+        if env_web_mcp_tool is not None and env_web_mcp_tool.strip():
+            object.__setattr__(self, "web_search_mcp_tool", env_web_mcp_tool.strip())
         # 验证
         if self.max_upload_bytes < 0:
             raise ValueError(

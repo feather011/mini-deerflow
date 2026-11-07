@@ -1,0 +1,42 @@
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--color-text-muted, #6b7280);
+  border-top: 1px solid var(--color-border, #e5e7eb);
+  background: var(--color-bg-subtle, #f9fafb);
+}
+
+.text {
+  overflow-wrap: anywhere;
+}
+
+.spinner {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--color-border, #d1d5db);
+  border-top-color: var(--color-text-muted, #6b7280);
+  border-radius: 50%;
+  animation: runStatusSpin 0.9s linear infinite;
+}
+
+.status[data-phase='done'] .spinner {
+  animation: none;
+  border-top-color: var(--color-border, #d1d5db);
+  background: var(--color-border, #d1d5db);
+}
+
+@keyframes runStatusSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}

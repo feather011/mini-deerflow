@@ -639,6 +639,269 @@ def test_safe_failure_message_hides_message_and_traceback():
     assert "WeirdError" in msg
 
 
+def test_safe_failure_message_includes_model_error_reason():
+    """模型协议错误的原因必须到达客户端。
+
+    `ModelProtocolError` 的消息按 model_errors 的模块约定由本地构造、
+    只含状态码/供应商/模型名等非敏感信息；不展示它，使用者只能看到
+    "ModelProtocolError" 这个代号，无法判断到底发生了什么。
+    """
+    from mini_deerflow.model_errors import ModelProtocolError
+
+    e = ModelProtocolError("模型一次返回了 2 个 tool_use；当前只支持串行单工具调用")
+    msg = safe_failure_message(e)
+    assert "ModelProtocolError" in msg
+    assert "2 个 tool_use" in msg
+
+
+def test_safe_failure_message_follows_cause_chain():
+    """`raise ... from exc` 包装过的原始原因也要能取到。"""
+    from mini_deerflow.api.services.agent_runs import AgentRunFailedError
+    from mini_deerflow.model_errors import ModelProtocolError
+
+    cause = ModelProtocolError("模型一次返回了 2 个 tool_use")
+    try:
+        raise AgentRunFailedError() from cause
+    except AgentRunFailedError as e:
+        msg = safe_failure_message(e)
+    assert "AgentRunFailedError" in msg
+    assert "2 个 tool_use" in msg
+
+
+def test_safe_failure_message_still_hides_generic_cause_in_chain():
+    """异常链上的**普通**异常仍然不暴露 message（既有保守策略不放宽）。"""
+
+    class WeirdError(Exception):
+        pass
+
+    try:
+        raise WeirdError("包含路径/Token")
+    except WeirdError as e:
+        msg = safe_failure_message(e)
+    assert "包含路径/Token" not in msg
+    assert "WeirdError" in msg
+
+
+def test_safe_failure_detail_truncates_long_reason():
+    """过长的原因要截断，避免撑爆事件面板。"""
+    from mini_deerflow.model_errors import ModelProtocolError
+
+    e = ModelProtocolError("x" * 5000)
+    msg = safe_failure_message(e)
+    assert len(msg) < 500
+    assert msg.endswith("…")
+
+
+def test_middleware_model_failed_event_carries_reason(fresh_broker):
+    """model.failed 事件必须带上具体原因，而不是只有异常类名。"""
+    from mini_deerflow.model_errors import ModelProtocolError
+
+    b = fresh_broker
+    q = b.subscribe("r1")
+    mw = RunEventMiddleware(b)
+    mw.before(_ctx(OperationType.AGENT_RUN, "r1", "t1"))
+    mw.before(_ctx(OperationType.MODEL_CALL))
+    mw.error(
+        _ctx(OperationType.MODEL_CALL),
+        ModelProtocolError("模型一次返回了 2 个 tool_use"),
+    )
+    mw.finally_(_ctx(OperationType.AGENT_RUN))
+    b.close()
+    events = list(iter_run_events(q, poll_timeout=0.05))
+    failed = [e for e in events if e.event_type == RunEventType.MODEL_FAILED]
+    assert failed, "应当发出 model.failed 事件"
+    assert failed[0].error is not None
+    assert "2 个 tool_use" in failed[0].error
+
+
+def test_middleware_tool_failed_event_carries_reason(fresh_broker):
+    """tool.failed 事件同样要带上工具异常的具体原因。"""
+    from mini_deerflow.project_tools import ProjectToolStateError
+
+    b = fresh_broker
+    q = b.subscribe("r1")
+    mw = RunEventMiddleware(b)
+    mw.before(_ctx(OperationType.AGENT_RUN, "r1", "t1"))
+    mw.before(_ctx(OperationType.TOOL_CALL))
+    mw.error(
+        _ctx(OperationType.TOOL_CALL),
+        ProjectToolStateError("当前会话不是项目会话，没有绑定仓库"),
+    )
+    mw.finally_(_ctx(OperationType.AGENT_RUN))
+    b.close()
+    events = list(iter_run_events(q, poll_timeout=0.05))
+    failed = [e for e in events if e.event_type == RunEventType.TOOL_FAILED]
+    assert failed, "应当发出 tool.failed 事件"
+    assert failed[0].error is not None
+    assert "没有绑定仓库" in failed[0].error
+
+
+# ============================================================================
+# 工具失败的安全展示：工具名 + 稳定错误码 + 安全说明
+# ============================================================================
+
+
+def test_tool_failed_未知工具_给稳定错误码与工具名(fresh_broker):
+    """普通工具错误要有工具名与稳定错误码，而不是只有类名。"""
+    from mini_deerflow.tools import ToolNotFoundError
+
+    b = fresh_broker
+    q = b.subscribe("r1")
+    mw = RunEventMiddleware(b)
+    mw.before(_ctx(OperationType.AGENT_RUN, "r1", "t1"))
+    mw.before(_ctx(OperationType.TOOL_CALL, operation_name="no_such_tool"))
+    mw.error(
+        _ctx(OperationType.TOOL_CALL, operation_name="no_such_tool"),
+        ToolNotFoundError("未知工具: no_such_tool"),
+    )
+    mw.finally_(_ctx(OperationType.AGENT_RUN))
+    b.close()
+    events = list(iter_run_events(q, poll_timeout=0.05))
+    failed = [e for e in events if e.event_type == RunEventType.TOOL_FAILED]
+    assert failed, "应当发出 tool.failed 事件"
+    error = failed[0].error or ""
+    assert "no_such_tool" in error
+    assert "TOOL_NOT_FOUND" in error
+
+
+def test_tool_failed_工具执行失败_不放行原始异常_message(fresh_broker):
+    """`ToolExecutionError` 的 message 内嵌 handler 的原始异常 —— 不得透传。
+
+    原始异常可能带绝对路径、内部栈或凭据片段；客户端只应看到
+    工具名 + 稳定错误码 + 固定说明。
+    """
+    from mini_deerflow.tools import ToolExecutionError
+
+    secret = "/home/user/secret-project/token=abc123"
+    b = fresh_broker
+    q = b.subscribe("r1")
+    mw = RunEventMiddleware(b)
+    mw.before(_ctx(OperationType.AGENT_RUN, "r1", "t1"))
+    mw.before(_ctx(OperationType.TOOL_CALL, operation_name="read_file"))
+    mw.error(
+        _ctx(OperationType.TOOL_CALL, operation_name="read_file"),
+        ToolExecutionError(f"工具执行失败: read_file: {secret}"),
+    )
+    mw.finally_(_ctx(OperationType.AGENT_RUN))
+    b.close()
+    events = list(iter_run_events(q, poll_timeout=0.05))
+    failed = [e for e in events if e.event_type == RunEventType.TOOL_FAILED]
+    assert failed, "应当发出 tool.failed 事件"
+    error = failed[0].error or ""
+    assert secret not in error
+    assert "TOOL_EXECUTION_FAILED" in error
+    assert "read_file" in error
+
+
+def test_tool_failed_越权调用_给稳定错误码(fresh_broker):
+    """越权调用（工具不在允许清单内）有独立的稳定错误码。"""
+    from mini_deerflow.tools import ToolNotAllowedError
+
+    b = fresh_broker
+    q = b.subscribe("r1")
+    mw = RunEventMiddleware(b)
+    mw.before(_ctx(OperationType.AGENT_RUN, "r1", "t1"))
+    mw.before(_ctx(OperationType.TOOL_CALL, operation_name="write_file"))
+    mw.error(
+        _ctx(OperationType.TOOL_CALL, operation_name="write_file"),
+        ToolNotAllowedError("工具不在允许清单内: write_file"),
+    )
+    mw.finally_(_ctx(OperationType.AGENT_RUN))
+    b.close()
+    events = list(iter_run_events(q, poll_timeout=0.05))
+    failed = [e for e in events if e.event_type == RunEventType.TOOL_FAILED]
+    assert failed, "应当发出 tool.failed 事件"
+    error = failed[0].error or ""
+    assert "TOOL_NOT_ALLOWED" in error
+    assert "write_file" in error
+
+
+def test_tool_failed_授权未过_给稳定错误码(fresh_broker):
+    """授权判定失败有独立错误码，并带上内部 reason_code 便于定位。"""
+    from mini_deerflow.tool_authorization import ToolAuthorizationError
+    from mini_deerflow.tool_contracts import ToolAccessDecision
+
+    decision = ToolAccessDecision.deny("tool_disabled", "工具 x 已禁用")
+    b = fresh_broker
+    q = b.subscribe("r1")
+    mw = RunEventMiddleware(b)
+    mw.before(_ctx(OperationType.AGENT_RUN, "r1", "t1"))
+    mw.before(_ctx(OperationType.TOOL_CALL, operation_name="x"))
+    mw.error(
+        _ctx(OperationType.TOOL_CALL, operation_name="x"),
+        ToolAuthorizationError(decision),
+    )
+    mw.finally_(_ctx(OperationType.AGENT_RUN))
+    b.close()
+    events = list(iter_run_events(q, poll_timeout=0.05))
+    failed = [e for e in events if e.event_type == RunEventType.TOOL_FAILED]
+    assert failed, "应当发出 tool.failed 事件"
+    error = failed[0].error or ""
+    assert "TOOL_AUTHORIZATION_DENIED" in error
+    assert "tool_disabled" in error
+
+
+def test_tool_failed_未知异常_只给类名不放行_message(fresh_broker):
+    """未识别的工具异常：只给类名，绝不放行原始 message。"""
+    b = fresh_broker
+    q = b.subscribe("r1")
+    mw = RunEventMiddleware(b)
+    mw.before(_ctx(OperationType.AGENT_RUN, "r1", "t1"))
+    mw.before(_ctx(OperationType.TOOL_CALL, operation_name="mystery"))
+    mw.error(
+        _ctx(OperationType.TOOL_CALL, operation_name="mystery"),
+        RuntimeError("内部细节 /home/user/secret"),
+    )
+    mw.finally_(_ctx(OperationType.AGENT_RUN))
+    b.close()
+    events = list(iter_run_events(q, poll_timeout=0.05))
+    failed = [e for e in events if e.event_type == RunEventType.TOOL_FAILED]
+    assert failed, "应当发出 tool.failed 事件"
+    error = failed[0].error or ""
+    assert "/home/user/secret" not in error
+    assert "RuntimeError" in error
+    assert "mystery" in error
+
+
+def test_safe_failure_detail_工具错误_给错误码不放行原始_message():
+    """`safe_failure_detail` 对工具错误同样只给错误码 + 说明。"""
+    from mini_deerflow.api.schemas.streaming import safe_failure_detail
+    from mini_deerflow.tools import ToolExecutionError
+
+    detail = safe_failure_detail(
+        ToolExecutionError("工具执行失败: read_file: /home/user/secret")
+    )
+    assert "/home/user/secret" not in detail
+    assert "TOOL_EXECUTION_FAILED" in detail
+
+
+def test_safe_failure_detail_项目工具错误_保留受控原因():
+    """项目工具错误的 message 在产生端已受控（路径已剥离），应保留。"""
+    from mini_deerflow.api.schemas.streaming import safe_failure_detail
+    from mini_deerflow.project_tools import ProjectToolUsageError
+
+    detail = safe_failure_detail(ProjectToolUsageError("path无法解析（路径不可访问）"))
+    assert "PROJECT_TOOL_USAGE_ERROR" in detail
+    assert "路径不可访问" in detail
+
+
+def test_safe_failure_detail_项目工具错误_沿_cause_链取到():
+    """`ToolExecutionError` 包着项目工具错误时，应取到内层的受控原因。"""
+    from mini_deerflow.api.schemas.streaming import safe_failure_detail
+    from mini_deerflow.project_tools import ProjectToolStateError
+    from mini_deerflow.tools import ToolExecutionError
+
+    try:
+        try:
+            raise ProjectToolStateError("当前会话不是项目会话，没有绑定仓库")
+        except ProjectToolStateError as inner:
+            raise ToolExecutionError(f"工具执行失败: read_file: {inner}") from inner
+    except ToolExecutionError as exc:
+        detail = safe_failure_detail(exc)
+    assert "PROJECT_TOOL_STATE_ERROR" in detail
+    assert "没有绑定仓库" in detail
+
+
 def test_terminal_status_from_exception_timeout():
     assert terminal_status_from_exception(TimeoutError()) == RunEventType.RUN_TIMED_OUT
 
@@ -915,8 +1178,18 @@ def test_stream_manager_shutdown_is_idempotent(fresh_broker):
 # ============================================================================
 
 
-def _ctx(op: OperationType, run_id: str = "r1", thread_id: str = "t1") -> ExecutionContext:
-    return ExecutionContext(run_id=run_id, thread_id=thread_id, operation=op, operation_name=op.name.lower())
+def _ctx(
+    op: OperationType,
+    run_id: str = "r1",
+    thread_id: str = "t1",
+    operation_name: str | None = None,
+) -> ExecutionContext:
+    return ExecutionContext(
+        run_id=run_id,
+        thread_id=thread_id,
+        operation=op,
+        operation_name=operation_name or op.name.lower(),
+    )
 
 
 def test_middleware_publishes_run_started(fresh_broker):

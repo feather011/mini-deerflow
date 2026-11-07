@@ -31,12 +31,16 @@ import type { ApiError } from '../../shared/api/client'
 import { MessageList } from './MessageList'
 import { MessageComposer } from './MessageComposer'
 import { RunEventPanel } from './RunEventPanel'
+import { RunStatusLine } from './RunStatusLine'
 import { ErrorNotice } from '../../shared/ui/ErrorNotice'
 import { SSEContext } from '../../app/SSEContext'
 import { ingestRealTaskData, ingestProjectExecuteResult } from '../inspector/realTaskAdapter'
 import type { OptimisticMessage, UserSubmitStatus } from './types'
 import { generateClientId } from './types'
 import { useDraftStore } from './useDraftStore'
+// TOOL-05：确认卡（聊天内嵌紧邻对应工具活动）
+import { useConfirmations } from '../confirmations/useConfirmations'
+import { ConfirmationCardList } from '../confirmations/ConfirmationCardList'
 import styles from './AgentChatPanel.module.css'
 
 interface AgentChatPanelProps {
@@ -52,6 +56,11 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
 
   // 已处理的 run.result 事件序列号（防重复 ingest）
   const processedResultSeq = useRef<number>(0)
+
+  // 取消提示的「已关闭」标记，绑定到产生它的那一次运行。
+  // 键取 runId：新一轮 run 会拿到新的 runId，上一轮的关闭状态自然失效，
+  // 于是新一轮被取消时会重新显示它自己的通知。
+  const [dismissedCancelRunId, setDismissedCancelRunId] = useState<string | null>(null)
 
   // 消息提交状态
   const [submitStatus, setSubmitStatus] = useState<UserSubmitStatus>('idle')
@@ -70,6 +79,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
     currentText,
     start,
     stop,
+    cancelRun,
+    cancelState,
+    cancelError,
   } = useAgentStream({
     threadId: thread.thread_id,
     message: '',
@@ -109,13 +121,10 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
   }, [isTerminal]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // 26：从 API 响应恢复最近一次 run.result（页面刷新后仍显示 diff）
-  useEffect(() => {
-    const persisted = thread.last_run_result
-    if (persisted && typeof persisted === 'string' && persisted.trim().startsWith('{')) {
-      ingestProjectExecuteResult(thread.thread_id, persisted)
-    }
-  }, [thread.thread_id, thread.last_run_result])
-
+  //
+  // 注意：这个 effect 必须排在下面「建立本会话任务」的 effect **之后**。
+  // `ingestProjectExecuteResult` 在缓存里没有该 thread 的条目时会直接返回，
+  // 冷启动（刷新页面）时若先恢复、后建立，保存的结果就被丢弃了。
   useEffect(() => {
     ingestRealTaskData(thread.thread_id, {
       streamStatus,
@@ -139,6 +148,13 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [thread.thread_id, streamStatus, events, runId])
+
+  useEffect(() => {
+    const persisted = thread.last_run_result
+    if (persisted && typeof persisted === 'string' && persisted.trim().startsWith('{')) {
+      ingestProjectExecuteResult(thread.thread_id, persisted)
+    }
+  }, [thread.thread_id, thread.last_run_result])
 
   // 同步 SSE 状态到提交状态
   useEffect(() => {
@@ -192,6 +208,11 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
       createdAt: Date.now(),
     })
 
+    // 每轮 run 的 sequence 都从 0/1 重新计数，处理游标必须一起归零。
+    // 否则上一轮已经处理到 sequence=30，本轮的 run.result（sequence=1）
+    // 会因为「不大于游标」被整段跳过，文件和 diff 都不更新。
+    processedResultSeq.current = 0
+
     // 保存草稿快照（发送前），编辑区继续接受新草稿
     savePendingSent(message)
     start(message)
@@ -207,8 +228,36 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
 
   const isStopped = streamStatus === 'stopped'
 
+  // 真实取消（真停止）：只在有正在运行的 run 时提供
+  const isRunning = streamStatus === 'connecting' || streamStatus === 'streaming'
+  const canStop = isRunning && cancelState !== 'cancelling' && cancelState !== 'cancelled'
+  const isStopping = cancelState === 'cancelling'
+  const isCancelled = streamStatus === 'cancelled' || cancelState === 'cancelled'
+
+  // 取消提示是否要显示：只有「用户还没关掉这一轮的提示」时才显示。
+  // 关闭只改这一行的可见性，不改 streamStatus / cancelState，
+  // 因此后端的取消事实、任务历史都不受影响，也不会触发重试。
+  const cancelNoticeKey = runId ?? 'unknown-run'
+  const showCancelNotice = isCancelled && dismissedCancelRunId !== cancelNoticeKey
+
+  /** 点击"停止"：请求后端取消当前任务（不是仅断流） */
+  function handleStop() {
+    void cancelRun?.()
+  }
+
   // unknown 状态下：pendingSent 存在即可恢复（恢复只清 pendingSent，不影响新草稿 draft.current）
   const canRestore = submitStatus === 'unknown' && draft.pendingSent !== null
+
+  // TOOL-05：确认卡数据源（轮询；切换 thread 重新启动）
+  const {
+    byRunId,
+    online: confirmOnline,
+    activeRunId: confirmActiveRunId,
+    inFlight: confirmInFlight,
+    deny: confirmDeny,
+    approveAndExecute: confirmApproveAndExecute,
+    verify: confirmVerify,
+  } = useConfirmations(thread.thread_id)
 
   return (
     <SSEContext.Provider value={{ events, status: streamStatus }}>
@@ -219,6 +268,16 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
             messages={thread.messages}
             optimisticMessage={optimisticMsg}
             streamingText={currentText}
+          />
+          {/* TOOL-05：确认卡紧邻消息流底部渲染（按 run_id 分组） */}
+          <ConfirmationCardList
+            byRunId={byRunId}
+            activeRunId={confirmActiveRunId}
+            online={confirmOnline}
+            inFlight={confirmInFlight}
+            onDeny={confirmDeny}
+            onApproveAndExecute={confirmApproveAndExecute}
+            onVerify={confirmVerify}
           />
         </div>
 
@@ -269,6 +328,49 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
           />
         )}
 
+        {/* 已取消：后端确认取消（子进程已回收、锁已释放） */}
+        {showCancelNotice && (
+          <ErrorNotice
+            error={{ status: 0, code: 'RUN_CANCELLED', message: '' }}
+            context="generic"
+            tone="info"
+            title="已取消当前任务"
+            description="后端已取消该 Run 并回收执行进程，项目锁已释放。"
+            dismissLabel="知道了"
+            onDismiss={() => {
+              // 只隐藏本轮提示：不动 streamStatus / cancelState，
+              // 不重试、不取消其它任务；新一轮被取消会重新显示。
+              setDismissedCancelRunId(cancelNoticeKey)
+              setSubmitStatus('submitted')
+              setOptimisticMsg(null)
+              clearPendingSent()
+            }}
+            ariaLabel="已取消提示"
+          />
+        )}
+
+        {/* 取消失败：如实告知后端任务可能仍在运行（不得谎称已停止） */}
+        {cancelState === 'failed' && (
+          <ErrorNotice
+            error={{
+              status: 0,
+              code: 'CANCEL_FAILED',
+              message: cancelError ?? '取消失败',
+            }}
+            context="generic"
+            title="取消失败"
+            description={`${cancelError ?? '取消失败'}。后端任务可能仍在运行，请稍后重试或查看后端日志。`}
+            dismissLabel="关闭"
+            onDismiss={() => {
+              // 不改任何草稿/提交状态：任务状态未知，如实呈现
+            }}
+            ariaLabel="取消失败提示"
+          />
+        )}
+
+        {/* 轻量运行状态：依据真实 SSE 事件显示"当前在做什么"（明细在「查看任务 → 过程」） */}
+        {isRunning && <RunStatusLine events={events} status={streamStatus} />}
+
         {/* 消息输入 */}
         <MessageComposer
           value={draft.current}
@@ -278,6 +380,9 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
           isSubmitting={submittingRef.current}
           hasPendingRestore={canRestore}
           onRestore={handleRestore}
+          canStop={canStop}
+          isStopping={isStopping}
+          onStop={handleStop}
         />
 
         {/* 上下文用量 */}

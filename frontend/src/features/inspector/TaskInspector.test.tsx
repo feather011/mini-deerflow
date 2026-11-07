@@ -4,7 +4,7 @@
  * 覆盖：
  * - open=false 不渲染内容；× 按钮触发 onClose
  * - 头部：状态 pill 语义色、run 归属副标题、底部固定说明
- * - 六个任务状态 / 五个验证状态的文案与语义色映射
+ * - 七个任务状态 / 五个验证状态的文案与语义色映射
  * - 页签切换（变化/验证/过程，role=tablist + aria-selected）
  * - diff 渲染：add/remove/context 三色行 + 新旧行号
  * - 文件列表切换：点击文件显示对应 diff
@@ -19,10 +19,16 @@ import { describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import {
   MOCK_TASK_IDS,
+  GUARD_MISSING_META,
+  GUARD_VERDICT_META,
   TASK_STATUS_META,
   VALIDATION_STATUS_META,
   TaskInspector,
+  clearRealTaskData,
+  ingestProjectExecuteResult,
+  ingestRealTaskData,
   mockTaskAdapter,
+  realTaskAdapter,
 } from './index'
 
 function renderInspector(threadId: string | null) {
@@ -37,6 +43,49 @@ function renderInspector(threadId: string | null) {
   )
   return { ...view, onClose }
 }
+
+// ---- 无 Run：产品口径「暂无运行」，不得显示「运行中」----
+
+describe('TaskInspector 无 Run 状态', () => {
+  it('生产数据源下没有任何 Run 时，pill 显示「暂无运行」且页面无「运行中」', () => {
+    clearRealTaskData()
+    ingestRealTaskData('thread-no-run', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: '还没有派发过任务的会话',
+    })
+    try {
+      render(
+        <TaskInspector open onClose={vi.fn()} threadId="thread-no-run" />,
+      )
+      const pill = screen.getByTestId('task-status-pill')
+      expect(pill).toHaveTextContent('暂无运行')
+      expect(pill).toHaveAttribute('data-tone', 'neutral')
+      expect(screen.queryByText('运行中')).toBeNull()
+    } finally {
+      clearRealTaskData()
+    }
+  })
+
+  it('Run 正在跑时才显示「运行中」', () => {
+    clearRealTaskData()
+    ingestRealTaskData('thread-running', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-xyz',
+      title: '正在跑的会话',
+    })
+    try {
+      render(
+        <TaskInspector open onClose={vi.fn()} threadId="thread-running" />,
+      )
+      expect(screen.getByTestId('task-status-pill')).toHaveTextContent('运行中')
+    } finally {
+      clearRealTaskData()
+    }
+  })
+})
 
 // ---- open / 关闭 ----
 
@@ -95,8 +144,9 @@ describe('TaskInspector 头部与底部', () => {
     expect(footerText).toContain('不自动提交或推送')
   })
 
-  it('六个任务状态的文案与语义色映射齐全', () => {
+  it('七个任务状态的文案与语义色映射齐全', () => {
     expect(TASK_STATUS_META).toEqual({
+      no_run: { label: '暂无运行', tone: 'neutral' },
       running: { label: '运行中', tone: 'warning' },
       completed: { label: '已完成', tone: 'success' },
       failed: { label: '失败', tone: 'danger' },
@@ -106,14 +156,24 @@ describe('TaskInspector 头部与底部', () => {
     })
   })
 
-  it('五个验证状态的文案与语义色映射齐全', () => {
+  it('六个验证状态的文案与语义色映射齐全', () => {
     expect(VALIDATION_STATUS_META).toEqual({
       not_run: { label: '未运行', tone: 'neutral' },
       running: { label: '运行中', tone: 'warning' },
       interrupted: { label: '中断', tone: 'warning' },
       passed: { label: '通过', tone: 'success' },
       failed: { label: '失败', tone: 'danger' },
+      unverified: { label: '未验证', tone: 'warning' },
     })
+  })
+
+  it('guard 判定的三档文案与语义色映射齐全', () => {
+    expect(GUARD_VERDICT_META).toEqual({
+      verified: { label: '已关联检查通过', tone: 'success' },
+      unverified: { label: '未验证', tone: 'warning' },
+      failed: { label: '验证失败', tone: 'danger' },
+    })
+    expect(GUARD_MISSING_META).toEqual({ label: '未判定', tone: 'neutral' })
   })
 
   it('失败/运行中/停止任务的状态 pill 语义色正确', () => {
@@ -241,23 +301,27 @@ describe('TaskInspector 验证页签', () => {
   it('通过：展示命令证据与输出', () => {
     renderInspector(MOCK_TASK_IDS.verified)
     fireEvent.click(screen.getByRole('tab', { name: '验证' }))
-    expect(screen.getByTestId('validation-pill')).toHaveTextContent('通过')
+    // 结论来自后端 guard，不是前端按退出码推断的
+    expect(screen.getByTestId('validation-pill')).toHaveTextContent('已关联检查通过')
     expect(
       screen.getByText('python -m pytest tests/test_pagination.py -q'),
     ).toBeInTheDocument()
     expect(screen.getByText('4 passed in 0.18s')).toBeInTheDocument()
+    // 逐条命令的结构化退出码
+    expect(screen.getByTestId('verification-exit-code')).toHaveTextContent('0')
   })
 
-  it('执行完成但验证未运行：显示「未运行」，不显示测试通过', () => {
+  it('执行完成但验证未运行：按 guard 显示「未验证」，不显示测试通过', () => {
     renderInspector(MOCK_TASK_IDS.unverified)
     // 任务状态仍是已完成
     expect(screen.getByTestId('task-status-pill')).toHaveTextContent('已完成')
     fireEvent.click(screen.getByRole('tab', { name: '验证' }))
-    expect(screen.getByTestId('validation-pill')).toHaveTextContent('未运行')
-    expect(screen.getByTestId('validation-pill')).toHaveAttribute('data-tone', 'neutral')
-    // 没有命令证据：不出现独立的「通过」字样，也不出现命令/输出块
+    expect(screen.getByTestId('validation-pill')).toHaveTextContent('未验证')
+    expect(screen.getByTestId('validation-pill')).toHaveAttribute('data-tone', 'warning')
+    // 没有命令证据：不出现独立的「通过」字样，也不出现逐条命令表
     expect(screen.queryByText('通过', { exact: true })).toBeNull()
     expect(screen.queryByText(/passed/)).toBeNull()
+    expect(screen.queryByTestId('verification-exit-code')).toBeNull()
     // 明确提示
     expect(
       screen.getByText('执行完成不等于业务验收通过；没有命令证据不显示测试通过。'),
@@ -267,9 +331,10 @@ describe('TaskInspector 验证页签', () => {
   it('失败：展示失败状态与命令输出', () => {
     renderInspector(MOCK_TASK_IDS.failed)
     fireEvent.click(screen.getByRole('tab', { name: '验证' }))
-    expect(screen.getByTestId('validation-pill')).toHaveTextContent('失败')
+    expect(screen.getByTestId('validation-pill')).toHaveTextContent('验证失败')
     expect(screen.getByTestId('validation-pill')).toHaveAttribute('data-tone', 'danger')
     expect(screen.getByText('1 failed, 3 passed in 0.09s')).toBeInTheDocument()
+    expect(screen.getByTestId('verification-exit-code')).toHaveTextContent('1')
   })
 
   it('停止：验证显示「中断」', () => {
@@ -340,5 +405,154 @@ describe('TaskInspector thread 隔离', () => {
     expect(screen.getByRole('tab', { name: '验证' })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByTestId('validation-pill')).toHaveTextContent('通过')
     expect(screen.queryByText(/discount\.py/)).toBeNull()
+  })
+})
+
+/**
+ * F1 消费链回归：两段 hunk 的 diff 经适配器到**展示**都必须正确。
+ *
+ * 审查复现：真实子进程改 30 行文件的第 2、25 行 → 后端产出两个合法 hunk；
+ * 旧解析器把第二个块头 `@@ -22,7 +22,7 @@` 当成正文行，
+ * CHANGED_AT_25 的行号显示成 10（实际应为 25）。
+ */
+describe('TaskInspector 多段 hunk 展示', () => {
+  const TWO_HUNK_DIFF = [
+    '--- a/demo.txt',
+    '+++ b/demo.txt',
+    '@@ -1,5 +1,5 @@',
+    ' line1',
+    '-line2',
+    '+CHANGED_AT_2',
+    ' line3',
+    ' line4',
+    ' line5',
+    '@@ -22,7 +22,7 @@',
+    ' line22',
+    ' line23',
+    ' line24',
+    '-line25',
+    '+CHANGED_AT_25',
+    ' line26',
+    ' line27',
+    ' line28',
+  ].join('\n')
+
+  const renderTwoHunk = () => {
+    clearRealTaskData()
+    ingestRealTaskData('thread-two-hunk', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-two-hunk',
+      title: '两段 hunk',
+    })
+    ingestProjectExecuteResult(
+      'thread-two-hunk',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: {
+          files: [{ path: 'demo.txt', status: 'modified', unified_diff: TWO_HUNK_DIFF }],
+        },
+      }),
+    )
+    return render(
+      <TaskInspector
+        open
+        onClose={vi.fn()}
+        threadId="thread-two-hunk"
+        adapter={realTaskAdapter}
+      />,
+    )
+  }
+
+  it('展示里没有块头伪正文（没有以 @@ 开头的行）', () => {
+    renderTwoHunk()
+    const rows = Array.from(document.querySelectorAll('[data-line-type]'))
+    expect(rows.length).toBeGreaterThan(0)
+    const texts = rows.map((r) => (r.lastElementChild?.textContent ?? '').trim())
+    expect(texts.some((t) => t.startsWith('@@'))).toBe(false)
+  })
+
+  it('第二处修改的行号显示为 25（不是接着上一段累加的 10）', () => {
+    renderTwoHunk()
+    const rows = Array.from(document.querySelectorAll('[data-line-type]'))
+    const row25 = rows.find(
+      (r) => (r.lastElementChild?.textContent ?? '').trim() === '+CHANGED_AT_25',
+    )
+    expect(row25).toBeTruthy()
+    // 行结构：旧行号、新行号、正文
+    const spans = row25!.querySelectorAll('span')
+    expect(spans[0]?.textContent).toBe('')
+    expect(spans[1]?.textContent).toBe('25')
+  })
+
+  it('第一处修改的行号显示为 2', () => {
+    renderTwoHunk()
+    const rows = Array.from(document.querySelectorAll('[data-line-type]'))
+    const row2 = rows.find(
+      (r) => (r.lastElementChild?.textContent ?? '').trim() === '+CHANGED_AT_2',
+    )
+    const spans = row2!.querySelectorAll('span')
+    expect(spans[1]?.textContent).toBe('2')
+  })
+
+  it('文件计数覆盖两段改动（+2 −2）', () => {
+    renderTwoHunk()
+    expect(screen.getByText('+2 −2')).toBeInTheDocument()
+  })
+})
+
+// ---- 刷新后：有历史结果 ≠ 从未执行过 ----
+
+describe('TaskInspector 历史结果状态', () => {
+  it('没有进行中的 Run 但有历史执行结果时，pill 显示「历史结果」而不是「暂无运行」', () => {
+    clearRealTaskData()
+    ingestRealTaskData('thread-hist', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: '刷新后的会话',
+    })
+    ingestProjectExecuteResult(
+      'thread-hist',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        verification: [{ command: 'pytest -q', exit_code: 0, output: 'ok' }],
+        guard: {
+          verdict: 'verified',
+          label: '验证通过',
+          reason: 'ok',
+          acceptance_covered: true,
+        },
+        changes: { files: [{ path: 'a.py', status: 'added' }] },
+      }),
+    )
+    try {
+      render(<TaskInspector open onClose={vi.fn()} threadId="thread-hist" />)
+      const pill = screen.getByTestId('task-status-pill')
+      expect(pill).toHaveTextContent('历史结果')
+      expect(pill).not.toHaveTextContent('暂无运行')
+      // 副标题不得说"尚未建立 Run"
+      expect(screen.queryByText(/尚未建立 Run/)).toBeNull()
+    } finally {
+      clearRealTaskData()
+    }
+  })
+
+  it('既没有进行中的 Run 也没有历史结果时，仍显示「暂无运行」', () => {
+    clearRealTaskData()
+    ingestRealTaskData('thread-nohist', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: '从没跑过的会话',
+    })
+    try {
+      render(<TaskInspector open onClose={vi.fn()} threadId="thread-nohist" />)
+      expect(screen.getByTestId('task-status-pill')).toHaveTextContent('暂无运行')
+    } finally {
+      clearRealTaskData()
+    }
   })
 })

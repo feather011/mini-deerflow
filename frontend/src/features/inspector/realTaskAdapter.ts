@@ -15,11 +15,15 @@
 import type {
   ChangedFile,
   DiffLine,
+  GuardEvidence,
+  GuardVerdict,
   TaskAdapter,
   TaskEvent,
   TaskResult,
   TaskStatus,
   ValidationEvidence,
+  ValidationStatus,
+  VerificationEntry,
 } from './types'
 import type { RunEvent, RunEventType } from '../../shared/types/events'
 import type { StreamStatus } from '../threads/useAgentStream'
@@ -65,6 +69,18 @@ export interface ProjectExecuteResult {
   tool_events?: Array<{ name?: string; duration_s?: number }>
   tool_calls?: number
   error?: string
+  /**
+   * 后端按执行证据算出的**权威判定**。
+   *
+   * 旧记录里没有这个字段 → 前端显示「未判定」，
+   * 不用退出码自己推断一个结论出来。
+   */
+  guard?: {
+    verdict?: string
+    label?: string
+    reason?: string
+    acceptance_covered?: boolean | null
+  } | null
 }
 
 const cache: Map<string, TaskResult> = new Map()
@@ -97,9 +113,14 @@ export function ingestRealTaskData(
         command: null,
         output: null,
         note: '执行器输出尚未通过 run.result 事件推送。',
+        guard: null,
+        entries: [],
       },
       files: [],
       events,
+      // 必须记录：下一轮 ingest 用它判断"是否开始了新 run"，
+      // 缺省会变成 undefined，使任何 runId 都被误判成新 run 而清空已有结果。
+      run_id_marker: data.runId,
     })
     return
   }
@@ -118,11 +139,22 @@ export function ingestRealTaskData(
       command: null,
       output: null,
       note: '执行器输出尚未通过 run.result 事件推送。',
+      guard: null,
+      entries: [],
     }
     existing.files = []
+    // 新一轮开始：上一轮的结果不再是"当前结果"。
+    // （但这不等于"从未执行过"——历史仍由 last_run_result 保留，
+    //   面板在新结果到达前的短暂空窗里显示「暂无运行」是可接受的。）
+    existing.last_result_status = null
   }
   existing.status = status
-  existing.run_label = run_label
+  // 有历史执行结果时，不要把副标题退回「尚未建立 Run」——
+  // 那是"从未执行过"的说法，与下方已恢复的变更/验证证据矛盾。
+  const hasHistory = existing.last_result_status != null
+  existing.run_label = hasHistory
+    ? existing.run_label
+    : run_label
   existing.title = data.title
   existing.run_id_marker = data.runId
   existing.events = events
@@ -154,6 +186,16 @@ export function ingestProjectExecuteResult(
   // 更新 files
   task.files = buildChangedFilesFromResult(parsed)
 
+  // 记住这次执行记录的状态：刷新后没有进行中的 Run，但**历史结果存在**，
+  // 界面必须如实说"有历史结果"，不能退回「暂无运行」（等于谎称从未执行过）。
+  task.last_result_status = typeof parsed.status === 'string' ? parsed.status : null
+
+  // 没有进行中的 Run 时，副标题不写"尚未建立 Run"——那与下方已有的
+  // 变更/验证证据自相矛盾。改为标明这是历史运行的结果。
+  if (task.status === 'no_run' && task.run_label.includes('尚未建立 Run')) {
+    task.run_label = `thread: ${threadId} · 历史运行结果（${task.last_result_status ?? '已记录'}）`
+  }
+
   // 强制触发 React 重渲染：替换整个缓存条目
   cache.set(threadId, { ...task })
 }
@@ -165,6 +207,8 @@ export function clearRealTaskData(): void {
 
 /** 生产路径使用的 TaskAdapter：从模块级缓存读真实数据 */
 export const realTaskAdapter: TaskAdapter = {
+  // 生产路径的数据来自真实 SSE / 真实 harness 结果，不是演示数据
+  dataSource: 'real',
   getTask(threadId: string | null): TaskResult | null {
     if (!threadId) return null
     return cache.get(threadId) ?? null
@@ -185,71 +229,99 @@ function mapStreamStatus(status: StreamStatus | null): TaskStatus {
       return 'stopped'
     case 'timed_out':
       return 'timeout'
+    // 还没有任何 Run：不得显示"运行中"（产品口径：暂无运行）。
+    // idle 是流的初始状态，null 表示根本没有流信息 —— 两者都等同于无 Run。
     case 'idle':
+    case null:
+      return 'no_run'
     case 'connecting':
     case 'streaming':
+      return 'running'
     default:
       return 'running'
   }
 }
 
 function buildValidationFromResult(result: ProjectExecuteResult): ValidationEvidence {
-  if (!result.verification || result.verification.length === 0) {
-    // 有 changes 但没有 verification：执行了但未运行验证命令
-    if (result.changes && result.changes.files && result.changes.files.length > 0) {
-      return {
-        status: 'not_run',
-        command: null,
-        output: null,
-        note: '本轮执行器运行完成，但未运行验证命令。',
-      }
-    }
-    // 没有任何结果
+  const entries = buildVerificationEntries(result.verification)
+  const guard = parseGuard(result.guard)
+  const primary = entries[0]
+
+  if (!guard) {
+    // 没有 guard（旧的执行记录里没有这个字段）→ **未判定**。
+    //
+    // 这里刻意**不**按退出码自己推断结论：前端推断出来的结论曾经和
+    // 展示的证据对不上（面板说"失败（退出码 0）"，实际退出码是 2）。
+    // 没有判定字段就如实说没有判定。
     return {
       status: 'not_run',
-      command: null,
-      output: null,
-      note: '执行器输出当前未通过 SSE 推送。',
+      command: primary?.command ?? null,
+      output: primary?.output ?? null,
+      note:
+        entries.length > 0
+          ? '这条执行记录里没有判定字段（guard），结论未判定；下方只列原始命令与退出码。'
+          : '这条执行记录里没有判定字段（guard），也没有验证命令。',
+      guard: null,
+      entries,
     }
   }
 
-  const verifications = result.verification
-  const allPassed = verifications.every((v) => v.exit_code === 0)
-  const anyFailed = verifications.some((v) => v.exit_code != null && v.exit_code !== 0)
-
-  let status: ValidationEvidence['status']
-  if (result.status === 'completed') {
-    status = allPassed ? 'passed' : anyFailed ? 'failed' : 'not_run'
-  } else if (result.status === 'stopped') {
-    status = 'interrupted'
-  } else {
-    status = 'interrupted'
-  }
-
-  // 合并多个验证命令：取第一个命令作为主证据
-  const primary = verifications[0]
-  if (!primary) {
-    return {
-      status: 'not_run',
-      command: null,
-      output: null,
-      note: '验证命令无记录。',
-    }
-  }
+  // status 只是 guard 的镜像：前端不独立产生结论。
+  const status: ValidationStatus =
+    guard.verdict === 'verified'
+      ? 'passed'
+      : guard.verdict === 'failed'
+        ? 'failed'
+        : 'unverified'
 
   return {
     status,
-    command: primary.command ?? null,
-    output: primary.output ?? null,
-    note:
-      status === 'passed'
-        ? '验证命令已执行且全部退出码为 0。'
-        : status === 'failed'
-          ? `验证失败（退出码 ${primary.exit_code ?? '未知'}）。`
-          : status === 'interrupted'
-            ? '任务被停止，验证未完成。'
-            : '执行完成但未运行验证命令。',
+    command: primary?.command ?? null,
+    output: primary?.output ?? null,
+    note: guard.reason,
+    guard,
+    entries,
   }
+}
+
+/** 解析后端 guard 字段；结构不认识就当"没有判定"（不猜、不补） */
+function parseGuard(raw: ProjectExecuteResult['guard']): GuardEvidence | null {
+  if (!raw || typeof raw !== 'object') return null
+  const verdict = raw.verdict
+  if (typeof verdict !== 'string') return null
+  if (verdict !== 'verified' && verdict !== 'unverified' && verdict !== 'failed') {
+    return null
+  }
+  return {
+    verdict: verdict as GuardVerdict,
+    label: typeof raw.label === 'string' ? raw.label : '',
+    reason: typeof raw.reason === 'string' ? raw.reason : '',
+    acceptance_covered:
+      typeof raw.acceptance_covered === 'boolean' ? raw.acceptance_covered : null,
+  }
+}
+
+/**
+ * 把 verification 列表变成逐条结构化证据。
+ *
+ * 退出码缺失（后端没解析出来）就是 null —— **绝不默认成 0**：
+ * 默认成 0 等于把"没读到"说成"通过了"。
+ */
+function buildVerificationEntries(
+  list: ProjectExecuteResult['verification'],
+): VerificationEntry[] {
+  if (!Array.isArray(list)) return []
+  return list.map((item) => {
+    const raw = item?.exit_code
+    const exitCode =
+      typeof raw === 'number' && Number.isInteger(raw) ? raw : null
+    return {
+      command: typeof item?.command === 'string' ? item.command : '',
+      exit_code: exitCode,
+      passed: exitCode === null ? null : exitCode === 0,
+      output: typeof item?.output === 'string' ? item.output : null,
+    }
+  })
 }
 
 function buildChangedFilesFromResult(result: ProjectExecuteResult): ChangedFile[] {
@@ -257,77 +329,90 @@ function buildChangedFilesFromResult(result: ProjectExecuteResult): ChangedFile[
   if (!changes || changes.length === 0) return []
 
   return changes.map((f) => {
-    const added =
-      f.status === 'added'
-        ? (f.unified_diff?.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).length ?? 0)
+    const diff = parseUnifiedDiff(f.unified_diff ?? '')
+    // 计数以**实际渲染出来的 diff 行**为准，避免计数与展示不一致
+    // （例如新增文件此前没有 diff 正文，计数恒为 +0）。
+    const hasDiff = diff.length > 0
+    const added = hasDiff ? diff.filter((l) => l.type === 'add').length : 0
+    const removed = hasDiff
+      ? diff.filter((l) => l.type === 'remove').length
+      : f.status === 'deleted'
+        ? 1
         : 0
-    const removed =
-      f.status === 'modified'
-        ? (f.unified_diff?.split('\n').filter((l) => l.startsWith('-') && !l.startsWith('---')).length ?? 0)
-        : f.status === 'deleted'
-          ? 1
-          : 0
 
     return {
       path: f.path,
       change: f.status === 'added' ? 'A' : f.status === 'modified' ? 'M' : 'D',
       added,
       removed,
-      diff: parseUnifiedDiff(f.unified_diff ?? ''),
+      diff,
+      diff_truncated: f.diff_truncated === true,
     }
   })
 }
 
+/**
+ * 解析 unified diff 文本为可渲染的行。
+ *
+ * 头判定必须是**状态机**：`--- ` / `+++ ` 只有在进入 hunk 之前才是文件头；
+ * 进入 hunk 之后同样以 `--- ` / `+++ ` 开头的是**内容行**
+ * （例如被删除的一行内容是 `-- 注释`）。用 startsWith 判定会把这类内容行
+ * 误当文件头丢掉。
+ *
+ * **多段 hunk**：一次修改可能产生多个 `@@` 块（改动点相隔超过上下文行数时，
+ * difflib 会拆成多段）。每个块头都要**重新设定行号并跳过** —— 否则第二个块头
+ * 会被当成一行正文，后面的行号也会接着上一段累加，全是错的。
+ */
 function parseUnifiedDiff(diff: string): DiffLine[] {
   if (!diff) return []
   const lines = diff.split('\n')
   const result: DiffLine[] = []
   let oldLine = 0
   let newLine = 0
+  // 是否已进入 hunk（进入后不再把 --- / +++ 当文件头）
+  let inHunk = false
+
+  // 块头格式：@@ -旧行[,旧行数] +新行[,新行数] @@
+  const applyHunkHeader = (raw: string): void => {
+    const m = raw.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+    if (m?.[1] && m?.[2]) {
+      oldLine = parseInt(m[1]!, 10)
+      newLine = parseInt(m[2]!, 10)
+    }
+    // 格式不标准时保留当前行号（尽力而为），但仍要跳过块头本身
+  }
 
   for (const raw of lines) {
-    if (raw.startsWith('---') || raw.startsWith('+++') || raw.startsWith('@@')) {
-      // 解析 @@ 行中的行号
-      const m = raw.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
-      if (m?.[1] && m?.[2]) {
-        oldLine = parseInt(m[1]!, 10)
-        newLine = parseInt(m[2]!, 10)
+    if (!inHunk) {
+      if (raw.startsWith('@@')) {
+        applyHunkHeader(raw)
+        inHunk = true
       }
+      // 文件头（--- / +++）与 hunk 前的其它行：不渲染
+      continue
+    }
+
+    // 已在 hunk 中：又遇到块头 → 新的一段 hunk，重设行号并跳过块头
+    if (raw.startsWith('@@')) {
+      applyHunkHeader(raw)
+      continue
+    }
+
+    if (raw.startsWith('\\')) {
+      // 元信息行（如 "\ ... diff 已截断"）：跳过
       continue
     }
     if (raw.startsWith('+')) {
       result.push({ type: 'add', old_line: null, new_line: newLine++, text: raw.slice(1) })
     } else if (raw.startsWith('-')) {
       result.push({ type: 'remove', old_line: oldLine++, new_line: null, text: raw.slice(1) })
-    } else if (raw.length > 0) {
-      result.push({ type: 'context', old_line: oldLine++, new_line: newLine++, text: raw })
+    } else {
+      // 上下文行：unified diff 里以空格开头；渲染时会再补一个空格，这里去掉
+      const text = raw.startsWith(' ') ? raw.slice(1) : raw
+      result.push({ type: 'context', old_line: oldLine++, new_line: newLine++, text })
     }
   }
   return result
-}
-
-function buildTaskResult(threadId: string, data: RealTaskDataInput): TaskResult {
-  // 已废弃：原实现每次都重建 task 并把 files/validation 重置为空，
-  // 导致「重新进入 thread」或「SSE 重连」时把上一次 run.result 的成果清空。
-  // 保留以避免外部测试引用；新逻辑在 ingestRealTaskData 内联处理。
-  const status = mapStreamStatus(data.streamStatus)
-  return {
-    thread_id: threadId,
-    run_label: data.runId
-      ? `run-${data.runId.slice(0, 4)} · 归属当前会话`
-      : `thread: ${threadId} · 尚未建立 Run`,
-    title: data.title,
-    status,
-    validation: {
-      status: 'not_run',
-      command: null,
-      output: null,
-      note: '执行器输出尚未通过 run.result 事件推送。',
-    },
-    files: [], // 默认空；run.result 事件触发更新
-    events: data.events.map(convertToTimelineEvent),
-    run_id_marker: data.runId,
-  }
 }
 
 // ---- 工具：把 SSE RunEvent 转为 TaskEvent 时间线条目 ----

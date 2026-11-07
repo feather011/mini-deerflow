@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Callable, Iterator, TypeVar
 
 from mini_deerflow.context_assembler import AssembledContext, ContextAssembler
@@ -17,8 +19,16 @@ from mini_deerflow.middleware import (
     MiddlewarePipeline,
     OperationType,
 )
-from mini_deerflow.models import FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.models import (
+    Decision,
+    FinalAnswer,
+    Message,
+    Model,
+    ToolCall,
+    ToolCalls,
+)
 from mini_deerflow.skill_runtime import SkillContextProvider
+from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import ThreadStore
 from mini_deerflow.tools import (
     ToolRegistry,
@@ -33,6 +43,12 @@ from mini_deerflow.tool_authorization import (
     ToolAuthorizationError,
 )
 from mini_deerflow.tool_contracts import ToolCapability, ExecutorPrincipal
+from mini_deerflow.verification_guard import (
+    collect_guard_verdicts,
+    parse_declared_verdict,
+    rewrite_conclusion,
+    summarize_verdicts,
+)
 
 T = TypeVar("T")
 
@@ -71,6 +87,36 @@ PROJECT_SESSION_PROMPT = """项目会话
 
 主 Agent 负责讨论、澄清、派发和汇总；具体写文件/改代码/运行命令交给 harness。
 模型不需要自己模拟执行结果——成功与否以 tool 返回值为准。
+
+## 任务交接契约
+
+**派发前**：目标或边界不清楚时，先向用户澄清并拿到确认，不要自己猜。
+
+**派发时**：project_execute 的四个参数各有分工，不要只填 task：
+- task：这次要达成的目标，写成一句能判断完成与否的话。
+- context：用户已确认的背景与约束（涉及哪些文件、用户明确说过什么）。
+  没有可确认的内容就写"无"，不要编造。
+- scope：范围边界（改哪些文件或目录、明确不做什么）。
+- acceptance：验收条件（跑什么命令、期望什么结果、怎么算通过）。
+
+**汇总时**：最终回答必须写清本轮改了哪些文件（含新增文件）和验证证据
+（跑了什么命令、退出码、关键输出）。证据只认 project_execute 返回的 changes 与
+verification；没跑过或没通过就如实说没验证，不写成已通过。
+
+## 验证结论契约
+
+harness 执行结束（status=completed）**不等于**用户的验收条件已经满足。
+project_execute 的返回值里有 `guard` 字段，是系统按执行证据算出的权威判定：
+
+- `verified`（验证通过）：跑过的验证命令退出码都是 0，且与验收条件对得上。
+- `unverified`（有改动但未验证）：没有跑验证命令、退出码无法解析，
+  或验收条件与实际执行的命令无法建立关联。
+- `failed`（验证失败）：有验证命令退出码非 0。
+
+**汇总时**：最终回答的最后一行必须写结论标签，三选一 ——
+`验证结论：验证通过` / `验证结论：有改动但未验证` / `验证结论：验证失败`，
+且必须与 `guard.verdict` 一致。叙述里不要写"已完成""全部通过"这类
+没有证据支撑的断言。判定以 `guard` 为准：你的判断与它冲突时，以 `guard` 为准。
 """
 
 
@@ -138,6 +184,8 @@ class Agent:
         self._memory_processor = memory_processor
         self._skill_context_provider = skill_context_provider
         self._middleware_pipeline = middleware_pipeline
+        # BUDGET-01：这里存的是**额度上限模板**，不是活的计数器。
+        # 每次运行由 new_run_budget() 派生一个独立计数器（见 run()）。
         self._budget = budget
         self._context_assembler = context_assembler
         self._last_assembled: "AssembledContext | None" = None
@@ -151,6 +199,18 @@ class Agent:
     def last_assembled(self) -> "AssembledContext | None":
         """最近一次 assemble() 的结果，供 IntegratedAgent 读取快照用。"""
         return self._last_assembled
+
+    def new_run_budget(self) -> Budget | None:
+        """按额度上限派生一个**本次运行专属**的预算计数器。
+
+        BUDGET-01：预算是运行级的 —— 不同运行互不消耗。调用方
+        （`IntegratedAgent.run`，即 run 边界）派生一次，并把同一个实例
+        传进 `Agent.run(budget=...)`，于是本轮的主 Agent 与其子代理
+        共享**同一个**计数器。
+
+        没有配置额度时返回 None（= 不限制），与既有语义一致。
+        """
+        return self._budget.derive() if self._budget is not None else None
 
     def _run_via_pipeline(
         self,
@@ -168,14 +228,30 @@ class Agent:
     def run(
         self, thread_id: str, user_input: str, run_id: str = "",
         cancellation_token: CancellationToken | None = None,
+        budget: Budget | None = None,
+        *,
+        parent_span_id: str | None = None,
     ) -> tuple[str, list[dict]]:
         """对指定 thread_id 执行一轮 Agent 循环；成功后原子写入，失败时 Thread 不变。
 
         Args:
-            run_id: 上层 Run 的标识，仅用于 Trace 关联上下文组装与压缩事件。
-                缺省为空串，保持既有调用方兼容。
+            thread_id: 目标 Thread ID。
+            user_input: 用户输入文本。
+            run_id: 上层 Run 的标识；**同时**用于 Trace 关联（模型 / 工具 span
+                都挂在它下面）。缺省为空串，保持既有调用方兼容。
             cancellation_token: 可选取消令牌；主任务停止时置位，Agent 在每步开始检查。
+            budget: 本次运行的预算。**None = 按 Agent 的额度上限派生一个本次运行
+                专属的计数器**（BUDGET-01）；显式传入则直接使用。
+            parent_span_id: TRACE-01。上层（IntegratedAgent 的 AGENT_RUN span）
+                传下来的父 span id；本轮产生的所有 span 挂在它下面。
+                None = 无父节点。
+
+        BUDGET-01：预算是**运行级**的，不是进程级的。
+        `self._budget` 只作为「额度上限模板」，每次 run() 派生一个独立计数器
+        —— 不同运行互不消耗；本轮的父子 Agent 共享**同一个**派生实例。
         """
+        # 本次运行的预算（run 局部变量 → run 结束即释放，天然不跨运行残留）
+        run_budget = budget if budget is not None else self.new_run_budget()
         thread = self._store.get(thread_id)  # ThreadNotFoundError 原样传播
 
         # 25：计算本轮允许的工具集（暴露限制 + 执行限制的基础）
@@ -240,13 +316,20 @@ class Agent:
                 session_caps = frozenset({
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
+                    ToolCapability.SESSION_STATE_WRITE,
+                    # TOOL-06：网络只读工具需要 NETWORK_READ
+                    ToolCapability.NETWORK_READ,
                 })
                 session_project_id: str | None = None
             else:
                 session_caps = frozenset({
                     ToolCapability.PROJECT_READ,
+                    ToolCapability.PROJECT_EXEC_DELEGATE,
                     ToolCapability.COMPUTE,
                     ToolCapability.SESSION_HISTORY_READ,
+                    ToolCapability.SESSION_STATE_WRITE,
+                    # TOOL-06：项目会话同样可调用网络只读工具
+                    ToolCapability.NETWORK_READ,
                 })
                 session_project_id = thread.project_id
             visible_names: set[str] = set()
@@ -266,14 +349,28 @@ class Agent:
 
         trace: list[dict] = []
 
+        # 验证判定（Guard）：本轮所有执行证据的判定，最后取最保守的一个。
+        # 空列表 = 本轮没有产生任何执行证据 → 不对结论做约束。
+        guard_verdicts: list[dict] = []
+
+        # TRACE-01：因果链的链尾（span id）。
+        # 规则：模型调用的父节点 = 链尾；模型调用后链尾 = 模型 span；
+        # 工具调用的父节点 = 发起它的那次模型 span；工具完成后链尾 = 工具 span。
+        # 于是「模型 → 工具 → 模型」串成一条链，而不是一堆并列的兄弟节点。
+        chain_tail: str | None = parent_span_id
+
         for step in range(1, self._max_steps + 1):
             # 步骤预算：每步开始前扣减，超限抛 BudgetExceededError
-            if self._budget is not None:
-                self._budget.consume_step()
+            if run_budget is not None:
+                run_budget.consume_step()
 
             # 停止检查：主任务停止时在步骤开始前退出
             if cancellation_token is not None and cancellation_token.is_cancelled():
-                raise BudgetExceededError("steps", self._budget.max_steps)
+                # 预算可能未启用（API 默认 disable_budget=True），
+                # 此时不能解引用 run_budget，否则取消会变成 AttributeError。
+                raise BudgetExceededError(
+                    "steps", run_budget.max_steps if run_budget is not None else None
+                )
             # 组合发送给模型的完整消息列表：Memory → Skill → history → user
             # 每次循环重新组合以包含新增的 tool messages
             if self._context_assembler is not None:
@@ -301,23 +398,37 @@ class Agent:
             # 25C: 使用 stream_decide() 实现 token 流式推送
             token_accumulator: list[str] = []
             model_ctx = ExecutionContext(
-                run_id="",  # 由 IntegratedAgent 在外层生成
+                # TRACE-01：run_id 贯通 —— 过去这里硬编码空串，
+                # Trace 直接记录它，于是同一次运行里模型调用事件的 run_id
+                # 与工具调用事件的不一致，按 run_id 查不到模型调用。
+                run_id=run_id or "",
                 thread_id=thread_id,
                 operation=OperationType.MODEL_CALL,
                 operation_name="model_decide",
-                budget=self._budget,
+                budget=run_budget,
                 token_accumulator=token_accumulator,
+                # TRACE-01：取消令牌进模型上下文 —— 少了它，
+                # 「模型调用期间被取消」在 Trace 里无法与普通失败区分。
+                cancellation_token=cancellation_token,
+                # TRACE-01：父节点 = 因果链的链尾
+                parent_span_id=chain_tail,
             )
             def _do_model_call(
                 _msgs=model_messages,
                 _tools=model_tools,
                 _acc=token_accumulator,
-            ) -> ToolCall | FinalAnswer:
+            ) -> Decision:
                 # 25C: 如果模型实现了 stream_decide()，用流式路径；
                 # 否则用普通 decide()（FakeModel 等不支持流式的模型）
                 if hasattr(self._model, "stream_decide"):
                     return _do_model_call_stream(_msgs, _tools, _acc)
                 else:
+                    # BUDGET-01：非流式路径**也**必须在真正发起调用前消费额度。
+                    # 过去这条路径直接 decide()，model_calls 永不增长 ——
+                    # 不支持流式的模型（FakeModel 等）完全绕过了 max_model_calls。
+                    # 与流式路径同一语义：**一次模型决策 = 一次额度消耗**。
+                    if run_budget is not None:
+                        run_budget.consume_model_call()
                     result = self._model.decide(_msgs, _tools)
                     _acc.append(result.content if isinstance(result, FinalAnswer) else "")
                     return result
@@ -326,15 +437,19 @@ class Agent:
                 _msgs: list[Message],
                 _tools: list[ToolSpec] | None,
                 _acc: list[str],
-            ) -> ToolCall | FinalAnswer:
+            ) -> Decision:
                 # 真正发起调用前原子消费额度（成功/失败/Retry 每次都计）
-                if self._budget is not None:
-                    self._budget.consume_model_call()
+                if run_budget is not None:
+                    run_budget.consume_model_call()
 
                 if self._model_timeout_seconds > 0 and cancellation_token is not None:
                     timer = threading.Timer(
                         self._model_timeout_seconds,
-                        cancellation_token.cancel,
+                        # TRACE-01：标记「本次取消源于模型超时」。
+                        # 用户主动停止置位的是**同一个**令牌，光看
+                        # is_cancelled() 分不出二者（Trace 终态分类依赖原因）。
+                        # 首次取消原因胜出：用户先停止时不会被后来的超时覆盖。
+                        lambda: cancellation_token.cancel(reason="model_timeout"),
                     )
                     timer.start()
                     try:
@@ -348,8 +463,8 @@ class Agent:
                 _msgs: list[Message],
                 _tools: list[ToolSpec] | None,
                 _acc: list[str],
-            ) -> ToolCall | FinalAnswer:
-                result: ToolCall | FinalAnswer | None = None
+            ) -> Decision:
+                result: Decision | None = None
                 for event in self._model.stream_decide(_msgs, _tools):  # type: ignore[union-attr]
                     etype, evalue = event
                     if etype == "token":
@@ -363,126 +478,315 @@ class Agent:
                     return FinalAnswer(content="".join(_acc))
                 return result
 
-            # 模型调用返回后检查是否因超时/停止而被取消
+            # 模型调用返回后检查是否因超时/停止而被取消。
+            #
+            # BUDGET-01：这个检查**必须在模型调用之后**。原先它写在调用
+            # 之前 —— 于是「模型调用过程中发生的取消」（模型超时定时器在
+            # 调用期间置位、用户在模型返回前点了停止）会被完全漏掉：
+            # 决策照样被采纳，工具照样执行，停止退化成"跑完了"。
+            # 调用**之前**是否已取消，由步骤开始处的检查（见上方）负责。
+            decision = self._run_via_pipeline(model_ctx, _do_model_call)
+
+            # TRACE-01：模型 span 成为新的链尾 —— 本次决策触发的工具挂在它下面。
+            # 取 ctx.span_id 而不是构造时的值：重试会换新 span（D6）。
+            chain_tail = model_ctx.span_id
+
             if cancellation_token is not None and cancellation_token.is_cancelled():
                 raise BudgetExceededError(
                     "model_call_timeout",
                     None,
                 )
-            decision = self._run_via_pipeline(model_ctx, _do_model_call)
 
             if isinstance(decision, FinalAnswer):
-                assistant_message = Message(role="assistant", content=decision.content)
+                # 验证结论一致性闸门：**结论以代码判定为准**。
+                #
+                # harness 跑完 ≠ 验收条件已满足。若模型自述的结论与
+                # 执行证据算出的判定不一致（或压根没给结论），这里纠正它，
+                # 并在 trace 里留下纠正记录 —— 结论与证据对不上时，
+                # 不允许把模型的话原样交给用户。
+                content = decision.content
+                authoritative = summarize_verdicts(guard_verdicts)
+                if authoritative is not None:
+                    content, corrected = rewrite_conclusion(content, authoritative)
+                    if corrected:
+                        trace.append({
+                            "step": step,
+                            "action": "conclusion_corrected",
+                            "detail": {
+                                "declared": parse_declared_verdict(decision.content),
+                                "verdict": authoritative.get("verdict"),
+                                "label": authoritative.get("label"),
+                                "reason": authoritative.get("reason"),
+                            },
+                        })
+
+                assistant_message = Message(role="assistant", content=content)
                 pending.append(assistant_message)
                 trace.append({
                     "step": step,
                     "action": "final_answer",
-                    "detail": decision.content,
+                    "detail": content,
                 })
                 # 原子提交：先全部 extend，再 save
                 thread.extend(pending)
+                # 提交前合并「本轮执行证据」—— 不能用运行开始时的旧快照整份覆盖。
+                #
+                # 旧快照的 last_run_result 是运行开始时的值（通常为 None），
+                # 而 project_execute 的执行证据（diff / verification / guard）
+                # 是**运行途中**由 run_event 中间件写进 store 的。
+                # 直接 save 旧快照会把刚写进去的证据抹掉 → 页面刷新后
+                # 「答案正文还在、结构化证据没了」。
+                #
+                # 这里不是调整保存顺序，而是**显式合并**：以 store 里的最新值为准。
+                # 反过来也修了另一种情况：上一轮遗留的旧证据会被这一轮的空快照
+                # 覆盖掉，害得这一轮的证据丢失。
+                self._merge_latest_run_result(thread_id, thread)
                 self._store.save(thread)
 
                 # 成功后处理记忆（只处理本轮 user Message）
                 if self._memory_processor is not None:
                     self._process_memory(thread_id, user_message, trace)
 
-                return decision.content, trace
+                return content, trace
 
-            if isinstance(decision, ToolCall):
-                tool_description = (
-                    f"调用工具 {decision.name}，参数: {decision.arguments}"
+            if isinstance(decision, (ToolCall, ToolCalls)):
+                # 模型可能在**一次响应**里发起多个工具调用（ToolCalls）。
+                # 全部执行、全部回灌 —— 绝不静默丢弃其中任何一个。
+                # 执行是**串行**的：同一轮里前一个工具可能修改仓库，
+                # 后一个必须看到修改后的结果。
+                calls: tuple[ToolCall, ...] = (
+                    decision.calls if isinstance(decision, ToolCalls) else (decision,)
                 )
-                trace.append({
-                    "step": step,
-                    "action": "model_decision",
-                    "detail": tool_description,
-                })
+                tool_descriptions = [
+                    f"调用工具 {call.name}，参数: {call.arguments}"
+                    for call in calls
+                ]
+                for tool_description in tool_descriptions:
+                    trace.append({
+                        "step": step,
+                        "action": "model_decision",
+                        "detail": tool_description,
+                    })
 
-                # 21B：先把模型发出的 tool_use 还原成一条 assistant 消息，
+                # 21B：先把模型发出的 tool_use 还原成 assistant 消息，
                 # 与下面的 tool 结果**按 call_id 配对**。缺了这条，本轮
                 # decide() 无法重建 tool_use/tool_result，供应商会拒收该请求。
+                #
+                # 一次响应多个调用时，这 N 条 assistant 消息必须**连续**：重建请求时
+                # 它们会合成同一个 assistant turn（协议要求一个 turn 里的每个
+                # tool_use，都要在紧随的 user turn 里有对应的 tool_result）。
                 #
                 # **只进 working_messages**（本轮喂给模型）：pending（落库）
                 # 只保留 user 与最终 assistant，工具往返不进 ThreadState，
                 # 详见下方 tool 结果处的注释。
-                working_messages.append(Message(
-                    role="assistant",
-                    content=tool_description,
-                    tool_call_id=decision.id,
-                    tool_name=decision.name,
-                    tool_arguments=dict(decision.arguments),
-                ))
+                for call, tool_description in zip(calls, tool_descriptions):
+                    working_messages.append(Message(
+                        role="assistant",
+                        content=tool_description,
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        tool_arguments=dict(call.arguments),
+                    ))
 
                 # Tool call：通过 middleware_pipeline 包装（含 budget 检查/记录）
-                tool_ctx = ExecutionContext(
-                    run_id="",
-                    thread_id=thread_id,
-                    operation=OperationType.TOOL_CALL,
-                    operation_name=decision.name,
-                    budget=self._budget,
-                    cancellation_token=cancellation_token,
-                )
-                def _do_tool_call(
-                    _name=decision.name,
-                    _args=decision.arguments,
-                    _ctx=tool_ctx,
+                # R1 round 4：tool_ctx.run_id 取 Agent.run 入口的 run_id，
+                # 保证确认请求绑定的 run_id 与 IntegratedAgent/AgentRunService 一致。
+                def _perform_tool_call(
+                    _name: str,
+                    _args: dict[str, object],
                 ) -> str:
-                    # 25：三层纵深防御
-                    # 第一层：确保工具已注册（未知名 → ToolNotFoundError）
-                    self._registry.get(_name)  # KeyError → ToolNotFoundError
-                    # 第二层：确保工具在允许清单内（已注册但越权 → ToolNotAllowedError）
-                    ensure_tool_allowed(_name, allowed)
-                    # TOOL-02 第三层：细粒度授权策略（能力/主体/确认）
-                    # 仅当注册了 policy_registry 时启用；None 时回退到前两层
-                    if self._tool_policy_registry is not None:
-                        # 根据会话类型授予默认基础能力
-                        if thread.project_id is None:
-                            # 普通会话：允许 calculator(history_search 等
-                            default_caps = frozenset({
-                                ToolCapability.COMPUTE,
-                                ToolCapability.SESSION_HISTORY_READ,
-                            })
-                        else:
-                            # 项目会话：允许 project_read_file/calculator/history_search
-                            default_caps = frozenset({
-                                ToolCapability.PROJECT_READ,
-                                ToolCapability.COMPUTE,
-                                ToolCapability.SESSION_HISTORY_READ,
-                            })
-                        authority = self._tool_policy_registry.get_authority(
-                            thread_id=thread_id,
-                            run_id=getattr(_ctx, "run_id", "") or "",
-                            project_id=thread.project_id,
-                            granted_capabilities=default_caps,
-                            principal=self._run_principal,
-                        )
-                        decision = check_tool_access(self._tool_policy_registry, _name, authority)
-                        if decision.is_denied or decision.is_confirm:
-                            raise ToolAuthorizationError(decision)
-                    # 真正发起调用前原子消费额度（成功/失败都计）
-                    if self._budget is not None:
-                        self._budget.consume_tool_call()
-                    return self._registry.execute(_name, _args, context=_ctx)
-                result = self._run_via_pipeline(tool_ctx, _do_tool_call)
-                trace.append({
-                    "step": step,
-                    "action": "tool_call",
-                    "detail": {"name": decision.name, "args": decision.arguments, "result": result},
-                })
+                    # TRACE-01：工具 span 的父节点 = 发起它的那次模型决策 span。
+                    # 同一轮里的多个工具是**并列兄弟**（都挂在同一个模型 span 下）。
+                    nonlocal chain_tail
+                    tool_ctx = ExecutionContext(
+                        run_id=run_id or "",
+                        thread_id=thread_id,
+                        operation=OperationType.TOOL_CALL,
+                        operation_name=_name,
+                        budget=run_budget,
+                        cancellation_token=cancellation_token,
+                        parent_span_id=model_ctx.span_id,
+                    )
+                    def _do_tool_call() -> str:
+                        # 25：三层纵深防御
+                        # 第一层：确保工具已注册（未知名 → ToolNotFoundError）
+                        self._registry.get(_name)  # KeyError → ToolNotFoundError
+                        # 第二层：确保工具在允许清单内（已注册但越权 → ToolNotAllowedError）
+                        ensure_tool_allowed(_name, allowed)
+                        # TOOL-02 第三层：细粒度授权策略（能力/主体/确认）
+                        # 仅当注册了 policy_registry 时启用；None 时回退到前两层
+                        if self._tool_policy_registry is not None:
+                            # 根据会话类型授予默认基础能力
+                            if thread.project_id is None:
+                                # 普通会话：calculator / history / task_note
+                                default_caps = frozenset({
+                                    ToolCapability.COMPUTE,
+                                    ToolCapability.SESSION_HISTORY_READ,
+                                    ToolCapability.SESSION_STATE_WRITE,
+                                    # TOOL-06：网络只读
+                                    ToolCapability.NETWORK_READ,
+                                })
+                            else:
+                                # 项目会话：项目读写 + 普通会话基础能力
+                                default_caps = frozenset({
+                                    ToolCapability.PROJECT_READ,
+                                    ToolCapability.PROJECT_EXEC_DELEGATE,
+                                    ToolCapability.COMPUTE,
+                                    ToolCapability.SESSION_HISTORY_READ,
+                                    ToolCapability.SESSION_STATE_WRITE,
+                                    # TOOL-06：网络只读
+                                    ToolCapability.NETWORK_READ,
+                                })
+                            authority = self._tool_policy_registry.get_authority(
+                                thread_id=thread_id,
+                                run_id=getattr(tool_ctx, "run_id", "") or "",
+                                project_id=thread.project_id,
+                                granted_capabilities=default_caps,
+                                principal=self._run_principal,
+                            )
+                            auth_decision = check_tool_access(self._tool_policy_registry, _name, authority)
+                            if auth_decision.is_denied:
+                                raise ToolAuthorizationError(auth_decision)
+                            if auth_decision.is_confirm:
+                                # R1 round 4：使用真实 run_id 创建 pending，挂起等待 API 决议
+                                # - run_id 取自当前 ExecutionContext（与运行入口一致）
+                                # - 等待 outcome 决定返回真实工具结果或合成错误
+                                cm = getattr(self, "_confirmation_manager", None)
+                                runtime_obj = getattr(self, "_runtime", None)
+                                if cm is not None:
+                                    from mini_deerflow.tool_contracts import (
+                                        ExecutorPrincipal as _EP,
+                                    )
+                                    principal = _EP[
+                                        authority.principal.name
+                                    ] if hasattr(authority.principal, "name") else authority.principal
+                                    # R1 round 4：run_id 贯通——优先取 ExecutionContext
+                                    # 的 run_id（与 IntegratedAgent.run 传入的一致），
+                                    # 回退到 authority.run_id（per-tool-call 构造），
+                                    # 最后才用 "main"（向后兼容）。
+                                    real_run_id = (
+                                        getattr(tool_ctx, "run_id", None)
+                                        or authority.run_id
+                                        or "main"
+                                    )
+                                    pending = cm.create(
+                                        run_id=real_run_id,
+                                        thread_id=thread_id,
+                                        project_id=thread.project_id,
+                                        principal=principal,
+                                        tool_name=_name,
+                                        arguments=_args,
+                                    )
+                                    # 把 request_id 写入决策 metadata
+                                    try:
+                                        auth_decision.metadata["request_id"] = pending.request_id
+                                    except Exception:
+                                        pass
+                                    # R1 round 4：runtime 提供 wait 接口时，
+                                    # 在 Agent 线程中挂起等待 API 决议，
+                                    # 而非直接 raise 结束本 run。
+                                    if runtime_obj is not None and hasattr(
+                                        runtime_obj, "wait_for_confirmation"
+                                    ):
+                                        remaining = max(
+                                            0.0,
+                                            pending.expires_at - time.time(),
+                                        )
+                                        slot = runtime_obj.wait_for_confirmation(
+                                            request_id=pending.request_id,
+                                            run_id=real_run_id,
+                                            thread_id=thread_id,
+                                            tool_name=_name,
+                                            ttl_seconds=remaining,
+                                            cancellation_token=getattr(
+                                                tool_ctx, "cancellation_token", None
+                                            ),
+                                        )
+                                        outcome = slot.get("outcome", "expired")
+                                        if outcome == "executed":
+                                            # 工具实际执行结果回灌到 working_messages，
+                                            # 让模型继续推进。
+                                            return slot.get("result") or ""
+                                        # 拒绝/过期/取消/失败：合成错误结果反馈给模型
+                                        err = slot.get("error", "confirmation " + outcome)
+                                        return json.dumps(
+                                            {
+                                                "ok": False,
+                                                "error": f"confirmation_{outcome}: {err}",
+                                                "unknown": True,
+                                            }
+                                        )
+                                raise ToolAuthorizationError(auth_decision)
+                            # 授权通过：记录已授予能力，供 handler（如 subagent_submit）读取并传递
+                            tool_ctx.granted_capabilities = default_caps
+                        # 真正发起调用前原子消费额度（成功/失败都计）
+                        if run_budget is not None:
+                            run_budget.consume_tool_call()
+                        return self._registry.execute(_name, _args, context=tool_ctx)
 
-                # 喂给模型的这条带 call_id，与上面的 assistant tool_use 配对。
-                #
-                # **不写入 pending**：Thread 只提交 user 与最终 assistant。
-                # 中间 tool 消息若单独落库（不带 call_id），会成为一条
-                # "孤儿 tool_result"——下一轮 working_messages 里没有与之配对的
-                # tool_use，供应商会拒收该轮请求。工具往返只保留在
-                # working_messages（本轮喂给模型）、Trace 与 SSE 事件里。
-                working_messages.append(
-                    Message(role="tool", content=result, tool_call_id=decision.id)
-                )
+                    tool_result = self._run_via_pipeline(tool_ctx, _do_tool_call)
+                    # TRACE-01：工具 span 成为新的链尾 —— 下一次模型调用
+                    # 挂在它下面（「模型 → 工具 → 模型」）。
+                    chain_tail = tool_ctx.span_id
+                    return tool_result
+
+                # 串行执行：同一轮里前一个工具可能修改仓库，
+                # 后一个必须看到修改后的结果。
+                for call in calls:
+                    # 停止检查：**每个后续工具启动前**都要确认没被取消。
+                    # 步骤开始（291 行）与模型调用后（387 行）都有检查，
+                    # 但工具之间没有 —— 一次响应给出多个调用时，用户停止或
+                    # 模型超时后，剩余工具仍会执行完。
+                    if cancellation_token is not None and cancellation_token.is_cancelled():
+                        raise BudgetExceededError("tool_call_cancelled", None)
+                    result = _perform_tool_call(call.name, call.arguments)
+                    trace.append({
+                        "step": step,
+                        "action": "tool_call",
+                        "detail": {"name": call.name, "args": call.arguments, "result": result},
+                    })
+                    # 执行类工具的结果里带验证证据 → 收进本轮的判定集合
+                    guard_verdicts.extend(collect_guard_verdicts(result))
+
+                    # 喂给模型的这条带 call_id，与上面的 assistant tool_use 配对。
+                    # 一次响应多个调用时，这 N 条 tool 消息也必须**连续**（重建时合成
+                    # 同一个 user turn）。
+                    #
+                    # **不写入 pending**：Thread 只提交 user 与最终 assistant。
+                    # 中间 tool 消息若单独落库（不带 call_id），会成为一条
+                    # "孤儿 tool_result"——下一轮 working_messages 里没有与之配对的
+                    # tool_use，供应商会拒收该轮请求。工具往返只保留在
+                    # working_messages（本轮喂给模型）、Trace 与 SSE 事件里。
+                    working_messages.append(
+                        Message(role="tool", content=result, tool_call_id=call.id)
+                    )
 
         raise RuntimeError(f"Agent 在 {self._max_steps} 步内未完成")
+
+    def _merge_latest_run_result(
+        self,
+        thread_id: str,
+        thread: ThreadState,
+    ) -> None:
+        """把 store 里最新的 ``last_run_result`` 合并进待保存的 thread。
+
+        ``last_run_result`` 由 run_event 中间件在**工具调用结束时**写入，
+        与 Agent 的最终保存是两条独立的写路径。Agent 手里的 thread 是
+        运行开始时的快照，直接整份保存会覆盖掉中途写入的证据。
+
+        规则：**store 里的最新值优先**。store 里没有值时保留 thread 自带的
+        （内存实现下两者是同一个对象，本方法即恒等操作）。
+        读 store 失败一律按"保持原样"处理 —— 合并失败不能影响正常收尾。
+        """
+        try:
+            latest = self._store.get(thread_id)
+        except Exception:
+            return
+        if latest is None:
+            return
+        latest_result = getattr(latest, "last_run_result", None)
+        if latest_result:
+            thread.last_run_result = latest_result
 
     def _process_memory(
         self,

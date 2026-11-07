@@ -285,12 +285,16 @@ class TestMiddlewareInAgentRealPath(unittest.TestCase):
             budget=budget,
         )
 
-        answer, _ = agent.run("default", "retry me")
+        # BUDGET-01：额度是运行级的 —— 本次运行的计数器由模板派生。
+        run_budget = agent.new_run_budget()
+        answer, _ = agent.run("default", "retry me", budget=run_budget)
         self.assertEqual(answer, "recovered")
         self.assertEqual(model.call_count, 2)
         # 原子 consume 语义：Model 在每次实际调用前 consume；
         # 失败 + 成功 retry = 共 2 次 model_calls（failures / retries 都计）。
-        self.assertEqual(budget.model_calls(), 2)
+        # BUDGET-01：额度是**运行级**的 —— 构造参数里的 budget 只是额度上限模板，
+        # 本次运行的计数器由 new_run_budget() 派生，因此断言要落在运行计数器上。
+        self.assertEqual(run_budget.model_calls(), 2)
 
     def test_non_idempotent_tool_not_retried(self):
         """不可重试的 tool 异常不应触发重试。
@@ -517,12 +521,15 @@ class TestBudgetAtomicConsume(unittest.TestCase):
             budget=budget,
         )
 
+        # BUDGET-01：断言落在**本次运行**的计数器上（构造参数里的 budget 只是上限模板）。
+        run_budget = agent.new_run_budget()
         with self.assertRaises(BudgetExceededError) as ctx:
-            agent.run("default", "always fail")
+            agent.run("default", "always fail", budget=run_budget)
         self.assertEqual(ctx.exception.resource, "model_calls")
         # 3 次 attempt 后 budget 耗尽，retry 不再继续
         # （Agent 主循环不在 step 层消费；budget 只在每次 model 调用前 consume_model_call）
-        self.assertEqual(budget.model_calls(), 3)
+        # BUDGET-01：断言落在**本次运行**的计数器上（构造参数里的 budget 只是上限模板）。
+        self.assertEqual(run_budget.model_calls(), 3)
 
     # ----- 测试 3：Tool 失败仍消耗 1 次 tool_calls -----
 
@@ -553,11 +560,13 @@ class TestBudgetAtomicConsume(unittest.TestCase):
             budget=budget,
         )
 
+        # BUDGET-01：额度是运行级的 —— 本次运行的计数器由模板派生。
+        run_budget = agent.new_run_budget()
         with self.assertRaises(ToolExecutionError):
-            agent.run("default", "use boom tool")
+            agent.run("default", "use boom tool", budget=run_budget)
         # tool 失败但 consume_tool_call 已扣减
-        self.assertEqual(budget.tool_calls(), 1)
-        self.assertEqual(budget.model_calls(), 1)
+        self.assertEqual(run_budget.tool_calls(), 1)
+        self.assertEqual(run_budget.model_calls(), 1)
 
     # ----- 测试 4：两个并发 Subagent 共享 model limit 不会合计超限 -----
 
