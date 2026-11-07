@@ -5436,7 +5436,17 @@ running」冲突。改为：
   （各自相对 tool-07 无独有提交）→ 不重复搬代码。
 - `tool-06`：唯一独有提交 `23991f8` 是**旧版**产品演示脚本。
   tool-07 上已有更新版（`0d7eaae` → `3009023` → `cabc63d`，6 个演示场景，
-  额外覆盖「未配置 harness」与「真实子进程超时」）→ **不用旧脚本覆盖新版**。
+  额外覆盖「未配置 harness」与「真实子进程超时」）。
+  **逐场景核对后仍以 `--no-ff` 合入 tool-06**（保留其提交历史），
+  `scripts/tool07_demo.py` 的 add/add 冲突**取 tool-07 更新版** ——
+  不用旧脚本覆盖新版，也不擅自丢弃 tool-06 的历史：
+  | tool-06 旧版场景 | tool-07 新版对应 |
+  |---|---|
+  | `demo_normal_session_blocks_project_tools`<br>`demo_normal_session_execute_rejected` | `demo_normal_session_blocks_project_execute`（一个函数同时断言白名单不含 `project_execute` 与经 Agent 强制调用抛 `ToolNotAllowedError`） |
+  | `demo_project_session_executes_harness` | `demo_project_session_writes_file`（额外覆盖 diff 保留既有修改） |
+  | `demo_cancellation_stops_subprocess` | `demo_cancellation_after_start` |
+  | `demo_timeout_reclaims_process` | `demo_timeout_real_subprocess`（另有 `demo_timeout_returns_timeout`） |
+  | —— | 新版额外：`demo_unconfigured_harness_error` |
 - ChatGPT 的整合提交 `2c81f8f` 仅存在于其隔离环境，**未寻找、未依赖**；
   整合全部使用本机可取得的原始分支。
 
@@ -5449,4 +5459,27 @@ running」冲突。改为：
 
 ### 整合验证
 
-见本轮交付汇报。**未跑全量后端套件**，未开多 Agent 复审。
+Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
+`agent` / `verification_guard` / `trace_safety` 全部解析到
+`D:	mp\integration-v1\src\...`。
+
+| 验证 | 结果 |
+|---|---|
+| Trace / Guard / 交接定向测试 | **54 passed** |
+| 测试隔离 + 本轮 V1 持久化 + Git ignore 回归 | **21 passed** |
+| 预算生命周期（3 个文件） | **106 passed** |
+| tool07 进程树/超时 + agent + api_threads + project_diff/tools | **83 passed, 1 skipped** |
+| 后端更广回归（排除 3 个真实 harness 文件） | **3690 passed, 1 skipped, 42 subtests；15 failed** |
+| 前端 `npm run typecheck` | **通过** |
+| 前端 `npx vitest run` | **43 files / 541 tests passed** |
+| 浏览器实机（Playwright，刷新后） | 正文 + diff + verification + guard **同时存在**；判定「已关联检查通过」，逐条退出码 `0 / 0` 与 API 读回一致；pill 显示「历史结果」 |
+
+**15 项失败全部是既有失败，与整合无关** —— 已用两个干净基线 worktree
+（`origin/master` `914380b` 与 `origin/automation/tool-07` `4c9354b`）
+跑同一批文件做**失败集合差分**：三处失败清单**逐条完全一致**
+（`test_mcp.py` 11 项 + `test_phase21b_events.py` 1 项 +
+`test_subagent_allowed_tools.py` 3 项；根因是 MCP server 启动环境问题）。
+整合分支**未引入任何新失败**。
+
+**未跑全量后端**（按本轮约束；且真实 harness 路径需先确认假凭据/本地 mock/禁外网），
+未开多 Agent 复审。真实 harness 回归 = **未验证**。
