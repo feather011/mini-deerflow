@@ -28,6 +28,7 @@ from mini_deerflow.models import (
     ToolCalls,
 )
 from mini_deerflow.skill_runtime import SkillContextProvider
+from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import ThreadStore
 from mini_deerflow.tools import (
     ToolRegistry,
@@ -499,6 +500,18 @@ class Agent:
                 })
                 # 原子提交：先全部 extend，再 save
                 thread.extend(pending)
+                # 提交前合并「本轮执行证据」—— 不能用运行开始时的旧快照整份覆盖。
+                #
+                # 旧快照的 last_run_result 是运行开始时的值（通常为 None），
+                # 而 project_execute 的执行证据（diff / verification / guard）
+                # 是**运行途中**由 run_event 中间件写进 store 的。
+                # 直接 save 旧快照会把刚写进去的证据抹掉 → 页面刷新后
+                # 「答案正文还在、结构化证据没了」。
+                #
+                # 这里不是调整保存顺序，而是**显式合并**：以 store 里的最新值为准。
+                # 反过来也修了另一种情况：上一轮遗留的旧证据会被这一轮的空快照
+                # 覆盖掉，害得这一轮的证据丢失。
+                self._merge_latest_run_result(thread_id, thread)
                 self._store.save(thread)
 
                 # 成功后处理记忆（只处理本轮 user Message）
@@ -712,6 +725,31 @@ class Agent:
                     )
 
         raise RuntimeError(f"Agent 在 {self._max_steps} 步内未完成")
+
+    def _merge_latest_run_result(
+        self,
+        thread_id: str,
+        thread: ThreadState,
+    ) -> None:
+        """把 store 里最新的 ``last_run_result`` 合并进待保存的 thread。
+
+        ``last_run_result`` 由 run_event 中间件在**工具调用结束时**写入，
+        与 Agent 的最终保存是两条独立的写路径。Agent 手里的 thread 是
+        运行开始时的快照，直接整份保存会覆盖掉中途写入的证据。
+
+        规则：**store 里的最新值优先**。store 里没有值时保留 thread 自带的
+        （内存实现下两者是同一个对象，本方法即恒等操作）。
+        读 store 失败一律按"保持原样"处理 —— 合并失败不能影响正常收尾。
+        """
+        try:
+            latest = self._store.get(thread_id)
+        except Exception:
+            return
+        if latest is None:
+            return
+        latest_result = getattr(latest, "last_run_result", None)
+        if latest_result:
+            thread.last_run_result = latest_result
 
     def _process_memory(
         self,

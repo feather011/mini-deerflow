@@ -1,5 +1,11 @@
 export { TaskInspector } from './TaskInspector'
-export { TASK_STATUS_META, VALIDATION_STATUS_META } from './constants'
+export {
+  TASK_STATUS_META,
+  TASK_HISTORY_META,
+  VALIDATION_STATUS_META,
+  GUARD_VERDICT_META,
+  GUARD_MISSING_META,
+} from './constants'
 export type { TaskInspectorProps } from './TaskInspector'
 export type { PillTone } from './constants'
 // realTaskAdapter 是生产路径默认数据源；mock 适配器与 demo ID 仅保留给测试
@@ -15,4 +21,7 @@ export type {
   ChangedFile,
   DiffLine,
   DiffLineType,
+  GuardEvidence,
+  GuardVerdict,
+  VerificationEntry,
 } from './types'

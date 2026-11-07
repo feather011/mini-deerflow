@@ -15,8 +15,10 @@
    指向仓库外时 `resolve()` 已把它带到真实位置，边界检查自然拦下。
 3. **所有输出有上限**：读取字节、行数、glob 条数、grep 命中数与
    单文件扫描字节都封顶，超限只截断并如实标注 truncated。
-4. **纯 Python 检索，无 shell、无子进程**：grep 用 `re` + `os.walk`，
-   参数永远不进命令行拼接。
+4. **只读检索是纯 Python**（grep 用 `re` + `os.walk`，参数永远不进命令行拼接）。
+   执行前后的**快照采集**会调一次只读的 `git ls-files`（固定 argv、无 shell、
+   有超时）—— 快照必须以 Git 的 ignore 规则为准，否则环境目录会淹没 diff。
+   该命令只列举文件，不写仓库、不改索引。
 
 工具结果统一为 JSON（复用 context_shared 的 ok/err 约定）：
 参数类错误 `kind="usage_error"`（模型可改参重试），
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -717,9 +720,74 @@ SNAPSHOT_TOTAL_LIMIT = 50 * 1024 * 1024  # 50MB，总采集字节限制
 DIFF_MAX_LINES = 100  # diff 最多展示的行数（超出置 diff_truncated）
 TEXT_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh", ".bat", ".ps1", ".html", ".css", ".sql", ".xml", ".svg", ".c", ".cpp", ".h", ".hpp", ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".r", ".m", ".lua", ".pl", ".pm", ".ex", ".exs", ".erl", ".hrl", ".clj", ".cljs", ".hs", ".fs", ".fsx", ".vb", ".cs", ".fs"}
 
+GIT_LIST_TIMEOUT_SECONDS = 20
+"""`git ls-files` 的超时上限；超时按"拿不到列表"处理（退回目录遍历）。"""
+
+
+def _git_visible_files(root: Path) -> "list[str] | None":
+    """列出 Git 视角下"可见"的文件（相对 root，平台原生分隔符）。
+
+    规则（交给 Git 自己判定，不自己解析 .gitignore）：
+
+    - ``--cached``：**已跟踪**文件。即使后来被 .gitignore 命中也照样列出 ——
+      已跟踪就是仓库的一部分，不能因为后来加了忽略规则就从 diff 里消失。
+    - ``--others --exclude-standard``：**未跟踪且未被 Git ignore** 的文件。
+      .gitignore / .git/info/exclude / core.excludesFile 全部生效。
+
+    不是 Git 仓库、git 不可用、命令失败或超时 → 返回 None，
+    由调用方退回目录遍历（``_snapshot_workspace`` 的 fallback 分支）。
+
+    只读命令、固定 argv、不经过 shell：路径里的空格与特殊字符不会被解释。
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git", "-C", str(root), "ls-files", "-z",
+                "--cached", "--others", "--exclude-standard",
+            ],
+            capture_output=True,
+            timeout=GIT_LIST_TIMEOUT_SECONDS,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.decode("utf-8", errors="replace")
+    names = [name for name in raw.split("\0") if name]
+    # git 用 "/" 分隔；转成平台原生分隔符，与快照里其它路径保持一致
+    return [str(Path(name)) for name in names]
+
+
+def _walk_snapshot_files(root: Path) -> "list[Path]":
+    """目录遍历（fallback）：跳过 .git，其余文件全部计入。
+
+    只在拿不到 Git 列表时使用 —— 此时无从判断 ignore 规则，
+    宁可多收也不能把"看不见"当成"没有"。
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            p = Path(dirpath) / name
+            try:
+                if not p.is_file():
+                    continue
+            except OSError:
+                continue
+            found.append(p)
+    return found
+
 
 def _snapshot_workspace(repo_path: "Path") -> dict:
     """采集工作区快照：{path: (is_binary, size, mtime, content|text_preview)}。
+
+    **采集范围以 Git 的 ignore 规则为准**（仓库内时）：已跟踪文件 +
+    未被忽略的未跟踪文件。环境目录（``.venv/``、``.pytest_cache/`` 等）
+    只要被 ignore，就不会进快照，也就不会进 diff —— 快照不是"磁盘全量镜像"。
+
+    不是 Git 仓库（或 git 不可用）时退回目录遍历，结果里用
+    ``ignore_mode`` 标明是哪一种，避免把两种口径混为一谈。
 
     采集失败时返回 complete=False；其余字段尽力返回。
     """
@@ -727,11 +795,19 @@ def _snapshot_workspace(repo_path: "Path") -> dict:
         "files": {},
         "complete": True,
         "error": None,
+        "ignore_mode": "fallback",
     }
     try:
         root = Path(repo_path).resolve()
+        git_names = _git_visible_files(root)
+        if git_names is not None:
+            result["ignore_mode"] = "git"
+            candidates = [root / name for name in git_names]
+        else:
+            candidates = _walk_snapshot_files(root)
+
         total_bytes = 0
-        for p in root.rglob("*"):
+        for p in candidates:
             if not p.is_file():
                 continue
             # 大小限制
@@ -1070,6 +1146,8 @@ def create_project_execute_tool(
             changes = _diff_snapshots(baseline, after, repo_path)
             changes["baseline_complete"] = baseline_complete
             changes["snapshot_complete"] = after_complete
+            # 采集口径：git = 按 Git ignore 规则；fallback = 非 Git 仓库，退回目录遍历
+            changes["snapshot_ignore_mode"] = after.get("ignore_mode", "fallback")
 
             # 验证判定（Guard）：**status=completed 只说明执行器跑完了**，
             # 不代表用户的验收条件已经满足。结论一律由代码从证据算出 ——
