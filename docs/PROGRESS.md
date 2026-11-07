@@ -1,5 +1,46 @@
 # Mini DeerFlow 总进度
 
+## TEST-01：默认离线测试与真实 harness mock 接线（2026-11-03）
+
+- 状态：**READY_FOR_REVIEW** —— 隔离副本经其独立审查；**本机（Windows）已合入并复跑通过**；本机合入部分**尚未独立复审**。未 commit/push/merge。
+- 会话：codex-test01-20261103-isolated（隔离副本实现）；claude-worker-20261010-2015（2026-11-04 本机合入与复跑）。
+- 源码基线：隔离副本 a29af0c3fbcbbadca3a5159521a0884f35f25ad7；本机实际基线 **edd5d64**（= a29af0c + 662bbe2 BACKEND-02 修复 + edd5d64 复审结论记录），两者相差两个**仅后端**提交，本阶段未触及。
+- 662bbe2 尚未推送，未伪造该基线；本阶段不修改其生产文件或两个测试文件。
+- 范围：tests/conftest.py、tests/_offline_guard/sitecustomize.py、tests/test_test_isolation.py、tests/test_harness_runner_integration.py；设计与实施计划见同日 test01 文档。
+- 生产代码零修改。测试专用 env_file + HARNESS_MIMO_BASE_URL + 假 Key；覆盖残留 fake 模式和代理；真实 mock HTTP 请求与文件产出同时断言。
+- pytest 父进程默认保护 socket DNS/连接；Python 子进程通过继承 PYTHONPATH 的 sitecustomize 启用同一保护。包含旧式正/反向解析接口。
+- 手工 mock 服务器异常/skip 时在 finally 中关闭；清除原协议夹具多余未回收的子进程，并用真实非法 JSON 子进程验证协议拒绝，不放宽断言。
+- 外部 harness：89fa546ea7a30cbeefb0f6292b928bd2cb01ce26 的干净 git archive；需已安装两仓库依赖的 Python，显式设置 HARNESS_ROOT。
+- RED：父凭据穿透/子进程无保护两探针失败；独立审查后的旧式 DNS 4 探针及服务器 cleanup 探针也先失败，随后修复。
+- 定向：`HARNESS_ROOT=<harness路径> PYTHONPATH=src python -m pytest tests/test_test_isolation.py tests/test_harness_runner_integration.py -q`，26 passed，22.39s。
+- 扩展回归：上述两文件 + test_tool07_process_tree_recovery.py，29 passed / 1 failed；失败为并发心跳 14→0。基线该例单跑 1 passed（9.13s）；当前版该例重跑 1 passed（7.27s）。不根据数量宣称全绿，不把未证实的归因写成“既有失败”。
+- 一次独立审查发现旧 DNS 入口与服务器异常清理问题，均已修；修后以定向回归验证，没有反复派发审查。
+- 限制：不是 OS 沙箱；native 进程、清空 PYTHONPATH、Python -I/-S 等可绕过本测试保护。未跑全量、**未做 Windows 桌面人工体验**（Windows 上的自动化测试已在本机实跑，见下）、浏览器、真实 Provider。
+- 既有一个 pass 占位测试仍然是占位，未伪称为功能证据；不在本轮扩展计数语义。
+- 下一阶段：按实际 run 创建预算与取消生命周期；不自动启用生产预算开关。
+
+**本机合入与复跑（2026-11-04，claude-worker-20261010-2015）**
+
+> 以下是**本机实际结果**，与上面「隔离副本」的证据**分列**，不合并计数、不互相替代。
+
+| 项 | 隔离副本证据（补丁自带） | 本机实际结果 |
+|---|---|---|
+| 定向（两文件） | 26 passed / 22.39s | **26 passed / 27.95s**（数量一致；耗时差为环境差异） |
+| 进程树回归 | 29 passed / 1 failed（并发心跳 14→0，该例单跑 1 passed） | `tests/test_tool07_process_tree_recovery.py` **5 passed**，该抖动**本机未复现** —— 只记「本机未观测到」，**不宣称抖动已消除** |
+| 解释器 | 「需已安装两仓库依赖的 Python」 | 项目 `.venv` **Python 3.12.12**（harnessagent 的 `textual`/`pyfiglet` 仅 `harness/tui/**` 用到，非交互路径不需要；`rich` 为可选传递依赖，本机 `import harness.noninteractive` 未拉入） |
+| harnessagent | `89fa546ea7a30cbeefb0f6292b928bd2cb01ce26` 的干净 git archive | 本地 `D:/项目解读/harnessagent` HEAD **89fa546**（同一版本），显式设 `HARNESS_ROOT` |
+
+- 合入方式：`git apply --check test01.patch` 通过 → **7 个文件全部干净应用，0 冲突**。
+  `docs/PROGRESS.md` 无冲突的原因：补丁把本节插在**文件顶部**，而 662bbe2 / edd5d64
+  的记录追加在**文件末尾**，改动区间不重叠。
+- 生产代码零修改：补丁只动 `tests/` 与 `docs/`；`src/` 下无任何改动，
+  与补丁声明一致（本机 `git status` 中 `src/` 无变更）。
+- 补丁 sha256 `9403a155184bca584eccefbe0db81ac59830eced61cadd26bc53e196bff19014`，与交付值一致。
+- 本机**未完成项**：未跑后端全量、**未做 Windows 桌面人工体验**（Windows 上的自动化测试本机已实跑）、
+  未做浏览器验收、未调用真实付费 Provider（与补丁「限制」条一致）；
+  **本机合入部分尚未经独立复审**，故状态仍为 READY_FOR_REVIEW。
+
+
 状态图例：`⬜ 未开始` `🟡 进行中` `✅ 已完成` `⛔ 阻塞`
 
 更新时间：2026-10-02
