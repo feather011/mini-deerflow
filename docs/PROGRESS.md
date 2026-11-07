@@ -5413,6 +5413,186 @@ running」冲突。改为：
 
 ---
 
+## V1 实战：项目会话端到端（本机真实派发，2026-11-07）
+
+- 任务 ID：V1-LIVE-01
+- 会话标识：claude-v1-live-20261107-1
+- 目标版本：服务端/宿主代码跑 **`e49fcf4`**（= TEST-01 + HANDOVER-01 + GUARD-01，PR #9 的 head）；
+  试用工作区是 `e49fcf4` 的干净 git 检出（`git fetch` + `checkout`，**无 remote**）
+- 状态：**V1 主体成立；同时暴露 4 个真实缺陷**（见下"三、发现"）
+- **未 commit / push / merge**（本节只写在工作区，等下一轮交付）
+
+### 一、怎么跑的（本机，真实模型）
+
+| 项 | 取值 |
+|---|---|
+| 后端 | `uvicorn mini_deerflow.api.app:app` @ 127.0.0.1:8000，DB = `D:/tmp/md-v1/mini-deerflow.db`（SQLite），工作区根 = `D:/tmp/md-v1/workspaces` |
+| 宿主模型 | `.env` 的 **minimax / MiniMax-M3**（**真实付费调用**）。注：任务里的"不调用付费模型"是对**被派发的 workflow** 的要求，不是对本次宿主/执行器的要求 |
+| 执行器 | `D:/项目解读/harnessagent`（`89fa546`），真子进程、真模型 |
+| 项目会话 | `POST /api/projects` → 后端托管工作区（`git init`）→ `git fetch` 本仓 `automation/handover-01` → `checkout FETCH_HEAD`；`POST /api/threads {project_id}` |
+| 派发 | `POST /api/threads/{id}/runs/stream`（SSE），prompt 逐字照用用户给定那段 |
+| 前端 | `npm run dev` @ 5173（`VITE_API_TARGET` 已指向 8000），Playwright 实机点开 |
+
+### 二、三轮实跑结果（同一 prompt、同一工作区内容）
+
+| 轮次 | thread | 宿主 | project_execute | run 终态 | 刷新后能找回什么（浏览器实机复核） |
+|---|---|---|---|---|---|
+| 1 | `b16b43f33d84` | 派发成功 | **成功**（1 文件 + 9 条命令） | completed | 聊天正文**在**（Diff / 实际执行的检查 / 未验证项）；任务面板**空** |
+| 2 | `877c972e7174` | 10 步全耗在 glob/read_file/grep，**从未派发** | 未调用 | **failed** | 0 条消息 |
+| 3 | `07b67cab840f` | 第 1 次协议错误，第 2 次成功但**没来得及给最终回答** | 第 1 次 `PROJECT_TOOL_PROTOCOL_ERROR`；第 2 次**成功** | **failed**（10 步上限） | 聊天**0 条消息**；任务面板**在**（4278 个变更文件 + 实际执行的验证命令与完整输出） |
+
+- 第 3 轮的 `project_execute` 结果里 **GUARD-01 字段齐全**：`guard.verdict=failed`、`handover={provided:{context,scope,acceptance}全 true, missing:[], complete:true}`、`acceptance` 已填、`changes` 有 diff、`verification` 17 条 —— 说明 PR #9 的宿主侧代码**在线且生效**。
+- 试用工作区里 agent 产出的 `.github/workflows/pr-checks.yml` 内容正确（Python 3.12、装项目+测试依赖、只跑那三个文件、`MINI_DEERFLOW_MODEL_PROVIDER: fake` 钉死离线），并**如实列出未验证项**（含"本地没实际跑这三个 pytest"）。
+- **CI 未验证**：GitHub 上没有实际运行过该 workflow。
+
+### 三、发现（按严重度）
+
+1. **🔴 `last_run_result` 被 Agent 的最终 save 覆盖 → 成功的 run 反而丢掉结构化证据。**
+   `agent.py:440` 在 FinalAnswer 分支执行 `self._store.save(thread)`，而 `thread` 是**运行开始时**取的
+   `ThreadState` 快照（`agent.py:211`），其中 `last_run_result=None` —— 把 `api/middleware/run_event.py:214`
+   刚持久化的结果整个盖掉。
+   **证据（本轮浏览器实机复核，刷新后逐项对比）**：
+   | 会话 | run 终态 | 刷新后的聊天正文 | 刷新后的任务面板 |
+   |---|---|---|---|
+   | 轮次 1 `b16b43f33d84` | completed | **在**（Diff / 实际执行的检查 / 未验证项） | **空**（「本轮暂无文件变更」，验证页签无内容） |
+   | 轮次 3 `07b67cab840f` | failed | 空（0 条消息） | **在**（4278 个变更文件 + 实际执行的验证命令与完整输出） |
+
+   → **两半证据各活一半，且互斥：只有 run 失败才保住结构化证据。**
+   轮次 3 的 run 因失败没走到 Agent 的最终 save，所以 `last_run_result` 没被覆盖；
+   轮次 1 成功了，反而被自己的 FinalAnswer 保存动作抹掉。
+   另：刷新后状态 pill 仍显示「暂无运行」（run 状态来自实时 SSE，不落库）——
+   **状态不持久，证据持久，两者不同源**。
+   **修法方向**：`agent.py` 保存前合并 `last_run_result`（或先重读 store 再合并），不要用运行开始时的旧快照整份覆盖。
+2. **🔴 宿主模型派发不稳定 → 2/3 轮 `run.failed`。**
+   `runtime.py:777` / `runtime.py:1008` 的 `max_steps=10` **硬编码、无 env 可调**。
+   轮次 2 宿主把 10 步全花在 glob/read_file/grep 上，一次 `project_execute` 都没发；
+   轮次 3 第 2 次执行虽成功，却没来得及给最终回答。
+3. **🟠 协议错误信息失真，且真实原因连日志都没落。**
+   `project_tools.py` 对 `STATUS_PROTOCOL_ERROR` 一律给「执行器协议错误（N 行非法输出）」，
+   而 harness 侧的真实原因是「缺少有效终态事件（exit=N）」；`_executor_error`（`project_tools.py:230`）
+   把原文只交给 `logging.warning`，而该 logger 在生产启动方式下**看不到输出** —— 既不给模型，也不进日志。
+4. **🟠 `changes` 快照不认 `.gitignore` → diff 被噪声淹没、载荷爆炸。**
+   轮次 3 的 changes 是 **4278 个文件**（刷新后在任务面板「变化」页签实机可见）：
+   真 deliverable 只有 `.github/workflows/pr-checks.yml` 一个，其余全是执行代理装出来的
+   `.venv/**` 与 `.pytest_cache/**`。连带 `last_run_result` 达 **5.18 MB**（`GET /api/threads/{id}` 也返回 5.18 MB）。
+5. **🟡 Guard 的验收关联只认首 token → 复合命令里真跑了 pytest 也判"没有对应的执行记录"。**
+   轮次 3 的验收条件写了 `python -m pytest`，实际执行的命令是
+   `cd <ws> && echo ... && python -m pytest ...` —— 首 token 是 `cd`，
+   `_verification_signature` 返回空集 → `acceptance_covered=false`。
+6. **🟡 前端验证面板自算结论、不用 `guard`，且展示的证据与判定对不上。**
+   `realTaskAdapter.ts:206` 用**全部** verification 算 status，却用**第一条**命令做展示 →
+   面板出现「验证失败（退出码 0）」这种自相矛盾的文案；`guard` 字段在 UI 上**没有任何出口**。
+   **实机复核**：轮次 3 刷新后的验证页签，状态 pill 是「失败」，note 写「验证失败（退出码 0）」，
+   而正文里 `EXIT=2`（pytest 收集期 ImportError，真实退出码 2）—— **面板同时说"退出码 0"和"失败"，且都不是真相**。
+7. **🟡 执行代理改了宿主的 editable 安装。**
+   为绕开 `ModuleNotFoundError: No module named 'mini_deerflow.verification_guard'`，
+   轮次 3 的执行代理直接改写了主仓 `.venv` 的
+   `__editable__.mini_deerflow-0.1.0.pth`，把它指向试用工作区的 `src`；
+   并在试用工作区里建了**一整个 `.venv/`**，直接造成上面第 4 条的 4278 文件噪声。
+   **已恢复**（`uv pip install -e . --no-deps`，`.pth` 回到 `D:\项目解读\Deerflow\mini-deerflow\src`，
+   `import mini_deerflow` 已验证指回主仓）。**这是执行器能改宿主环境的口子。**
+   **根因在本轮环境配置**：harness 子进程的 `PYTHONPATH` 指向了**工作区根**而不是**工作区 `src`**，
+   `import mini_deerflow` 于是落回主仓 editable 安装（主仓当时还没 GUARD-01）→ ModuleNotFoundError
+   → 触发上面这一串。PYTHONPATH 改对，第 7、4 条都不会发生。
+8. **⚪ 执行代理的一条"未验证风险"与事实不符**：它称 `pip install -e .` 可能装不上 `src/` 布局。
+   该仓当前 editable 安装就是 `.pth → src/`，说明 setuptools 能自动发现 src 布局；该风险不成立。
+
+### 四、环境事实（非产品缺陷，但影响复现）
+
+- `api/app.py:31` 的 `load_dotenv` 按**包路径**找 `.env`；本轮 `mini_deerflow` 从试用工作区导入，
+  必须**按主仓路径显式加载** `.env`。
+- `os.environ["PYTHONPATH"]` 在解释器**启动后**改无效（`sys.path` 早已固定）：宿主侧必须
+  `sys.path.insert`，只有子进程（harness）吃环境变量。
+- harness 的 `pip install` 被权限层拦（`Permission required: Installing new package`），
+  所以"本地装依赖再跑 pytest"这条路在当前权限配置下走不通。
+- 项目会话**不出现在「会话」列表**：`frontend/src/features/threads/hooks.ts` 的 `useThreads`
+  明确过滤掉带 `project_id` 的线程（属设计，不是 bug）；项目会话从「项目」标签进入。
+- 本次**未重跑全量、未开新复审、未触碰 PR #6 / #7 / #8 / #9**；**CI 未验证**。
+
+### 五、用户本轮指定的唯一验收点：同一会话能看到改动与验证证据，刷新后还能找回来
+
+- **验法**：本机真开项目会话（绑定独立试用工作区），prompt 逐字照用用户给定那段；
+  浏览器（Playwright）实机点开 → 读面板 → `reload` → 再读面板，逐项对账。
+- **结论：部分成立，且成立与不成立的部分互斥。**
+
+| | 同一会话内可见 | 刷新后仍可见 |
+|---|---|---|
+| 改动（diff / 变更文件） | ✅ | 轮次 3 ✅（4278 个文件）/ 轮次 1 ❌（「本轮暂无文件变更」） |
+| 验证证据（命令 + 输出 + 退出码） | ✅ | 轮次 3 ✅（命令、`pytest` 完整输出、`EXIT=2` 都在）/ 轮次 1 ❌（验证页签空） |
+| 答案正文（Diff / 实际执行的检查 / 未验证项） | ✅ | 轮次 1 ✅ / 轮次 3 ❌（0 条消息） |
+| 运行状态 pill | ✅（completed/failed） | ❌（一律退回「暂无运行」，run 状态不落库） |
+
+- **根因**：`agent.py` 的 FinalAnswer 分支用**运行开始时的旧 ThreadState 快照**整份保存，
+  把 `run_event.py` 刚持久化的 `last_run_result` 覆盖成 `None`。
+  **成功 run 才走这条分支** → 成功的会话丢结构化证据；失败的会话没走 → 结构化证据反而留着。
+- **因此"刷新后还能找回来"目前只在 run 失败时成立**，且"能找回来"的是任务面板里的
+  原始证据（4278 个文件 + 命令输出），不是**经过 Guard 判定的结论**——
+  `guard` 字段在 UI 上没有任何出口（见发现 6）。
+- **CI 未验证**：GitHub 上没有实际运行过 `.github/workflows/pr-checks.yml`。
+
+---
+
+## V1 修复轮：小范围三项修复 + 四条结束条件验收（2026-11-07）
+
+- 任务 ID：V1-FIX-01
+- 会话标识：claude-v1-fix-20261107-1
+- 目标版本：工作区 `D:/tmp/handover-01-pr`（分支 `automation/handover-01`），基线 `e49fcf4`（= PR #9 head）
+- 依据：用户「拍板」——V1 验收链未通过，暂停 Web Skills，只做一轮小范围修复
+- 状态：**实现完成，四条结束条件全部通过**（脚本模型 + 生产 API + 真实持久化 + 浏览器刷新 + 临时仓库）；
+  已 commit `ad4e598` 并 push 到 `automation/handover-01`（PR **#9**，base = `automation/test-01`），**未 merge**
+
+### 一、三项必须修复的落地
+
+| 必须修复 | 落地方式 | 改动文件 |
+|---|---|---|
+| 成功结束覆盖执行证据 | **显式合并**（不是调保存顺序）：`agent.py` 新增 `_merge_latest_run_result()`，FinalAnswer 保存前从 store 重读最新 `last_run_result`，**store 的值优先**；读失败按"保持原样"处理，不影响收尾 | `src/mini_deerflow/agent.py` |
+| 前端结论与证据不一致 | guard 成为**唯一结论来源**：有 guard → 三档「已关联检查通过／未验证／验证失败」；无 guard（旧记录）→ 明确「未判定」，不按退出码自己推断；逐条命令列表格展示**结构化退出码**，缺失显示「缺失」、`passed` 为 null（**绝不默认成 0**） | `frontend/src/features/inspector/{types,constants,realTaskAdapter,TaskInspector}.tsx(ts)`、`mockTaskAdapter.ts`、`index.ts` |
+| 环境文件淹没 diff | 采集器改用**只读 `git ls-files -z --cached --others --exclude-standard`**（固定 argv、不经 shell、20s 超时）：已跟踪文件一律列出（哪怕后来被 ignore 命中），未跟踪且未被 ignore 的列出；非 Git 仓库/失败/超时 → 退回目录遍历（`ignore_mode=fallback`）。快照多带 `ignore_mode` 字段 | `src/mini_deerflow/project_tools.py` |
+
+**因果纠正已按要求分开处理**：错误的 `PYTHONPATH` 只解释"执行器为什么装了 venv"，
+**解释不了"为什么已忽略文件进了 diff"** —— 后者的原因是采集器压根没问过 Git。
+本轮修的是**采集器**（独立成链验证），没有拿改启动配置当 diff 问题的答案。
+
+### 二、本轮额外补的一处（属于"不得误报"硬要求）
+
+刷新后任务面板 pill 一律显示「暂无运行 / 尚未建立 Run」，而面板下方同时摆着
+历史变更与验证证据 —— 这正是"把有历史结果误说成没有执行过"。
+现在：**没有进行中的 Run 但有历史执行结果** → pill 显示「历史结果」，
+副标题改为「历史运行结果（状态）」，变化页签文案改为「最近一次运行」。
+**没有历史结果时**才显示「暂无运行」。
+
+### 三、四条结束条件的实测结果
+
+验法：**脚本模型**（`_ScriptedModel` / `_ScriptedHarnessRunner`，不联网、不计费、不碰宿主环境）
++ **生产 `create_app`** + **生产路由/SQLite 持久化** + **浏览器刷新** + **真实临时 git 仓库**。
+
+| # | 结束条件 | 结果 | 实测证据 |
+|---|---|---|---|
+| 1 | 成功运行后答案正文、diff、verification、guard 都能从 API 重读 | ✅ | `GET /api/threads/{id}`：2 条消息 + `last_run_result` 齐全；`check` 逐项 1a/1b/1c/1d 全 PASS（diff=`['business.py']`、verification 2 条、guard=`verified`） |
+| 2 | 失败运行也保留相同类型的证据，不被后续消息保存覆盖 | ✅ | fail 模式跑到步数耗尽（`run.failed`）→ `last_run_result` 仍在（verification 2 条、guard=`verified`）；随后 answer 模式**再跑一轮并保存消息** → 证据**一字未损**（`changed files`/`ignore mode` 仍可读回） |
+| 3 | 浏览器刷新后正文与任务面板同时存在，判定与逐条退出码一致 | ✅ | Playwright 实机 `goto`/`reload`：正文（"已新增 business.py…"）与任务面板**同时在**；验证页签 pill「已关联检查通过」，表格 `pytest -q → 0 → 通过`、`python -c "print('ok')" → 0 → 通过`，与 API 读回的 exit_code 一致 |
+| 4 | diff 只包含应展示的项目变更 | ✅ | 真实临时仓库：新增业务文件出现、`.venv/`/`.pytest_cache/` 不出现、已跟踪但被 ignore 命中的文件仍出现、diff 只剩 `feature.py`；验收仓库里 `ignore_mode=git`、changed files 仅 `business.py` |
+
+### 四、验证记录（本轮实际执行的命令）
+
+- 后端新增测试：`tests/test_agent_run_result_persistence.py`（4 例，真实 SQLite）、
+  `tests/test_project_snapshot_gitignore.py`（7 例，真实临时 git 仓库）→ **11 passed**
+- 后端相关回归：`test_project_diff.py test_project_tools.py test_project_execute_e2e.py
+  test_agent.py test_verification_guard.py test_task_handover_e2e.py test_api_threads.py`
+  → **113 passed, 1 skipped**
+- 前端：`npx vitest run` → **43 files / 541 tests passed**；`npm run typecheck` → 无错
+- 浏览器：Playwright 实机（Chrome），127.0.0.1:5174 → 验收后端 127.0.0.1:8010
+- **未重跑全量后端**（按本轮约束）；**未开多 Agent 复审**；**未触碰 PR #6/#7/#8/#9**
+
+### 五、本轮记录但不修的事项
+
+- `max_steps=10` 硬编码 → **只记录**；运行限额配置另做小任务，**未靠调大预算让验收"过关"**。
+- run 状态 pill 的持久化 → 本轮**未扩展运行状态存储**；但已确保"有历史结果"不会被说成"从未执行过"。
+- 执行器改宿主 `.pth` → 记为**执行边界问题**；本轮全部测试使用隔离环境，**未再修宿主环境**。
+- workflow 产物保留；**CI 未验证**（GitHub 上没跑过）。
+
+---
+
 ## V1 整合收口（2026-11-07）
 
 - 任务 ID：V1-CLOSEOUT-01
@@ -5488,3 +5668,19 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
 
 **未跑全量后端**（按本轮约束；且真实 harness 路径需先确认假凭据/本地 mock/禁外网），
 未开多 Agent 复审。真实 harness 回归 = **未验证**。
+
+### 合并结果
+
+- 整合 PR **#10**（`integration/v1-closeout` → `master`）**已合并**，
+  merge commit `010ef33c16ad45e43c88a8413cb587b41d31fe76`（保留提交历史，
+  **未 squash、未改写历史**）。
+- 远端 `master` 已核对包含全部来源分支 head：
+  `23991f8`(tool-06) / `4c9354b`(tool-07) / `528babd`(test-01) /
+  `ad4e598`(handover-01，含 V1 修复) / `9b73c24`(trace-01)。
+- 在最终 master 上做最小冒烟：核心定向测试 **99 passed**、
+  前端 `typecheck` 通过、inspector 组件测试 **76 passed**、
+  `mini_deerflow` / `verification_guard` / `trace_safety` 均解析到该 master 副本。
+- 旧 PR：#6（tool-07）**已自动关闭**；#7（trace-01）/ #8（test-01）/ #9（handover-01）
+  仍为 OPEN —— 其内容已由 #10 **全部包含**在 master 中，保留待人工处置，
+  不擅自丢弃任何独有改动。
+- **CI 未验证**：GitHub 上没有实际运行过 `.github/workflows/pr-checks.yml`。
