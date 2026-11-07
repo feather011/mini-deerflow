@@ -361,6 +361,17 @@ class ToolResult:
 # ---------------------------------------------------------------------------
 
 
+# subagent 工具族：submit 派发 + status/collect/cancel 生命周期管理。
+# 派发本身不产生外部副作用（子 Agent 的工具集由服务端固定上限约束），
+# 因此在策略 requires_confirmation=False 时直接放行，不打断主流程。
+_SUBAGENT_TOOL_NAMES = frozenset({
+    "subagent_submit",
+    "subagent_status",
+    "subagent_collect",
+    "subagent_cancel",
+})
+
+
 def _is_authorized_read_only_web(metadata: ToolMetadata) -> bool:
     """R1 收窄的「默认已授权豁免」条件。
 
@@ -452,11 +463,17 @@ def evaluate_tool_access(
     # - policy.requires_confirmation=False 且工具是「网络只读 web_*」+ 仅需
     #   NETWORK_READ 能力 → 视为「已授权豁免」，不弹确认
     # - project_execute 走受控派发例外（policy=False 时直接派发）
+    # - subagent_* 走受控委派例外（policy=False 时直接派发）
     # - 其余工具按 metadata.requires_confirmation() 判定
     if policy.requires_confirmation:
         needs_confirm = True
     elif metadata.name == "project_execute":
         # 受控执行路径：policy.requires_confirmation=False 时直接派发
+        needs_confirm = False
+    elif metadata.name in _SUBAGENT_TOOL_NAMES:
+        # 受控委派路径：子 Agent 派发本身不产生外部副作用
+        # （子 Agent 的工具集由服务端固定上限约束，见 subagent_policy.py），
+        # 因此 policy.requires_confirmation=False 时直接派发，不打断主流程。
         needs_confirm = False
     elif _is_authorized_read_only_web(metadata):
         # R1 收紧：仅对已授权的网络只读 web 工具豁免
@@ -584,6 +601,29 @@ SUBAGENT_METADATA = ToolMetadata(
     side_effects=frozenset({ToolSideEffect.DELEGATES_SUBAGENT}),
 )
 
+# subagent 状态/回收/取消工具：与 submit 同属委派生命周期的管理面，
+# 同样只允许主 Agent 调用（能力仍为 SUBAGENT_DELEGATE）。
+SUBAGENT_STATUS_METADATA = ToolMetadata(
+    name="subagent_status",
+    source=ToolSourceKind.LOCAL,
+    capabilities=frozenset({ToolCapability.SUBAGENT_DELEGATE}),
+    side_effects=frozenset({ToolSideEffect.DELEGATES_SUBAGENT}),
+)
+
+SUBAGENT_COLLECT_METADATA = ToolMetadata(
+    name="subagent_collect",
+    source=ToolSourceKind.LOCAL,
+    capabilities=frozenset({ToolCapability.SUBAGENT_DELEGATE}),
+    side_effects=frozenset({ToolSideEffect.DELEGATES_SUBAGENT}),
+)
+
+SUBAGENT_CANCEL_METADATA = ToolMetadata(
+    name="subagent_cancel",
+    source=ToolSourceKind.LOCAL,
+    capabilities=frozenset({ToolCapability.SUBAGENT_DELEGATE}),
+    side_effects=frozenset({ToolSideEffect.DELEGATES_SUBAGENT}),
+)
+
 # sandbox 工具（CLI 沙箱权限由 Web 产品独立建模）
 SANDBOX_READ_FILE_METADATA = ToolMetadata(
     name="sandbox_read_file",
@@ -638,7 +678,14 @@ WEB_READ_METADATA = ToolMetadata(
 # ---------------------------------------------------------------------------
 
 def default_policy_for_calculator() -> ToolPolicy:
-    return ToolPolicy(enabled=True)
+    return ToolPolicy(
+        enabled=True,
+        # 纯计算无副作用：主 Agent 与 Mini 子 Agent 都可用。
+        allowed_principals=frozenset({
+            ExecutorPrincipal.MAIN_AGENT,
+            ExecutorPrincipal.MINI_SUBAGENT,
+        }),
+    )
 
 
 def default_policy_for_history_tools() -> ToolPolicy:
@@ -685,11 +732,21 @@ def default_policy_for_project_execute() -> ToolPolicy:
 
 
 def default_policy_for_subagent() -> ToolPolicy:
+    """subagent 工具族策略：只有主 Agent 能派发与管理子任务。
+
+    `requires_confirmation=False`：派发子任务本身不产生外部副作用 ——
+    子 Agent 能用哪些工具由**服务端固定上限**决定（见 subagent_policy.py），
+    不由模型参数决定。因此不需要逐次弹确认打断主流程。
+
+    注意这里**不**授予 MINI_SUBAGENT：子 Agent 不能继续派发子 Agent
+    （不递归）。
+    """
     return ToolPolicy(
         enabled=True,
         allowed_principals=frozenset({
             ExecutorPrincipal.MAIN_AGENT,
         }),
+        requires_confirmation=False,
     )
 
 
@@ -792,6 +849,9 @@ BUILTIN_TOOL_METADATA: dict[str, ToolMetadata] = {
     "project_grep": PROJECT_GREP_METADATA,
     "project_execute": PROJECT_EXECUTE_METADATA,
     "subagent_submit": SUBAGENT_METADATA,
+    "subagent_status": SUBAGENT_STATUS_METADATA,
+    "subagent_collect": SUBAGENT_COLLECT_METADATA,
+    "subagent_cancel": SUBAGENT_CANCEL_METADATA,
     "sandbox_read_file": SANDBOX_READ_FILE_METADATA,
     "sandbox_write_file": SANDBOX_WRITE_FILE_METADATA,
     "sandbox_run_command": SANDBOX_RUN_COMMAND_METADATA,
@@ -814,6 +874,8 @@ def default_policy_for(name: str) -> ToolPolicy | None:
     if name == "project_execute":
         return default_policy_for_project_execute()
     if name == "subagent_submit":
+        return default_policy_for_subagent()
+    if name in ("subagent_status", "subagent_collect", "subagent_cancel"):
         return default_policy_for_subagent()
     if name.startswith("sandbox_"):
         return default_policy_for_sandbox()

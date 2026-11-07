@@ -36,6 +36,8 @@ class ThreadDetail(BaseModel):
     project_id: str | None = None  # 如果属于项目，则为项目 ID
     # 26：最近一次 project_execute 的结果 JSON（页面刷新后恢复 diff 展示）
     last_run_result: str | None = None
+    # Subagent 首版：子任务记录（页面刷新后恢复子任务卡）
+    subagent_runs: list[dict[str, object]] = Field(default_factory=list)
     messages: list[MessageResponse] = Field(default_factory=list)
 
 
@@ -70,6 +72,7 @@ def thread_to_detail(
     messages: list[tuple[str, str]],
     project_id: str | None = None,
     last_run_result: str | None = None,
+    subagent_runs: list[dict[str, object]] | None = None,
 ) -> ThreadDetail:
     """由 ID + 消息字段列表构造详情。
 
@@ -79,5 +82,6 @@ def thread_to_detail(
         thread_id=thread_id,
         project_id=project_id,
         last_run_result=last_run_result,
+        subagent_runs=list(subagent_runs or []),
         messages=[message_to_response(role, content) for role, content in messages],
     )

@@ -40,6 +40,7 @@ from mini_deerflow.tools import (
 from mini_deerflow.tool_authorization import (
     ToolPolicyRegistry,
     check_tool_access,
+    session_capabilities,
     ToolAuthorizationError,
 )
 from mini_deerflow.tool_contracts import ToolCapability, ExecutorPrincipal
@@ -310,28 +311,13 @@ class Agent:
 
         # TOOL-02：策略可见性过滤——DENY 工具隐藏，ALLOW/CONFIRM 可见
         # 用当前会话默认能力做可见性判定：模型不应看到自己无权调用的工具
+        #
+        # 能力集统一由 `session_capabilities()` 推导（不再内联复制一份）——
+        # 内联副本会与 tool_authorization 的定义漂移：新增能力时
+        # 漏改一处就出现「工具不可见」或「越权可见」。
         if self._tool_policy_registry is not None:
-            # 根据会话类型构造默认能力
-            if thread.project_id is None:
-                session_caps = frozenset({
-                    ToolCapability.COMPUTE,
-                    ToolCapability.SESSION_HISTORY_READ,
-                    ToolCapability.SESSION_STATE_WRITE,
-                    # TOOL-06：网络只读工具需要 NETWORK_READ
-                    ToolCapability.NETWORK_READ,
-                })
-                session_project_id: str | None = None
-            else:
-                session_caps = frozenset({
-                    ToolCapability.PROJECT_READ,
-                    ToolCapability.PROJECT_EXEC_DELEGATE,
-                    ToolCapability.COMPUTE,
-                    ToolCapability.SESSION_HISTORY_READ,
-                    ToolCapability.SESSION_STATE_WRITE,
-                    # TOOL-06：项目会话同样可调用网络只读工具
-                    ToolCapability.NETWORK_READ,
-                })
-                session_project_id = thread.project_id
+            session_caps = session_capabilities(thread.project_id)
+            session_project_id: str | None = thread.project_id
             visible_names: set[str] = set()
             for spec in model_tools:
                 authority = self._tool_policy_registry.get_authority(
@@ -616,27 +602,9 @@ class Agent:
                         # TOOL-02 第三层：细粒度授权策略（能力/主体/确认）
                         # 仅当注册了 policy_registry 时启用；None 时回退到前两层
                         if self._tool_policy_registry is not None:
-                            # 根据会话类型授予默认基础能力
-                            if thread.project_id is None:
-                                # 普通会话：calculator / history / task_note
-                                default_caps = frozenset({
-                                    ToolCapability.COMPUTE,
-                                    ToolCapability.SESSION_HISTORY_READ,
-                                    ToolCapability.SESSION_STATE_WRITE,
-                                    # TOOL-06：网络只读
-                                    ToolCapability.NETWORK_READ,
-                                })
-                            else:
-                                # 项目会话：项目读写 + 普通会话基础能力
-                                default_caps = frozenset({
-                                    ToolCapability.PROJECT_READ,
-                                    ToolCapability.PROJECT_EXEC_DELEGATE,
-                                    ToolCapability.COMPUTE,
-                                    ToolCapability.SESSION_HISTORY_READ,
-                                    ToolCapability.SESSION_STATE_WRITE,
-                                    # TOOL-06：网络只读
-                                    ToolCapability.NETWORK_READ,
-                                })
+                            # 会话默认能力统一由 session_capabilities() 推导
+                            # （与上面的可见性过滤同一份定义，不内联复制）。
+                            default_caps = session_capabilities(thread.project_id)
                             authority = self._tool_policy_registry.get_authority(
                                 thread_id=thread_id,
                                 run_id=getattr(tool_ctx, "run_id", "") or "",
@@ -768,11 +736,12 @@ class Agent:
         thread_id: str,
         thread: ThreadState,
     ) -> None:
-        """把 store 里最新的 ``last_run_result`` 合并进待保存的 thread。
+        """把 store 里最新的「运行途中写入」字段合并进待保存的 thread。
 
         ``last_run_result`` 由 run_event 中间件在**工具调用结束时**写入，
+        ``subagent_runs`` 由 subagent_submit 工具在**子任务结束时**写入，
         与 Agent 的最终保存是两条独立的写路径。Agent 手里的 thread 是
-        运行开始时的快照，直接整份保存会覆盖掉中途写入的证据。
+        运行开始时的快照，直接整份保存会覆盖掉中途写入的内容。
 
         规则：**store 里的最新值优先**。store 里没有值时保留 thread 自带的
         （内存实现下两者是同一个对象，本方法即恒等操作）。
@@ -787,6 +756,31 @@ class Agent:
         latest_result = getattr(latest, "last_run_result", None)
         if latest_result:
             thread.last_run_result = latest_result
+        # Subagent 首版：子任务记录同理 —— 运行途中写进 store 的记录
+        # 不能被收尾保存的旧快照抹掉（否则刷新后子任务卡消失，G6 未解决）。
+        #
+        # 合并规则与 last_run_result 一致但更细：**按 task_id 逐条合并**。
+        # 直接整份覆盖会有问题：store 里若没有本轮记录（例如本轮没派发
+        # 子任务，但上一轮有），整份覆盖会把上一轮的记录抹掉。
+        latest_runs = getattr(latest, "subagent_runs", None)
+        if latest_runs:
+            # 合并规则与 last_run_result 一致但更细：**按 task_id 逐条合并**。
+            # 直接整份覆盖会有问题：store 里若没有本轮记录（例如本轮没派发
+            # 子任务，但上一轮有），整份覆盖会把上一轮的记录抹掉。
+            ordered: list[dict[str, object]] = []
+            seen: set[object] = set()
+            for record in list(thread.subagent_runs) + list(latest_runs):
+                tid = record.get("task_id")
+                if tid in seen:
+                    # 同 task_id：以后写入的（store 侧）为准
+                    for i, existing in enumerate(ordered):
+                        if existing.get("task_id") == tid:
+                            ordered[i] = dict(record)
+                            break
+                    continue
+                seen.add(tid)
+                ordered.append(dict(record))
+            thread.subagent_runs = ordered
 
     def _process_memory(
         self,

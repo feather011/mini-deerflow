@@ -34,6 +34,13 @@ class RunEventType(str, Enum):
     RUN_TIMED_OUT = "run.timed_out"
     RUN_CANCELLED = "run.cancelled"
     RUN_MODEL_TOKEN = "model.token"  # token 流式推送事件
+    # Subagent 首版：子任务生命周期事件。
+    #
+    # 子代理不走中间件管线（没有 pipeline），因此这些事件由
+    # SubagentManager **手工**发布到 broker，与父运行的 SSE 同一条流。
+    SUBAGENT_STARTED = "subagent.started"
+    SUBAGENT_COMPLETED = "subagent.completed"
+    SUBAGENT_FAILED = "subagent.failed"
 
 
 class RunEvent(BaseModel):
@@ -59,6 +66,16 @@ class RunEvent(BaseModel):
     tool_result: str | None = None
     # model.token 事件携带 token 流式推送的增量文本
     delta: str | None = None
+
+    # Subagent 首版：子任务事件携带的字段。
+    subagent_task_id: str | None = None
+    """子任务 ID（sa-xxxxxxxxxxxx）。"""
+    subagent_status: str | None = None
+    """子任务终态：SUCCEEDED / FAILED / CANCELLED / TIMED_OUT。"""
+    subagent_instruction: str | None = None
+    """子任务指令摘录（前端卡片展示用）。"""
+    subagent_output: str | None = None
+    """子任务结果摘录（前端卡片展示用）。"""
 
 
 def encode_sse(event: RunEvent) -> str:

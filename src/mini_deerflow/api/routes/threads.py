@@ -95,7 +95,13 @@ def create_thread(
             detail=f"线程已存在: {exc.thread_id}",
         ) from exc
     messages = [(m.role, m.content) for m in thread.snapshot()]
-    return thread_to_detail(thread.thread_id, messages, thread.project_id, thread.last_run_result)
+    return thread_to_detail(
+        thread.thread_id,
+        messages,
+        thread.project_id,
+        thread.last_run_result,
+        thread.subagent_runs,
+    )
 
 
 @router.get(
@@ -140,7 +146,13 @@ def get_thread(
             detail=f"未知线程: {exc.thread_id}",
         ) from exc
     messages = [(m.role, m.content) for m in thread.snapshot()]
-    return thread_to_detail(thread.thread_id, messages, thread.project_id, thread.last_run_result)
+    return thread_to_detail(
+        thread.thread_id,
+        messages,
+        thread.project_id,
+        thread.last_run_result,
+        thread.subagent_runs,
+    )
 
 
 @router.get(

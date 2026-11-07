@@ -118,6 +118,10 @@ def session_capabilities(project_id: str | None) -> frozenset:
     - 项目会话：在普通会话能力之上再加项目读 / 派发执行
     - `NETWORK_READ` 属于 TOOL-06：已授权的网络只读工具（web_search / web_read）
       在普通会话与项目会话都可用，且**不因此**获得写入/命令/项目能力。
+    - `SUBAGENT_DELEGATE`：向子 Agent 委派任务。**普通会话也持有** ——
+      委派本身不产生外部副作用，子 Agent 的权限由服务端固定上限另行收窄
+      （见 subagent_policy.py）。注意这只授予**主 Agent**；
+      子 Agent 的能力集在继承时会剔除该能力（不可递归）。
     """
     from mini_deerflow.tool_contracts import ToolCapability
 
@@ -126,6 +130,7 @@ def session_capabilities(project_id: str | None) -> frozenset:
         ToolCapability.SESSION_HISTORY_READ,
         ToolCapability.SESSION_STATE_WRITE,
         ToolCapability.NETWORK_READ,
+        ToolCapability.SUBAGENT_DELEGATE,
     }
     if project_id is not None:
         base |= {

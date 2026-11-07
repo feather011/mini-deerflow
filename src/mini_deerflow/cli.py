@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -416,7 +417,12 @@ def run_cli(
     # model_settings 走统一 Model Factory（21A）：默认 fake，选 minimax 时
     # 缺 Key 会在 create_model 内 fail-closed 抛错，不静默降级。
     config = RuntimeConfig(
-        subagent_enabled=False,
+        # Subagent 首版：与 API 走同一个环境变量（MINI_DEERFLOW_SUBAGENT_ENABLED）。
+        # 默认关闭 —— 开启后主 Agent 会多看到 subagent_submit 工具。
+        subagent_enabled=(
+            os.environ.get("MINI_DEERFLOW_SUBAGENT_ENABLED", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
         trace_enabled=trace_enabled,
         model_settings=load_model_settings(),
         # 22：未配置 MINI_DEERFLOW_MCP_CONFIG 时返回 [] → 不启动任何 MCP

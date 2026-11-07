@@ -431,6 +431,9 @@ const SSE_EVENT_LABELS: Record<RunEventType, string> = {
   'run.failed': 'Run 失败',
   'run.timed_out': 'Run 超时',
   'run.cancelled': 'Run 取消',
+  'subagent.started': '子任务开始',
+  'subagent.completed': '子任务完成',
+  'subagent.failed': '子任务结束',
   'heartbeat': '心跳',
 }
 

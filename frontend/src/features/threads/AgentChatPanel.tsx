@@ -41,6 +41,9 @@ import { useDraftStore } from './useDraftStore'
 // TOOL-05：确认卡（聊天内嵌紧邻对应工具活动）
 import { useConfirmations } from '../confirmations/useConfirmations'
 import { ConfirmationCardList } from '../confirmations/ConfirmationCardList'
+// Subagent 首版：子任务卡（聊天区内嵌，展示主 Agent 派发的子任务）
+import { useSubagentCards } from '../subagents/useSubagentCards'
+import { SubagentCardList } from '../subagents/SubagentCardList'
 import styles from './AgentChatPanel.module.css'
 
 interface AgentChatPanelProps {
@@ -259,6 +262,12 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
     verify: confirmVerify,
   } = useConfirmations(thread.thread_id)
 
+  // Subagent 首版：子任务卡数据源。
+  //
+  // 两个来源合并：本轮 SSE 事件（实时进度）+ 线程详情里的持久化记录
+  // （页面刷新后靠它恢复卡片 —— G6 的前端一半）。
+  const subagentCards = useSubagentCards(events, thread.subagent_runs)
+
   return (
     <SSEContext.Provider value={{ events, status: streamStatus }}>
       <div className={styles.panel}>
@@ -279,6 +288,8 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
             onApproveAndExecute={confirmApproveAndExecute}
             onVerify={confirmVerify}
           />
+          {/* Subagent 首版：子任务卡（实时事件 + 刷新后从持久化记录恢复） */}
+          <SubagentCardList cards={subagentCards} />
         </div>
 
         {/* SSE 事件面板（已隐藏） */}

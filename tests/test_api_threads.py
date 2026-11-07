@@ -72,8 +72,16 @@ def test_post_threads_returns_201_with_empty_thread() -> None:
         response = client.post("/api/threads", json={})
     assert response.status_code == 201
     body = response.json()
-    assert set(body) == {"thread_id", "messages", "project_id", "last_run_result"}
+    assert set(body) == {
+        "thread_id",
+        "messages",
+        "project_id",
+        "last_run_result",
+        # Subagent 首版：子任务记录（页面刷新后恢复子任务卡）
+        "subagent_runs",
+    }
     assert body["messages"] == []
+    assert body["subagent_runs"] == []
 
 
 def test_post_threads_generates_unique_nonempty_id() -> None:

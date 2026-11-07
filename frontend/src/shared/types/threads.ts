@@ -39,7 +39,27 @@ export interface ThreadDetail {
   project_id?: string | null  // 如果属于项目，则为项目 ID
   // 26：最近一次 project_execute 的结果 JSON（页面刷新后恢复 diff 展示）
   last_run_result?: string | null
+  // Subagent 首版：子任务记录（页面刷新后恢复子任务卡）
+  subagent_runs?: SubagentRunRecord[]
   messages: MessageResponse[]
+}
+
+/**
+ * 子任务记录（与后端 ThreadState.subagent_runs 的元素对应）。
+ */
+export interface SubagentRunRecord {
+  task_id: string
+  instruction: string
+  status: string
+  output: string
+  error_type?: string
+  error_message?: string
+  started_at?: number
+  finished_at?: number
+  duration_seconds?: number
+  tool_calls?: number
+  model_calls?: number
+  recorded_at?: number
 }
 
 /**

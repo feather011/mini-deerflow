@@ -42,7 +42,19 @@ export type RunEventType =
   | 'run.failed'
   | 'run.timed_out'
   | 'run.cancelled'
+  // Subagent 首版：子任务生命周期事件
+  | 'subagent.started'
+  | 'subagent.completed'
+  | 'subagent.failed'
   | 'heartbeat'
+
+/** 子任务终态 */
+export type SubagentStatus =
+  | 'RUNNING'
+  | 'SUCCEEDED'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'TIMED_OUT'
 
 /**
  * 单条 SSE RunEvent
@@ -74,6 +86,14 @@ export interface RunEvent {
   tool_result?: string | null
   /** model.token 事件携带 token 流式推送的增量文本 */
   delta?: string | null
+  /** Subagent 首版：子任务 ID */
+  subagent_task_id?: string | null
+  /** Subagent 首版：子任务终态 */
+  subagent_status?: SubagentStatus | string | null
+  /** Subagent 首版：子任务指令摘录 */
+  subagent_instruction?: string | null
+  /** Subagent 首版：子任务结果摘录 */
+  subagent_output?: string | null
 }
 
 /** 判断事件是否为终态 */

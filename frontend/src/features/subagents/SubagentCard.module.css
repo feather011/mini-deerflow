@@ -1,0 +1,86 @@
+.card {
+  border: 1px solid var(--border-color, #4a7d9a);
+  border-radius: 6px;
+  background: var(--info-bg, #eef5fa);
+  padding: 12px 16px;
+  margin: 8px 0;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.card[data-status='SUCCEEDED'] {
+  border-color: #4a7d2a;
+  background: #ecf6e0;
+}
+
+.card[data-status='FAILED'],
+.card[data-status='TIMED_OUT'] {
+  border-color: #b30;
+  background: #fdeeee;
+}
+
+.card[data-status='CANCELLED'] {
+  border-color: #aaa;
+  background: #f0f0f0;
+  color: #555;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.status {
+  font-size: 13px;
+}
+
+.taskId {
+  font-family: monospace;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.05);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.duration {
+  font-size: 12px;
+  color: #666;
+  font-weight: 400;
+}
+
+.summary {
+  margin: 6px 0;
+  color: #333;
+}
+
+.instruction,
+.output {
+  font-family: monospace;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 6px 8px;
+  border-radius: 3px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow: auto;
+  margin: 0 0 4px;
+}
+
+.meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #666;
+}
+
+.error {
+  color: #b30;
+  font-weight: 600;
+}

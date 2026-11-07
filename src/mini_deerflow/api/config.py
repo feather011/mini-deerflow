@@ -105,6 +105,22 @@ class ApiSettings:
     web_search_mcp_tool: str = "search"
     """MCP 搜索工具名（默认 search）；模型通过 mcp__<server>__<tool> 暴露。"""
 
+    # ---- Subagent 首版：子 Agent 委派 ----
+    subagent_enabled: bool = False
+    """是否启用子 Agent 委派（主 Agent 可派发只读子任务）。
+
+    默认关闭：开启后模型会多看到一个工具，行为面变大。
+    用 ``MINI_DEERFLOW_SUBAGENT_ENABLED=1`` 开启。
+    """
+    subagent_max_concurrency: int = 2
+    """同时运行的子任务上限。"""
+    subagent_max_depth: int = 1
+    """子任务最大委派深度。首版固定 1 —— 不做递归派发。"""
+    subagent_max_tasks_per_parent: int = 10
+    """单次运行内允许派发的子任务数上限。"""
+    subagent_default_timeout: float = 300.0
+    """子任务默认超时（秒）。"""
+
     # ---- TRACE-01：Trace 采集与落盘 ----
     trace_enabled: bool = False
     """是否启用 Trace 事件采集。默认 False（不启用时不产生任何 Trace 事件）。
@@ -140,6 +156,40 @@ class ApiSettings:
         env_list = _get_env("MAX_LIST_ENTRIES", None)
         if env_list is not None:
             object.__setattr__(self, "max_list_entries", int(env_list))
+        # Subagent 首版：子 Agent 委派开关
+        env_subagent = _get_env("SUBAGENT_ENABLED", None)
+        if env_subagent is not None and env_subagent.strip():
+            object.__setattr__(
+                self,
+                "subagent_enabled",
+                env_subagent.strip().lower() in ("1", "true", "yes", "on"),
+            )
+        env_subagent_concurrency = _get_env("SUBAGENT_MAX_CONCURRENCY", None)
+        if env_subagent_concurrency is not None and env_subagent_concurrency.strip():
+            try:
+                object.__setattr__(
+                    self,
+                    "subagent_max_concurrency",
+                    int(env_subagent_concurrency.strip()),
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "环境变量 MINI_DEERFLOW_SUBAGENT_MAX_CONCURRENCY 必须为整数，"
+                    f"当前值: {env_subagent_concurrency!r}"
+                ) from exc
+        env_subagent_timeout = _get_env("SUBAGENT_DEFAULT_TIMEOUT", None)
+        if env_subagent_timeout is not None and env_subagent_timeout.strip():
+            try:
+                object.__setattr__(
+                    self,
+                    "subagent_default_timeout",
+                    float(env_subagent_timeout.strip()),
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "环境变量 MINI_DEERFLOW_SUBAGENT_DEFAULT_TIMEOUT 必须为数字，"
+                    f"当前值: {env_subagent_timeout!r}"
+                ) from exc
         # TRACE-01：Trace 采集与落盘
         env_trace_enabled = _get_env("TRACE_ENABLED", None)
         if env_trace_enabled is not None and env_trace_enabled.strip():

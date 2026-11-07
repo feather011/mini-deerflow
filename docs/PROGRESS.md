@@ -5684,3 +5684,125 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
   仍为 OPEN —— 其内容已由 #10 **全部包含**在 master 中，保留待人工处置，
   不擅自丢弃任何独有改动。
 - **CI 未验证**：GitHub 上没有实际运行过 `.github/workflows/pr-checks.yml`。
+
+---
+
+## Subagent 首版闭环（2026-11-08）
+
+- **任务 ID**：SUBAGENT-V1
+- **会话标识**：claude-worker-20261108-subagent-v1
+- **目标版本**：master（基线 `0103715`）
+- **状态**：READY_FOR_REVIEW（实现完成，定向测试通过；真实模型未验证）
+- **分支**：master（本地直改，worktree `D:/tmp/master-smoke-010ef33`）
+
+### 本轮范围
+
+主 Agent 派发 → 子 Agent 独立执行 → 结果回到原会话 → 主 Agent 继续整合。
+首版只做只读子任务；**不引入外部框架**、不接 `lead_agent/`、不做递归派发与任务恢复。
+
+### 方案决策（已确认，不再重开）
+
+| 项 | 决策 | 依据 |
+|---|---|---|
+| 执行主体 | 自有 `SubagentManager`/`SubagentRunner` 承担**只读**子任务；harnessagent 继续**独占编码执行**（只经 `project_execute`）；`lead_agent/` 不接入不维护 | 现有实现已自带隔离上下文/预算链/取消超时/Trace 父子/权限不超父/结果回传；框架只能替换「谁跑模型循环」，却要新写五处适配，等于框架外再套一层生命周期 |
+| 权限 | **有效权限 = 父任务实际权限 ∩ 服务端只读上限 ∩ `MINI_SUBAGENT` 主体策略** | 上限只做减法；固定白名单不得授予父任务没有的项目访问权；项目绑定只从父线程反查继承，模型参数不可更换 |
+| 工具上限 | `calculator` / `history_search` / `history_read` / `task_note` / `project_read_file` / `project_glob` / `project_grep` | 刻意不含 `project_execute`（编码由 harnessagent 独占）、`sandbox_*`（本地命令）、`subagent_*`（不可递归）、`mcp__*`（副作用不可预知） |
+| 执行模型 | 同步等待 + SSE 子任务事件 | `subagent_submit` 一次调用完成闭环；等待期间响应父取消 |
+| 派发触发 | 模型自主决定；普通会话可派发 | 委派本身不产生外部副作用；子 Agent 权限另行收窄 |
+| 取消边界 | 协作式令牌：拦**后续**模型/工具调用，**不保证**中断进行中的调用 | 文案与测试按此口径，不写成「进行中调用已被强制中断」 |
+| G6 收口 | **保存后能通过 API 重读，浏览器刷新后恢复卡片**；仅加字段不算解决 | 已实现并验证 |
+
+### 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/mini_deerflow/subagent_policy.py` | **新增**：服务端只读上限常量 + `compute_child_capabilities()` / `compute_child_tools()`（交集计算）+ 禁列兜底 |
+| `src/mini_deerflow/subagent_runs.py` | **新增**：子任务记录形状 + `build_subagent_run_record()` / `append_subagent_run()`（含截断，记录数有界） |
+| `src/mini_deerflow/subagent_tools.py` | `_SubmitHandler` 注入真实 model/registry；权限交集计算；**同步等待**结果；父取消 → `Manager.cancel`；记录落库；工具 schema **不含** `allowed_tools` |
+| `src/mini_deerflow/subagent_executor.py` | `SubagentManager` 接 `run_event_broker`；`_run_task` 发 `subagent.started` / `subagent.completed` / `subagent.failed`（手工发，子代理不走中间件管线） |
+| `src/mini_deerflow/tool_contracts.py` | 补 `subagent_status`/`collect`/`cancel` 三个 metadata + 策略收录；calculator 放行 `MINI_SUBAGENT`；「仅 `DELEGATES_SUBAGENT` 不弹确认」显式豁免 |
+| `src/mini_deerflow/tool_authorization.py` | `session_capabilities()` 加 `SUBAGENT_DELEGATE`（普通会话也持有） |
+| `src/mini_deerflow/agent.py` | 两处内联能力集改调 `session_capabilities()`（消除重复定义）；`_merge_latest_run_result()` 扩展为**按 task_id 逐条合并** `subagent_runs`，防 FinalAnswer 旧快照覆盖 |
+| `src/mini_deerflow/thread_state.py` | `SCHEMA_VERSION` 2→3；新增 `subagent_runs` 字段；`from_dict` 兼容 v1/v2 |
+| `src/mini_deerflow/runtime.py` | `run_event_broker` 创建**提前**到 Manager 之前；manager 接 broker；`create_subagent_tools` 注入真实 model/registry/父可见工具集 |
+| `src/mini_deerflow/api/config.py` | `ApiSettings` 加 `subagent_enabled` 等 4 项 + env（`MINI_DEERFLOW_SUBAGENT_ENABLED` 等），**默认关闭** |
+| `src/mini_deerflow/api/app.py` | 把开关透传进 `RuntimeConfig` |
+| `src/mini_deerflow/api/schemas/streaming.py` | `RunEventType` 增 3 个 `subagent.*`；`RunEvent` 增 `subagent_task_id`/`subagent_status`/`subagent_instruction`/`subagent_output` |
+| `src/mini_deerflow/api/schemas/threads.py` + `api/routes/threads.py` | `ThreadDetail` 增 `subagent_runs`，路由透出（G6 的 API 重读入口） |
+| `src/mini_deerflow/cli.py` | CLI 与 API 走同一 env 开关 |
+| `frontend/src/shared/types/events.ts` | 事件类型扩 3 个 + 4 个子任务字段 |
+| `frontend/src/shared/types/threads.ts` | `ThreadDetail` 增 `subagent_runs` + `SubagentRunRecord` |
+| `frontend/src/features/subagents/useSubagentCards.ts` | **新增**：SSE 事件 + 持久化记录按 task_id 合并（持久化优先） |
+| `frontend/src/features/subagents/SubagentCard.tsx` / `SubagentCardList.tsx` / `SubagentCard.module.css` | **新增**：聊天区子任务卡 |
+| `frontend/src/features/threads/AgentChatPanel.tsx` | 在 `MessageList` 下方挂 `SubagentCardList`（与确认卡同位） |
+| `frontend/src/features/threads/runProgress.ts` | 补 `subagent.*` 分支（状态行不落后） |
+| `frontend/src/features/inspector/realTaskAdapter.ts` | 补 `SSE_EVENT_LABELS` 三条（否则 typecheck 断） |
+
+### 接口变化
+
+- `ThreadState`：新增 `subagent_runs: list[dict]`，`SCHEMA_VERSION` 2→3（**向前兼容**：v1/v2 数据读回 `[]`）。
+- `ThreadDetail`（API）：新增 `subagent_runs`（默认 `[]`）。
+- `RunEventType`：新增 `subagent.started` / `subagent.completed` / `subagent.failed`。
+- `RuntimeConfig.subagent_enabled` / `ApiSettings.subagent_enabled`：新增，**默认 `False`**；
+  用 `MINI_DEERFLOW_SUBAGENT_ENABLED=1` 开启。
+- `create_subagent_tools()` 新增可选参数 `model` / `registry` / `parent_tool_names`。
+- `SubagentManager.__init__` 新增可选参数 `run_event_broker`。
+
+### 验证命令与实际结果
+
+| 验证 | 命令 | 结果 |
+|---|---|---|
+| Subagent 定向测试（新增） | `pytest tests/test_subagent_wiring.py` | **14 passed** |
+| G6 API 重读（新增） | `pytest tests/test_subagent_runs_api.py` | **3 passed** |
+| 端到端链路（新增） | `pytest tests/test_subagent_e2e_flow.py` | **1 passed** |
+| Trace 父子链 | `pytest tests/test_trace_chain.py` | **31 passed** |
+| Subagent + 授权 + 序列化 + API 回归 | `pytest tests/test_subagent_executor.py tests/test_subagent_integration.py tests/test_subagent_allowed_tools.py tests/test_subagent_models.py tests/test_tool_contracts.py tests/test_tool_authorization.py tests/test_tool_authorization_integration.py tests/test_serialization.py tests/test_api_threads.py tests/test_agent_run_result_persistence.py tests/test_api_e2e.py` | **250 passed, 3 failed**（3 项为既有 MCP 失败） |
+| 后端全量 | `pytest tests/` | **3718 passed, 15 failed, 15 skipped, 42 subtests** |
+| **失败集合差分** | 基线（`git stash`）跑同一批 → `diff` 两份 FAILED 清单 | **逐条完全一致 → 本轮未引入任何新失败** |
+| 前端 typecheck | `npm run typecheck` | **通过** |
+| 前端全量测试 | `npx vitest run` | **45 files / 553 tests passed** |
+| 子任务卡前端测试（新增） | `npx vitest run src/features/subagents/` | **12 passed**（8 hook + 4 组件） |
+| 开关行为 | 脚本核查 `ApiSettings` / `create_runtime` | 默认 `False`（不注册工具、`manager=None`）；env=1 → 注册 4 个工具、`manager` 就绪 |
+| 取消真停机硬证据 | 脚本核查 `manager._tokens[tid].is_cancelled()` | **True**（终态 `CANCELLED`，不只是终态标记） |
+
+**15 项失败全部是既有失败**（`test_mcp.py` 11 + `test_phase21b_events.py` 1 +
+`test_subagent_allowed_tools.py` 3；根因是 MCP server 启动环境问题），
+已用 `git stash` 切回基线跑同一批做**失败集合差分**，两份清单逐条完全一致。
+
+### 取消边界（如实记录）
+
+父取消 → `Manager.cancel(task_id)` → 子任务**自己的** `CancellationToken` 置位
+（脚本核查为 `True`）→ 子代理在**模型调用前 / 工具调用前**检查该令牌。
+
+因此可保证的是：**取消之后不再发起新的模型/工具调用**；
+**不能证明进行中的那次调用已被强制中断**。测试分三项分别断言：
+①父令牌被观测并触发 `Manager.cancel` ②子任务终态（非 `SUCCEEDED`）
+③取消后的后续模型调用次数不再增加。文案与文档按此口径，未写成强制中断。
+
+### 未验证事项
+
+- **真实模型未验证**：全部用脚本模型 + 本地临时资源（零网络、零付费模型）。
+  真实 Provider 下模型是否真的愿意派发子任务、派发时机是否合适，**未验证**。
+- **浏览器实机未跑**：本轮前端只做了组件级测试（渲染 + 刷新恢复路径），
+  **未在浏览器里实测刷新后卡片恢复**。G6 的「浏览器刷新后恢复卡片」
+  在**代码路径与组件测试层面已验证**，浏览器端到端 = **未验证**。
+- 真实 harness 路径未跑（需先确认假凭据/本地 mock/禁外网）。
+- `lead_agent/` 未接入（本轮明确不做），6324 行留档不维护。
+
+### 阻塞与决定
+
+- 既有 `test_serialization.py` / `test_api_threads.py` 的常量与字段集合断言
+  因 **schema 2→3** 与 `ThreadDetail` 新字段而更新 —— 是**契约演进**，
+  非放宽断言。
+- `agent.py` 的两处内联能力集改为调用 `session_capabilities()`：
+  内联副本会与 `tool_authorization` 漂移（新增能力时漏改一处即出现
+  「工具不可见」或「越权可见」）。
+- 首版 `subagent_submit` **同步等待**：模型自填 `timeout_seconds` 为 0 时
+  用 Manager 默认超时；等待超时如实返回「子任务可能仍在后台运行」，
+  **不谎称成功**。
+
+### 下一步依赖
+
+- 真实模型实测：确认模型在什么情况下会派发子任务（是否过度派发）。
+- 浏览器实机验收：刷新后子任务卡恢复。
+- 后续可选：子任务结果回灌主 Agent 的摘要策略（当前直接给完整输出摘录）。

@@ -174,6 +174,12 @@ def _default_runtime_factory(
             # （MINI_DEERFLOW_TRACE_PATH）。落盘路径不可写时启动即报错。
             trace_enabled=resolved.trace_enabled,
             trace_path=resolved.trace_path,
+            # Subagent 首版：子 Agent 委派开关（默认关闭）
+            subagent_enabled=resolved.subagent_enabled,
+            subagent_max_concurrency=resolved.subagent_max_concurrency,
+            subagent_max_depth=resolved.subagent_max_depth,
+            subagent_max_tasks_per_parent=resolved.subagent_max_tasks_per_parent,
+            subagent_default_timeout=resolved.subagent_default_timeout,
             disable_budget=True,
             # TOOL-06：网络只读配置
             web_read_timeout_s=resolved.web_read_timeout_s,

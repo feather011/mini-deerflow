@@ -2,6 +2,10 @@
 
 变更（Phase 26）：
 - schema_version → 2：新增 last_run_result 字段（存储最近一次 project_execute 的结果）
+
+变更（Subagent 首版）：
+- schema_version → 3：新增 subagent_runs 字段（存储子任务的指令、终态与结果摘录）。
+  向后兼容：v2 数据没有该字段时读回为空列表。
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ from dataclasses import dataclass, field
 from mini_deerflow.models import Message
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -25,6 +29,14 @@ class ThreadState:
     # 26：存储最近一次 project_execute 的结果 JSON 字符串，
     # 用于页面刷新后恢复 TaskInspector 的文件 diff 展示。
     last_run_result: str | None = None
+    # Subagent 首版：子任务记录（指令 / 终态 / 结果摘录）。
+    #
+    # **独立于 messages**：子任务是父 Agent 派发出去的独立执行单元，
+    # 不是父会话里的一条对话消息。它需要能在**页面刷新后**重新读出
+    # （前端子任务卡），因此必须落库，而不能只留在进程内存里。
+    #
+    # 元素是普通 dict（JSON 可序列化），字段由 subagent_runs.py 定义。
+    subagent_runs: list[dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not isinstance(self.thread_id, str):
@@ -72,6 +84,9 @@ class ThreadState:
         # 26：存储最近一次 project_execute 结果
         if self.last_run_result is not None:
             d["last_run_result"] = self.last_run_result
+        # Subagent 首版：存储子任务记录
+        if self.subagent_runs:
+            d["subagent_runs"] = list(self.subagent_runs)
         return d
 
     @classmethod
@@ -90,8 +105,10 @@ class ThreadState:
             )
         if version != SCHEMA_VERSION:
             # 26：version 1 → 2，新增 last_run_result 字段，v1 数据无此字段
-            if version == 1:
-                pass  # v1 数据缺少 last_run_result，下方 get 返回 None，不影响恢复
+            # Subagent 首版：version 2 → 3，新增 subagent_runs 字段
+            # 旧版本数据缺这些字段时，下方 get 返回 None / []，不影响恢复。
+            if version in (1, 2):
+                pass
             else:
                 raise ValueError(
                     f"未知 schema_version: {version}（当前: {SCHEMA_VERSION}）"
@@ -119,6 +136,24 @@ class ThreadState:
         messages = [Message.from_dict(m) for m in raw_messages]
         project_id = data.get("project_id")
         last_run_result = data.get("last_run_result")
-        thread = cls(thread_id=thread_id, project_id=project_id, last_run_result=last_run_result)
+        # Subagent 首版：v2 数据没有该键 → 空列表
+        raw_runs = data.get("subagent_runs") or []
+        if not isinstance(raw_runs, list):
+            raise ValueError(
+                f"subagent_runs 必须是列表，收到: {type(raw_runs).__name__}"
+            )
+        subagent_runs: list[dict[str, object]] = []
+        for item in raw_runs:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"subagent_runs 元素必须是字典，收到: {type(item).__name__}"
+                )
+            subagent_runs.append(dict(item))
+        thread = cls(
+            thread_id=thread_id,
+            project_id=project_id,
+            last_run_result=last_run_result,
+            subagent_runs=subagent_runs,
+        )
         thread.extend(messages)
         return thread

@@ -1,6 +1,20 @@
 """Subagent 工具适配层（17D 阶段）。
 
 将 SubagentManager 的能力包装为 Tool，供父 Agent 调用。
+
+首版闭环的关键约定：
+- **同步等待**：``subagent_submit`` 提交后**等待**子任务完成再返回结果，
+  主 Agent 因此在一次工具调用里就拿到子 Agent 的产出，无需再调 collect。
+  等待期间**响应父取消**：父任务被停止时调用 ``Manager.cancel``，
+  子任务随即在自己的 token 检查点退出（取消边界见下）。
+- **权限取交集**：子任务的有效权限 = 父任务实际权限 ∩ 服务端只读上限
+  ∩ 子执行主体策略。计算逻辑在 ``subagent_policy``，模型无法影响。
+- **结果落库**：子任务记录写进父线程的 ``ThreadState.subagent_runs``，
+  页面刷新后仍能读出（G6）。
+
+取消边界的**准确描述**：取消令牌是**协作式**的 —— 子代理在模型调用前、
+工具调用前检查令牌。因此取消能阻止**后续**的模型／工具调用，但**不能证明
+进行中的调用已被强制中断**。文案与测试都按这个口径写。
 """
 
 from __future__ import annotations
@@ -17,6 +31,14 @@ from mini_deerflow.subagent_models import (
     SubagentContextPolicy,
     SubagentResult,
     TaskStatus,
+)
+from mini_deerflow.subagent_policy import (
+    compute_child_capabilities,
+    compute_child_tools,
+)
+from mini_deerflow.subagent_runs import (
+    append_subagent_run,
+    build_subagent_run_record,
 )
 from mini_deerflow.tools import Tool, ToolRegistry
 
@@ -87,10 +109,13 @@ def _check_int(args: dict, name: str, field: str, min_val: int | None = None) ->
 
 
 class _SubmitHandler:
-    """subagent_submit handler。"""
+    """subagent_submit handler。
+
+    一次调用完成完整闭环：派发 → 子 Agent 独立执行 → 结果回传 → 记录落库。
+    """
     __slots__ = (
         "_manager", "_parent_run_id", "_parent_thread_id", "_depth",
-        "_thread_store", "_model", "_registry",
+        "_thread_store", "_model", "_registry", "_parent_tool_names",
     )
 
     def __init__(
@@ -102,6 +127,7 @@ class _SubmitHandler:
         thread_store: "InMemoryThreadStore | None" = None,
         model: "Model | None" = None,
         registry: "ToolRegistry | None" = None,
+        parent_tool_names: tuple[str, ...] | None = None,
     ) -> None:
         self._manager = manager
         self._parent_run_id = parent_run_id
@@ -114,6 +140,10 @@ class _SubmitHandler:
         # 不传则沿用 Manager 默认（FakeModel + 空注册表）。
         self._model = model
         self._registry = registry
+        # 父任务本次运行**真正可见**的工具名。子任务工具集 =
+        # 父可见 ∩ 服务端只读上限（见 subagent_policy.compute_child_tools）。
+        # None 表示不限制父侧（取交集时父侧视为全集）。
+        self._parent_tool_names = parent_tool_names
 
     def __call__(self, arguments: dict[str, object], context: object | None = None) -> str:
         tool_name = "subagent_submit"
@@ -140,6 +170,10 @@ class _SubmitHandler:
                 if hasattr(context, "granted_capabilities"):
                     parent_caps = getattr(context, "granted_capabilities") or frozenset()
 
+            # 权限交集（第一步）：父任务实际权限 ∩ 服务端只读上限。
+            # 上限**只做减法** —— 不会因为存在上限常量就授予父任务没有的能力。
+            child_caps = compute_child_capabilities(parent_caps)
+
             # BUDGET-01：父运行的预算（Agent.run 放进 tool_ctx 的那一个）。
             # 子代理必须与父**共享同一个**计数器 —— 子代理的模型/工具消耗
             # 真实计入父运行，父的额度上限对子代理同样生效。
@@ -154,6 +188,13 @@ class _SubmitHandler:
                 ctx_budget = getattr(context, "budget", None)
                 if isinstance(ctx_budget, (Budget, ChildBudget)):
                     parent_budget = ctx_budget
+
+            # 父任务的取消令牌：同步等待期间必须能响应父取消。
+            parent_token = None
+            if context is not None:
+                ctx_token = getattr(context, "cancellation_token", None)
+                if ctx_token is not None and hasattr(ctx_token, "is_cancelled"):
+                    parent_token = ctx_token
 
             # TRACE-01：父侧工具 span 的 id —— 子代理的 SUBAGENT_TASK span
             # 挂在它下面，于是一次运行里的「模型 → 工具 → 子代理」是一条链。
@@ -175,11 +216,38 @@ class _SubmitHandler:
             include_system = bool(arguments.get("include_system_instruction", False))
             allow_delegation = bool(arguments.get("allow_further_delegation", False))
 
+            # TOOL-02（R2a-1）：从共享 ThreadStore 获取父线程的 project_id，继承项目会话上下文
+            # 项目绑定**只从父线程反查**继承 —— 模型无法通过参数更换项目绑定。
+            parent_project_id: str | None = None
+            if self._thread_store is not None:
+                try:
+                    parent_thread = self._thread_store.get(effective_parent_thread_id)
+                    parent_project_id = getattr(parent_thread, "project_id", None) or None
+                except Exception:
+                    pass  # 非项目会话时 project_id 为 None
+
+            # 权限交集（第二步）：工具集 = 父可见 ∩ 服务端只读上限 ∩
+            # 禁列剔除。结果写进 policy.allowed_tools —— 它在**运行时**由
+            # build_allow_list / filter_tool_specs / ensure_tool_allowed 强制，
+            # 不只是序列化存取。
+            #
+            # 父可见集按**父线程的真实身份**算：普通会话看不到 project_* 工具
+            # （与父 Agent 的 allow list 同一套规则，见 compute_thread_tool_allow_list）。
+            # 注意：allowed_tools **不出现在工具 schema 里**，模型无法传参
+            # 扩大自己的权限。
+            child_tools = compute_child_tools(
+                self._parent_visible_tools(parent_project_id)
+            )
+
             policy = SubagentContextPolicy(
                 include_memory=include_memory,
                 include_skill_context=include_skill,
                 include_system_instruction=include_system,
-                allow_further_delegation=allow_delegation,
+                allowed_tools=child_tools,
+                # 不可递归：即使模型传 allow_further_delegation=True，
+                # 服务端也不给子任务继续派发的能力（child_caps 已剔除
+                # SUBAGENT_DELEGATE，且子任务工具集不含 subagent_*）。
+                allow_further_delegation=False,
             )
 
             # BUDGET-01：模型自填的局部上限**只能收紧，不能扩额**。
@@ -199,6 +267,7 @@ class _SubmitHandler:
             budget = build_child_budget(parent_budget, local_budget)
 
             # TOOL-02（R2a-1）：从共享 ThreadStore 获取父线程的 project_id，继承项目会话上下文
+            # 项目绑定**只从父线程反查**继承 —— 模型无法通过参数更换项目绑定。
             parent_project_id: str | None = None
             if self._thread_store is not None:
                 try:
@@ -217,22 +286,175 @@ class _SubmitHandler:
                 model=self._model,
                 registry=self._registry,
                 context_policy=policy,
-                parent_granted_capabilities=parent_caps,
+                # 子任务继承**收窄后**的能力（父 ∩ 上限），不是父的全部能力。
+                parent_granted_capabilities=child_caps,
                 parent_project_id=parent_project_id,
                 # TRACE-01：子代理 span 的父节点
                 parent_span_id=parent_span_id,
             )
 
+            # 首版闭环：提交后**同步等待**子任务完成，父 Agent 在这一次
+            # 工具调用里就拿到结果。等待期间响应父取消。
+            result = self._await_result(
+                task.task_id,
+                timeout=timeout if timeout else None,
+                parent_token=parent_token,
+            )
+
+            record = self._build_record(task, result)
+            self._persist(effective_parent_thread_id, record)
+
+            if result is None:
+                # 等待超时：子任务可能仍在跑，如实告知，不谎称成功。
+                return _ok(
+                    task_id=task.task_id,
+                    status=task.status.name,
+                    collected=False,
+                    reason="等待子任务超时，子任务可能仍在后台运行",
+                )
+
             return _ok(
-                task_id=task.task_id,
-                status=task.status.name,
-                created_at=task.created_at,
+                task_id=result.task_id,
+                status=result.terminal_status.name,
+                output=result.output,
+                succeeded=result.succeeded,
+                duration=result.duration,
+                error_type=result.error_type,
+                error_message=result.error_message,
             )
 
         except SubagentToolError:
             raise
         except Exception as e:
             return _error(tool_name, type(e).__name__, str(e))
+
+    def _parent_visible_tools(self, parent_project_id: str | None) -> tuple[str, ...]:
+        """父任务本次运行真正可见的工具名。
+
+        这是权限交集的**父侧**：子任务能用什么，先得是父能用的。
+
+        计算方式与父 Agent 的 allow list **同一套规则**
+        （``compute_thread_tool_allow_list``）：普通会话看不到 ``project_*``
+        工具，项目会话可见全部。父侧基数取自构造时传入的
+        ``parent_tool_names``（通常是注册表全量），再按会话身份收窄。
+        """
+        base = self._parent_tool_names
+        if base is None:
+            # 未提供父侧基数（直接构造 handler 的场景）：
+            # 用注册表当前的全部工具。
+            if self._registry is None:
+                return ()
+            base = tuple(t.name for t in self._registry.list_tools())
+        if parent_project_id is None:
+            # 普通会话：父看不到 project_* 工具
+            return tuple(n for n in base if not n.startswith("project_"))
+        return base
+
+    def _await_result(
+        self,
+        task_id: str,
+        *,
+        timeout: float | None,
+        parent_token: Any | None,
+    ) -> SubagentResult | None:
+        """等待子任务完成；父取消时**取消子任务**并返回其终态。
+
+        返回 None 表示等待超时（子任务可能仍在跑）。
+
+        取消边界（准确口径）：``Manager.cancel`` 置位子任务自己的令牌，
+        子代理在**模型调用前 / 工具调用前**检查它 —— 因此取消能阻止
+        **后续**调用，但不能证明**进行中**的调用已被强制中断。
+        """
+        deadline = (
+            time.monotonic() + timeout if timeout and timeout > 0 else None
+        )
+        while True:
+            # 父已取消 → 立刻取消子任务，不让它继续跑
+            if parent_token is not None and parent_token.is_cancelled():
+                self._manager.cancel(task_id)
+                # 给子任务一点时间收口（它会在下一个检查点退出）
+                return self._collect_with_grace(task_id)
+
+            status = self._manager.get_status(task_id)
+            if status in {
+                TaskStatus.SUCCEEDED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.TIMED_OUT,
+            }:
+                return self._collect_now(task_id)
+
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+
+            # 短轮询：让出 GIL，让子任务线程推进
+            time.sleep(0.05)
+
+    def _collect_now(self, task_id: str) -> SubagentResult | None:
+        try:
+            return self._manager.collect(task_id, timeout=0)
+        except (KeyError, TimeoutError):
+            return None
+
+    def _collect_with_grace(self, task_id: str) -> SubagentResult | None:
+        """取消后短暂等待子任务收口，取它的终态。"""
+        grace_deadline = time.monotonic() + 2.0
+        while time.monotonic() < grace_deadline:
+            result = self._collect_now(task_id)
+            if result is not None:
+                return result
+            time.sleep(0.05)
+        return self._collect_now(task_id)
+
+    def _build_record(
+        self,
+        task: Any,
+        result: SubagentResult | None,
+    ) -> dict[str, Any]:
+        """构造可持久化的子任务记录。"""
+        if result is not None:
+            status = result.terminal_status.name
+            output = result.output
+            error_type = result.error_type
+            error_message = result.error_message
+            started_at = result.started_at
+            finished_at = result.finished_at
+            duration = result.duration
+        else:
+            status = task.status.name
+            output = ""
+            error_type = None
+            error_message = None
+            started_at = getattr(task, "started_at", None)
+            finished_at = getattr(task, "finished_at", None)
+            duration = None
+        return build_subagent_run_record(
+            task_id=task.task_id,
+            instruction=task.instruction,
+            status=status,
+            output=output,
+            error_type=error_type,
+            error_message=error_message,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration,
+            parent_run_id=task.parent_run_id,
+        )
+
+    def _persist(self, parent_thread_id: str, record: dict[str, Any]) -> None:
+        """把子任务记录写进父线程的 ThreadState。
+
+        写失败**不影响**主流程：记录只是给人看的可追溯信息，
+        不能因为落库失败就让整个 run 失败。
+        """
+        if self._thread_store is None:
+            return
+        try:
+            thread = self._thread_store.get(parent_thread_id)
+            append_subagent_run(thread, record)
+            self._thread_store.save(thread)
+        except Exception:
+            pass
 
 
 class _StatusHandler:
@@ -376,38 +598,55 @@ def create_subagent_tools(
     parent_run_id: str,
     parent_thread_id: str,
     thread_store: "InMemoryThreadStore | None" = None,
+    model: "Model | None" = None,
+    registry: "ToolRegistry | None" = None,
+    parent_tool_names: tuple[str, ...] | None = None,
 ) -> list[Tool]:
-    """创建 4 个 Subagent 工具。"""
+    """创建 4 个 Subagent 工具。
+
+    Args:
+        manager: 子任务管理器。
+        parent_run_id / parent_thread_id: 父运行的标识（工具调用时会
+            从执行上下文覆盖为真实值）。
+        thread_store: 共享的线程仓库 —— 用于反查项目绑定与落库子任务记录。
+        model: 子任务使用的模型。**必须传入真实模型**，否则子代理会
+            退化成 FakeModel（只会算数，不会真的干活）。
+        registry: 子任务使用的工具注册表。
+        parent_tool_names: 父任务本次运行真正可见的工具名 —— 子任务
+            工具集 = 父可见 ∩ 服务端只读上限。None 表示父侧不限制。
+    """
     return [
         Tool(
             name="subagent_submit",
             description=(
-                "提交一个子 Agent 任务（委派执行）。"
-                "返回 task_id 和 queued/running 状态。"
-                "使用 subagent_collect 回收结果。"
+                "委派一个独立子任务给子 Agent 执行。"
+                "子 Agent 在隔离上下文中工作，只能使用只读工具"
+                "（计算、会话历史、项目只读检索），"
+                "不能写文件、不能执行命令、不能继续派发子任务。"
+                "本工具会等待子任务完成后返回结果。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "instruction": {
                         "type": "string",
-                        "description": "子任务的指令",
+                        "description": "子任务的指令（要独立完成的具体任务）",
                     },
                     "timeout_seconds": {
                         "type": "integer",
-                        "description": "超时秒数（默认使用系统配置）",
+                        "description": "等待子任务完成的超时秒数",
                     },
                     "max_steps": {
                         "type": "integer",
-                        "description": "最大 Agent 步数",
+                        "description": "子 Agent 最大步数",
                     },
                     "max_model_calls": {
                         "type": "integer",
-                        "description": "最大模型调用次数",
+                        "description": "子 Agent 最大模型调用次数",
                     },
                     "max_tool_calls": {
                         "type": "integer",
-                        "description": "最大工具调用次数",
+                        "description": "子 Agent 最大工具调用次数",
                     },
                     "include_memory": {
                         "type": "boolean",
@@ -419,9 +658,19 @@ def create_subagent_tools(
                     },
                 },
                 "required": ["instruction"],
+                # 注意：**没有** allowed_tools 字段 —— 子任务的工具集由
+                # 服务端固定上限决定，模型不能通过参数扩大自己的权限。
                 "additionalProperties": False,
             },
-            handler=_SubmitHandler(manager, parent_run_id, parent_thread_id, thread_store=thread_store),
+            handler=_SubmitHandler(
+                manager,
+                parent_run_id,
+                parent_thread_id,
+                thread_store=thread_store,
+                model=model,
+                registry=registry,
+                parent_tool_names=parent_tool_names,
+            ),
             needs_context=True,
         ),
         Tool(

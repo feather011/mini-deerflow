@@ -34,6 +34,7 @@ from mini_deerflow.tool_contracts import ExecutorPrincipal
 if TYPE_CHECKING:
     # 仅用于类型注解：运行时不导入，避免把上下文工程层拖进 Subagent 的导入链
     from mini_deerflow.context_assembler import ContextAssembler
+    from mini_deerflow.api.services.event_broker import RunEventBroker
 from mini_deerflow.subagent_models import (
     SubagentContextPolicy,
     SubagentResult,
@@ -50,6 +51,57 @@ from mini_deerflow.tools import (
     filter_tool_specs,
 )
 from mini_deerflow.tool_authorization import ToolPolicyRegistry
+
+
+# --- SSE（Subagent 首版） ---
+#
+# 子代理**不走中间件管线**（没有 pipeline），因此它的生命周期事件
+# 由 Manager **手工**发布到 broker —— 与父运行的 SSE 同一条流，
+# 前端能在同一个事件流里看到「主 Agent 派了个子任务、子任务跑完了」。
+#
+# 事件按**父 run_id** 发布（父订阅的是父 run 的队列），
+# thread_id 用**父线程** —— 这样前端能把它归到正确的会话里。
+
+def _publish_subagent_event(
+    broker: "RunEventBroker | None",
+    *,
+    run_id: str,
+    thread_id: str,
+    event_type: "RunEventType",
+    task_id: str,
+    status: str,
+    instruction: str = "",
+    output: str = "",
+) -> None:
+    """手工发一条子任务 SSE 事件。
+
+    broker 为 None（未启用 SSE）或没有订阅者时静默跳过 ——
+    子任务的执行结果不依赖事件流，事件只是给用户看的进度。
+    """
+    if broker is None or not run_id:
+        return
+    try:
+        from mini_deerflow.api.schemas.streaming import RunEvent, RunEventType
+
+        seq = broker.next_sequence(run_id)
+        broker.publish(
+            run_id,
+            RunEvent(
+                run_id=run_id,
+                thread_id=thread_id,
+                event_type=event_type,
+                sequence=seq,
+                operation="subagent",
+                subagent_task_id=task_id,
+                subagent_status=status,
+                subagent_instruction=instruction or None,
+                subagent_output=output or None,
+            ),
+        )
+    except Exception:
+        # 事件发布失败**不影响**子任务本身：结果回传走的是
+        # Manager.collect，不经过事件流。
+        pass
 
 
 # --- Budget ---
@@ -747,6 +799,9 @@ class SubagentManager:
         thread_store: ThreadStore | None = None,
         # TRACE-01：Trace sink。子代理不走中间件管线，span 由本模块手工发。
         trace_sink: "TraceSink | None" = None,
+        # Subagent 首版：SSE broker。子任务生命周期事件手工发到这里，
+        # 与父运行的 SSE 同一条流。None = 不发事件。
+        run_event_broker: "RunEventBroker | None" = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency 必须 >= 1")
@@ -772,6 +827,8 @@ class SubagentManager:
         self._store = thread_store
         # TRACE-01：Trace sink（子代理的 span 手工发，不走中间件管线）
         self._trace_sink = trace_sink
+        # Subagent 首版：SSE broker（子任务生命周期事件手工发）
+        self._run_event_broker = run_event_broker
 
         self._lock = threading.Lock()
         self._tasks: dict[str, SubagentTask] = {}
@@ -908,7 +965,11 @@ class SubagentManager:
 
         if should_cancel:
             self._mark_task_cancelled(task.task_id)
+            self._emit_task_event(task, TaskStatus.CANCELLED, "")
             return
+
+        # Subagent 首版：发出「子任务开始」事件（父 SSE 流可见）。
+        self._emit_task_event(task, TaskStatus.RUNNING, "", started=True)
 
         try:
             # 父子共享 Budget 优先：所有 Model/Tool 调用都受其约束
@@ -941,6 +1002,16 @@ class SubagentManager:
                 self._tasks[task.task_id] = runner.task
                 self._results[task.task_id] = result
 
+            # Subagent 首版：发出「子任务结束」事件。
+            # 终态如实反映 —— 失败/取消/超时都发 FAILED 事件并带上真实状态，
+            # **不谎报成功**。
+            self._emit_task_event(
+                task,
+                result.terminal_status,
+                result.output,
+                error_type=result.error_type,
+            )
+
         except Exception as e:
             with self._lock:
                 task_obj_ref = self._tasks.get(task.task_id) if task_obj is None else task_obj
@@ -959,6 +1030,41 @@ class SubagentManager:
                         error_type=type(e).__name__,
                         error_message=str(e),
                     )
+            self._emit_task_event(task, TaskStatus.FAILED, "", error_type=type(e).__name__)
+
+    def _emit_task_event(
+        self,
+        task: SubagentTask,
+        status: TaskStatus,
+        output: str,
+        *,
+        started: bool = False,
+        error_type: str | None = None,
+    ) -> None:
+        """发一条子任务 SSE 事件（父 run 的流）。"""
+        broker = self._run_event_broker
+        if broker is None:
+            return
+        from mini_deerflow.api.schemas.streaming import RunEventType
+
+        if started:
+            event_type = RunEventType.SUBAGENT_STARTED
+        elif status == TaskStatus.SUCCEEDED:
+            event_type = RunEventType.SUBAGENT_COMPLETED
+        else:
+            # 失败 / 取消 / 超时都归到 FAILED 事件，但 subagent_status
+            # 字段带真实终态，前端据此区分。
+            event_type = RunEventType.SUBAGENT_FAILED
+        _publish_subagent_event(
+            broker,
+            run_id=task.parent_run_id,
+            thread_id=task.parent_thread_id,
+            event_type=event_type,
+            task_id=task.task_id,
+            status=status.name,
+            instruction=task.instruction,
+            output=output,
+        )
 
     def get_status(self, task_id: str) -> TaskStatus:
         """查询任务状态。未知任务抛出 KeyError。"""

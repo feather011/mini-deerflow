@@ -112,6 +112,12 @@ class RuntimeConfig:
     """运行时配置。"""
     # Subagent
     subagent_enabled: bool = False
+    """是否启用子 Agent 委派。
+
+    启用后主 Agent 会在工具列表里看到 ``subagent_submit``，可把独立子任务
+    派给子 Agent。子 Agent 的权限由**服务端固定上限**约束（只读），
+    不随模型参数变化 —— 见 ``subagent_policy.py``。
+    """
     subagent_max_concurrency: int = 2
     subagent_max_depth: int = 3
     subagent_max_tasks_per_parent: int = 10
@@ -855,6 +861,12 @@ def create_runtime(
     # TOOL-02：创建策略注册表（SubagentManager 和 Agent 都需要注入）
     tool_policy_registry = ToolPolicyRegistry(thread_store=store)
 
+    # Subagent 首版：SSE broker 必须在 SubagentManager **之前**创建 ——
+    # Manager 要用它发布子任务生命周期事件（子代理不走中间件管线，
+    # 事件由 Manager 手工发）。原先 broker 在后面创建，顺序要调。
+    run_event_broker = RunEventBroker(queue_maxsize=config.stream_queue_maxsize)
+    run_event_middleware = RunEventMiddleware(run_event_broker, thread_store=store)  # 26: 传入 store 持久化 run.result
+
     # SubagentManager
     manager: SubagentManager | None = None
     if config.subagent_enabled:
@@ -877,13 +889,27 @@ def create_runtime(
             thread_store=store,
             # TRACE-01：子代理的 span 也进同一个 sink —— 与父运行同一条链
             trace_sink=trace_sink,
+            # Subagent 首版：子任务生命周期事件进同一条 SSE 流
+            run_event_broker=run_event_broker,
         )
-        # 注册子任务工具
+        # 注册子任务工具。
+        #
+        # Subagent 首版：注入**真实** model 与 registry —— 否则子代理会
+        # 退化成 FakeModel + 空工具表（只会算数，不会真的干活）。
+        #
+        # parent_tool_names：父任务真正可见的工具名 —— 子任务工具集
+        # = 父可见 ∩ 服务端只读上限（见 subagent_policy）。
+        # 这里传 registry 的全部工具名作为父侧基数：真正的收窄发生在
+        # 子任务侧（上限 ∩ 上限），父侧的真实可见性由子代理的
+        # policy 可见性过滤再兜一层。
         tools = create_subagent_tools(
             manager=manager,
             parent_run_id=run_id,
             parent_thread_id="default",
             thread_store=store,
+            model=agent_model,
+            registry=registry,
+            parent_tool_names=tuple(t.name for t in registry.list_tools()),
         )
         registry.register_many(tools)
 
@@ -921,8 +947,7 @@ def create_runtime(
     # Agent（带 Middleware pipeline：Logging + Trace + Retry + Budget）
     # 19D：额外注入 RunEventMiddleware（同一实例同时挂在 IntegratedAgent.pipeline，
     #     共享 thread-local 栈关联 AGENT_RUN 与 MODEL_CALL/TOOL_CALL）。
-    run_event_broker = RunEventBroker(queue_maxsize=config.stream_queue_maxsize)
-    run_event_middleware = RunEventMiddleware(run_event_broker, thread_store=store)  # 26: 传入 store 持久化 run.result
+    # Subagent 首版：broker 与 middleware 已在上方（SubagentManager 之前）创建。
 
     pipeline_middlewares: list = []
     if budget is not None:

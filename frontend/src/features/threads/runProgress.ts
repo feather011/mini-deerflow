@@ -68,6 +68,12 @@ export function describeRunProgress(
         }
       case 'run.result':
         return { phase: 'result', text: '执行结果已到达，正在汇总…' }
+      case 'subagent.started':
+        return { phase: 'tool', text: '子 Agent 正在执行子任务…' }
+      case 'subagent.completed':
+        return { phase: 'tool', text: '子任务已完成，正在汇总结果…' }
+      case 'subagent.failed':
+        return { phase: 'tool', text: '子任务未成功，正在处理其结果…' }
       case 'run.completed':
         return { phase: 'done', text: '执行完成' }
       case 'run.failed':
