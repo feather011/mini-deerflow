@@ -15,8 +15,10 @@
    指向仓库外时 `resolve()` 已把它带到真实位置，边界检查自然拦下。
 3. **所有输出有上限**：读取字节、行数、glob 条数、grep 命中数与
    单文件扫描字节都封顶，超限只截断并如实标注 truncated。
-4. **纯 Python 检索，无 shell、无子进程**：grep 用 `re` + `os.walk`，
-   参数永远不进命令行拼接。
+4. **只读检索是纯 Python**（grep 用 `re` + `os.walk`，参数永远不进命令行拼接）。
+   执行前后的**快照采集**会调一次只读的 `git ls-files`（固定 argv、无 shell、
+   有超时）—— 快照必须以 Git 的 ignore 规则为准，否则环境目录会淹没 diff。
+   该命令只列举文件，不写仓库、不改索引。
 
 工具结果统一为 JSON（复用 context_shared 的 ok/err 约定）：
 参数类错误 `kind="usage_error"`（模型可改参重试），
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -40,6 +43,10 @@ from mini_deerflow.project_store import (
 )
 from mini_deerflow.thread_store import ThreadNotFoundError, ThreadStore
 from mini_deerflow.tools import Tool
+from mini_deerflow.verification_guard import (
+    evaluate_verification,
+    execution_failed_verdict,
+)
 
 __all__ = [
     "PROJECT_READ_FILE_TOOL_NAME",
@@ -713,9 +720,74 @@ SNAPSHOT_TOTAL_LIMIT = 50 * 1024 * 1024  # 50MB，总采集字节限制
 DIFF_MAX_LINES = 100  # diff 最多展示的行数（超出置 diff_truncated）
 TEXT_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh", ".bat", ".ps1", ".html", ".css", ".sql", ".xml", ".svg", ".c", ".cpp", ".h", ".hpp", ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".r", ".m", ".lua", ".pl", ".pm", ".ex", ".exs", ".erl", ".hrl", ".clj", ".cljs", ".hs", ".fs", ".fsx", ".vb", ".cs", ".fs"}
 
+GIT_LIST_TIMEOUT_SECONDS = 20
+"""`git ls-files` 的超时上限；超时按"拿不到列表"处理（退回目录遍历）。"""
+
+
+def _git_visible_files(root: Path) -> "list[str] | None":
+    """列出 Git 视角下"可见"的文件（相对 root，平台原生分隔符）。
+
+    规则（交给 Git 自己判定，不自己解析 .gitignore）：
+
+    - ``--cached``：**已跟踪**文件。即使后来被 .gitignore 命中也照样列出 ——
+      已跟踪就是仓库的一部分，不能因为后来加了忽略规则就从 diff 里消失。
+    - ``--others --exclude-standard``：**未跟踪且未被 Git ignore** 的文件。
+      .gitignore / .git/info/exclude / core.excludesFile 全部生效。
+
+    不是 Git 仓库、git 不可用、命令失败或超时 → 返回 None，
+    由调用方退回目录遍历（``_snapshot_workspace`` 的 fallback 分支）。
+
+    只读命令、固定 argv、不经过 shell：路径里的空格与特殊字符不会被解释。
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git", "-C", str(root), "ls-files", "-z",
+                "--cached", "--others", "--exclude-standard",
+            ],
+            capture_output=True,
+            timeout=GIT_LIST_TIMEOUT_SECONDS,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    raw = proc.stdout.decode("utf-8", errors="replace")
+    names = [name for name in raw.split("\0") if name]
+    # git 用 "/" 分隔；转成平台原生分隔符，与快照里其它路径保持一致
+    return [str(Path(name)) for name in names]
+
+
+def _walk_snapshot_files(root: Path) -> "list[Path]":
+    """目录遍历（fallback）：跳过 .git，其余文件全部计入。
+
+    只在拿不到 Git 列表时使用 —— 此时无从判断 ignore 规则，
+    宁可多收也不能把"看不见"当成"没有"。
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in filenames:
+            p = Path(dirpath) / name
+            try:
+                if not p.is_file():
+                    continue
+            except OSError:
+                continue
+            found.append(p)
+    return found
+
 
 def _snapshot_workspace(repo_path: "Path") -> dict:
     """采集工作区快照：{path: (is_binary, size, mtime, content|text_preview)}。
+
+    **采集范围以 Git 的 ignore 规则为准**（仓库内时）：已跟踪文件 +
+    未被忽略的未跟踪文件。环境目录（``.venv/``、``.pytest_cache/`` 等）
+    只要被 ignore，就不会进快照，也就不会进 diff —— 快照不是"磁盘全量镜像"。
+
+    不是 Git 仓库（或 git 不可用）时退回目录遍历，结果里用
+    ``ignore_mode`` 标明是哪一种，避免把两种口径混为一谈。
 
     采集失败时返回 complete=False；其余字段尽力返回。
     """
@@ -723,11 +795,19 @@ def _snapshot_workspace(repo_path: "Path") -> dict:
         "files": {},
         "complete": True,
         "error": None,
+        "ignore_mode": "fallback",
     }
     try:
         root = Path(repo_path).resolve()
+        git_names = _git_visible_files(root)
+        if git_names is not None:
+            result["ignore_mode"] = "git"
+            candidates = [root / name for name in git_names]
+        else:
+            candidates = _walk_snapshot_files(root)
+
         total_bytes = 0
-        for p in root.rglob("*"):
+        for p in candidates:
             if not p.is_file():
                 continue
             # 大小限制
@@ -1011,13 +1091,18 @@ def create_project_execute_tool(
 
         # 引导主 Agent 填写任务范围和验收条件（如有）
         scope = arguments.get("scope", "")
-        if isinstance(scope, str) and scope.strip():
-            prompt_parts.append(f"任务范围：{scope.strip()}")
+        scope = scope.strip() if isinstance(scope, str) else ""
         acceptance = arguments.get("acceptance", "")
-        if isinstance(acceptance, str) and acceptance.strip():
-            prompt_parts.append(f"验收条件：{acceptance.strip()}")
+        acceptance = acceptance.strip() if isinstance(acceptance, str) else ""
+        if scope:
+            prompt_parts.append(f"任务范围：{scope}")
+        if acceptance:
+            prompt_parts.append(f"验收条件：{acceptance}")
 
         prompt = "\n\n".join(prompt_parts)
+
+        # 交接要素盘点：让"边界没交过去"这件事在会话内可见（此前是静默缺口）
+        handover = _build_handover(context_raw, scope, acceptance)
 
         # 快照：持有项目锁后采集执行前基线（所有终态都需要）
         baseline = _snapshot_workspace(repo_path)
@@ -1061,9 +1146,20 @@ def create_project_execute_tool(
             changes = _diff_snapshots(baseline, after, repo_path)
             changes["baseline_complete"] = baseline_complete
             changes["snapshot_complete"] = after_complete
+            # 采集口径：git = 按 Git ignore 规则；fallback = 非 Git 仓库，退回目录遍历
+            changes["snapshot_ignore_mode"] = after.get("ignore_mode", "fallback")
+
+            # 验证判定（Guard）：**status=completed 只说明执行器跑完了**，
+            # 不代表用户的验收条件已经满足。结论一律由代码从证据算出 ——
+            # 模型只能转述，不能自己判定"已完成"。
+            verification = _build_verification(result)
+            guard = evaluate_verification(
+                verification,
+                acceptance,
+                has_changes=bool(changes.get("files")),
+            )
 
             if result.status == STATUS_COMPLETED:
-                verification = _build_verification(result)
                 body = {
                     "ok": True,
                     "status": "completed",
@@ -1071,6 +1167,9 @@ def create_project_execute_tool(
                     "answer": result.final_answer,
                     "files_written": result.files_written,
                     "verification": verification,
+                    "guard": guard,
+                    "acceptance": acceptance,
+                    "handover": handover,
                     "changes": changes,
                     "tool_events": [
                         {
@@ -1090,7 +1189,10 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": _build_verification(result),
+                    "verification": verification,
+                    "guard": guard,
+                    "acceptance": acceptance,
+                    "handover": handover,
                     "changes": changes,
                     "error": _executor_error(result.error, "任务被停止"),
                     "tool_events": [
@@ -1108,7 +1210,10 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": _build_verification(result),
+                    "verification": verification,
+                    "guard": guard,
+                    "acceptance": acceptance,
+                    "handover": handover,
                     "changes": changes,
                     "error": f"执行超时（{runner._timeout_seconds}s），任务已被终止",
                     "tool_events": [
@@ -1119,21 +1224,25 @@ def create_project_execute_tool(
                 }
                 return ok_response(**body)
             elif result.status == STATUS_LAUNCH_FAILED:
-                return err_response(
+                return _err_with_guard(
                     "execute",
                     _executor_error(result.error, "执行器启动失败，请检查执行器配置"),
-                    kind="error",
-                    code=PROJECT_TOOL_CODES["launch_failed"],
+                    PROJECT_TOOL_CODES["launch_failed"],
+                    execution_failed_verdict(
+                        "执行器启动失败，本轮没有任何验证证据"
+                    ),
                 )
             elif result.status == STATUS_PROTOCOL_ERROR:
-                return err_response(
+                return _err_with_guard(
                     "execute",
                     _executor_error(
                         result.error,
                         f"执行器协议错误（{result.unmapped_lines} 行非法输出）",
                     ),
-                    kind="error",
-                    code=PROJECT_TOOL_CODES["protocol_error"],
+                    PROJECT_TOOL_CODES["protocol_error"],
+                    execution_failed_verdict(
+                        "执行器协议错误，本轮没有任何可采信的验证证据"
+                    ),
                 )
             else:  # STATUS_FAILED / unknown
                 body = {
@@ -1143,7 +1252,10 @@ def create_project_execute_tool(
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": _build_verification(result),
+                    "verification": verification,
+                    "guard": guard,
+                    "acceptance": acceptance,
+                    "handover": handover,
                     "changes": changes,
                     "error": _executor_error(
                         result.error, f"执行失败（{result.status}）"
@@ -1163,10 +1275,15 @@ def create_project_execute_tool(
         description=(
             "在绑定仓库内执行编码任务（调用 harness 执行器）。"
             "当任务涉及创建文件、修改代码、运行程序或验证输出时，应使用本工具。"
-            "task 为任务描述；context 为补充背景（如相关文件、之前的讨论等）。"
-            "scope 为任务范围约束（可选，如'单文件输出'）；"
-            "acceptance 为验收条件（可选，如'运行后输出正确'）。"
-            "返回包含 files_written、verification（含退出码）和 changes diff。"
+            "四个参数各有分工：task 写要达成的目标；"
+            "context 写用户已确认的背景与约束（无则写'无'，不要编造）；"
+            "scope 写范围边界（改哪些文件、明确不做什么）；"
+            "acceptance 写验收条件（跑什么命令、期望什么结果）。"
+            "返回包含 files_written、verification（含退出码）、changes diff、handover"
+            "（本次交接带了哪些要素）与 guard（系统按证据算出的权威验证结论："
+            "verified 验证通过 / unverified 有改动但未验证 / failed 验证失败）。"
+            "**status=completed 只说明执行器跑完了，不代表验收条件已满足** —— "
+            "汇报结论一律以 guard 为准，不要自己复述未验证的结果。"
             "已有改动会被保留；不自动提交或推送。只能由项目会话调用。"
         ),
         parameters={
@@ -1198,6 +1315,50 @@ def create_project_execute_tool(
         handler=_as_tool_result("execute", _execute),
         needs_context=True,
     )
+
+
+def _err_with_guard(action: str, error: str, code: str, guard: dict) -> str:
+    """带验证判定的错误响应。
+
+    ``launch_failed`` / ``protocol_error`` 这两条路径拿不到任何验证记录，
+    但它们同样不能让主 Agent 自由写"已完成" —— 所以错误响应里也带
+    ``guard``，让结论闸门有依据可依。
+
+    形状与 ``context_shared.err_response`` 一致（ok/action/error/kind/code），
+    只多一个 ``guard`` 键。
+    """
+    import json
+
+    return json.dumps(
+        {
+            "ok": False,
+            "action": action,
+            "error": error,
+            "kind": "error",
+            "code": code,
+            "guard": guard,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _build_handover(context_raw: str, scope: str, acceptance: str) -> dict:
+    """盘点本次交接实际带了哪些要素，让缺口在会话内可见。
+
+    背景：交接缺口此前是**静默**的 —— 主 Agent 只填 task 时，执行 Agent 仍会
+    收到固定约束规则（`_TASK_RULES`），但"用户确认的边界没有交过去"这件事，
+    主 Agent 和用户都看不到，只能等执行结果不对才发现。
+
+    这里把三要素的到位情况显式放进工具结果：主 Agent 在同一会话里就能看到
+    `missing`，补齐后再派发；用户也能从结果里知道这一轮交接带了什么。
+    """
+    provided = {
+        "context": bool(context_raw.strip()),
+        "scope": bool(scope),
+        "acceptance": bool(acceptance),
+    }
+    missing = [name for name, ok in provided.items() if not ok]
+    return {"provided": provided, "missing": missing, "complete": not missing}
 
 
 def _build_verification(result) -> list[dict]:

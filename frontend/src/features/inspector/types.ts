@@ -27,6 +27,43 @@ export type ValidationStatus =
   | 'interrupted'
   | 'passed'
   | 'failed'
+  | 'unverified'
+
+/**
+ * 后端 Guard 的权威判定。
+ *
+ * 与前端自己按退出码推断的结论**分开建模**：判定以代码算出的 guard 为准，
+ * 前端不得用自己的推断覆盖它（那是"判定与证据对不上"的根源）。
+ */
+export type GuardVerdict = 'verified' | 'unverified' | 'failed'
+
+/** 后端 guard 字段的结构化形态 */
+export interface GuardEvidence {
+  verdict: GuardVerdict
+  /** 后端给的判定标签（如「验证通过」「有改动但未验证」） */
+  label: string
+  /** 判定依据（为什么会是这个结论） */
+  reason: string
+  /** 验收条件是否与实际执行的命令建立了关联；null = 后端没给这个信息 */
+  acceptance_covered: boolean | null
+}
+
+/**
+ * 单条验证命令的结构化证据。
+ *
+ * `exit_code` 为 null 表示**后端没能解析出退出码** —— 必须显示成
+ * 「缺失／未判定」，绝不能当成 0（当成 0 就是把"没读到"说成"通过了"）。
+ */
+export interface VerificationEntry {
+  /** 实际执行的命令 */
+  command: string
+  /** 结构化退出码；null = 缺失 */
+  exit_code: number | null
+  /** 是否通过；null = 退出码缺失，无法判定 */
+  passed: boolean | null
+  /** 命令输出 */
+  output: string | null
+}
 
 /** diff 行类型 */
 export type DiffLineType = 'add' | 'remove' | 'context'
@@ -56,13 +93,28 @@ export interface ChangedFile {
 
 /** 验证证据 */
 export interface ValidationEvidence {
+  /**
+   * 命令证据层面的状态。
+   *
+   * 它**始终**是 guard 的镜像（前端不再自己按退出码推断结论）；
+   * guard 缺失时恒为 'not_run'。
+   */
   status: ValidationStatus
-  /** 实际执行的命令；未运行时为 null */
+  /** 主证据命令（第一条）；没有命令时为 null */
   command: string | null
-  /** 命令输出摘要；没有证据时为 null（UI 不得据此宣称通过） */
+  /** 主证据输出；没有证据时为 null（UI 不得据此宣称通过） */
   output: string | null
   /** 说明文字 */
   note: string
+  /**
+   * 后端 guard 的权威判定。
+   *
+   * null = 这条记录里没有判定字段（旧的执行记录）→ 界面显示「未判定」，
+   * 不得退回"自己按退出码算一个结论"。
+   */
+  guard: GuardEvidence | null
+  /** 逐条验证命令及其结构化退出码 */
+  entries: VerificationEntry[]
 }
 
 /** 过程事件（时间线条目） */
@@ -85,6 +137,16 @@ export interface TaskResult {
   events: TaskEvent[]
   /** 当前展示的 run_id（用于检测新 run 开始时清空旧结果） */
   run_id_marker: string | null
+  /**
+   * 最近一次**执行记录**的状态（来自持久化的 last_run_result）。
+   *
+   * 刷新后没有进行中的 Run（status=no_run），但历史执行结果仍然存在。
+   * 这两个事实必须分开呈现：界面可以说"当前无进行中的运行"，
+   * 但**不能**因此说成"从未执行过"。
+   *
+   * null = 没有任何执行记录。
+   */
+  last_result_status?: string | null
 }
 
 /** 任务结果数据来源：real=真实运行结果，mock=演示数据 */

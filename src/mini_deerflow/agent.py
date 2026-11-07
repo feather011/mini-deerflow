@@ -28,6 +28,7 @@ from mini_deerflow.models import (
     ToolCalls,
 )
 from mini_deerflow.skill_runtime import SkillContextProvider
+from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import ThreadStore
 from mini_deerflow.tools import (
     ToolRegistry,
@@ -42,6 +43,12 @@ from mini_deerflow.tool_authorization import (
     ToolAuthorizationError,
 )
 from mini_deerflow.tool_contracts import ToolCapability, ExecutorPrincipal
+from mini_deerflow.verification_guard import (
+    collect_guard_verdicts,
+    parse_declared_verdict,
+    rewrite_conclusion,
+    summarize_verdicts,
+)
 
 T = TypeVar("T")
 
@@ -80,6 +87,36 @@ PROJECT_SESSION_PROMPT = """项目会话
 
 主 Agent 负责讨论、澄清、派发和汇总；具体写文件/改代码/运行命令交给 harness。
 模型不需要自己模拟执行结果——成功与否以 tool 返回值为准。
+
+## 任务交接契约
+
+**派发前**：目标或边界不清楚时，先向用户澄清并拿到确认，不要自己猜。
+
+**派发时**：project_execute 的四个参数各有分工，不要只填 task：
+- task：这次要达成的目标，写成一句能判断完成与否的话。
+- context：用户已确认的背景与约束（涉及哪些文件、用户明确说过什么）。
+  没有可确认的内容就写"无"，不要编造。
+- scope：范围边界（改哪些文件或目录、明确不做什么）。
+- acceptance：验收条件（跑什么命令、期望什么结果、怎么算通过）。
+
+**汇总时**：最终回答必须写清本轮改了哪些文件（含新增文件）和验证证据
+（跑了什么命令、退出码、关键输出）。证据只认 project_execute 返回的 changes 与
+verification；没跑过或没通过就如实说没验证，不写成已通过。
+
+## 验证结论契约
+
+harness 执行结束（status=completed）**不等于**用户的验收条件已经满足。
+project_execute 的返回值里有 `guard` 字段，是系统按执行证据算出的权威判定：
+
+- `verified`（验证通过）：跑过的验证命令退出码都是 0，且与验收条件对得上。
+- `unverified`（有改动但未验证）：没有跑验证命令、退出码无法解析，
+  或验收条件与实际执行的命令无法建立关联。
+- `failed`（验证失败）：有验证命令退出码非 0。
+
+**汇总时**：最终回答的最后一行必须写结论标签，三选一 ——
+`验证结论：验证通过` / `验证结论：有改动但未验证` / `验证结论：验证失败`，
+且必须与 `guard.verdict` 一致。叙述里不要写"已完成""全部通过"这类
+没有证据支撑的断言。判定以 `guard` 为准：你的判断与它冲突时，以 `guard` 为准。
 """
 
 
@@ -305,6 +342,10 @@ class Agent:
 
         trace: list[dict] = []
 
+        # 验证判定（Guard）：本轮所有执行证据的判定，最后取最保守的一个。
+        # 空列表 = 本轮没有产生任何执行证据 → 不对结论做约束。
+        guard_verdicts: list[dict] = []
+
         for step in range(1, self._max_steps + 1):
             # 步骤预算：每步开始前扣减，超限抛 BudgetExceededError
             if run_budget is not None:
@@ -428,22 +469,56 @@ class Agent:
                 )
 
             if isinstance(decision, FinalAnswer):
-                assistant_message = Message(role="assistant", content=decision.content)
+                # 验证结论一致性闸门：**结论以代码判定为准**。
+                #
+                # harness 跑完 ≠ 验收条件已满足。若模型自述的结论与
+                # 执行证据算出的判定不一致（或压根没给结论），这里纠正它，
+                # 并在 trace 里留下纠正记录 —— 结论与证据对不上时，
+                # 不允许把模型的话原样交给用户。
+                content = decision.content
+                authoritative = summarize_verdicts(guard_verdicts)
+                if authoritative is not None:
+                    content, corrected = rewrite_conclusion(content, authoritative)
+                    if corrected:
+                        trace.append({
+                            "step": step,
+                            "action": "conclusion_corrected",
+                            "detail": {
+                                "declared": parse_declared_verdict(decision.content),
+                                "verdict": authoritative.get("verdict"),
+                                "label": authoritative.get("label"),
+                                "reason": authoritative.get("reason"),
+                            },
+                        })
+
+                assistant_message = Message(role="assistant", content=content)
                 pending.append(assistant_message)
                 trace.append({
                     "step": step,
                     "action": "final_answer",
-                    "detail": decision.content,
+                    "detail": content,
                 })
                 # 原子提交：先全部 extend，再 save
                 thread.extend(pending)
+                # 提交前合并「本轮执行证据」—— 不能用运行开始时的旧快照整份覆盖。
+                #
+                # 旧快照的 last_run_result 是运行开始时的值（通常为 None），
+                # 而 project_execute 的执行证据（diff / verification / guard）
+                # 是**运行途中**由 run_event 中间件写进 store 的。
+                # 直接 save 旧快照会把刚写进去的证据抹掉 → 页面刷新后
+                # 「答案正文还在、结构化证据没了」。
+                #
+                # 这里不是调整保存顺序，而是**显式合并**：以 store 里的最新值为准。
+                # 反过来也修了另一种情况：上一轮遗留的旧证据会被这一轮的空快照
+                # 覆盖掉，害得这一轮的证据丢失。
+                self._merge_latest_run_result(thread_id, thread)
                 self._store.save(thread)
 
                 # 成功后处理记忆（只处理本轮 user Message）
                 if self._memory_processor is not None:
                     self._process_memory(thread_id, user_message, trace)
 
-                return decision.content, trace
+                return content, trace
 
             if isinstance(decision, (ToolCall, ToolCalls)):
                 # 模型可能在**一次响应**里发起多个工具调用（ToolCalls）。
@@ -633,6 +708,8 @@ class Agent:
                         "action": "tool_call",
                         "detail": {"name": call.name, "args": call.arguments, "result": result},
                     })
+                    # 执行类工具的结果里带验证证据 → 收进本轮的判定集合
+                    guard_verdicts.extend(collect_guard_verdicts(result))
 
                     # 喂给模型的这条带 call_id，与上面的 assistant tool_use 配对。
                     # 一次响应多个调用时，这 N 条 tool 消息也必须**连续**（重建时合成
@@ -648,6 +725,31 @@ class Agent:
                     )
 
         raise RuntimeError(f"Agent 在 {self._max_steps} 步内未完成")
+
+    def _merge_latest_run_result(
+        self,
+        thread_id: str,
+        thread: ThreadState,
+    ) -> None:
+        """把 store 里最新的 ``last_run_result`` 合并进待保存的 thread。
+
+        ``last_run_result`` 由 run_event 中间件在**工具调用结束时**写入，
+        与 Agent 的最终保存是两条独立的写路径。Agent 手里的 thread 是
+        运行开始时的快照，直接整份保存会覆盖掉中途写入的证据。
+
+        规则：**store 里的最新值优先**。store 里没有值时保留 thread 自带的
+        （内存实现下两者是同一个对象，本方法即恒等操作）。
+        读 store 失败一律按"保持原样"处理 —— 合并失败不能影响正常收尾。
+        """
+        try:
+            latest = self._store.get(thread_id)
+        except Exception:
+            return
+        if latest is None:
+            return
+        latest_result = getattr(latest, "last_run_result", None)
+        if latest_result:
+            thread.last_run_result = latest_result
 
     def _process_memory(
         self,

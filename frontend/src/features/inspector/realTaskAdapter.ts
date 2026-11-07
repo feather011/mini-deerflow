@@ -15,11 +15,15 @@
 import type {
   ChangedFile,
   DiffLine,
+  GuardEvidence,
+  GuardVerdict,
   TaskAdapter,
   TaskEvent,
   TaskResult,
   TaskStatus,
   ValidationEvidence,
+  ValidationStatus,
+  VerificationEntry,
 } from './types'
 import type { RunEvent, RunEventType } from '../../shared/types/events'
 import type { StreamStatus } from '../threads/useAgentStream'
@@ -65,6 +69,18 @@ export interface ProjectExecuteResult {
   tool_events?: Array<{ name?: string; duration_s?: number }>
   tool_calls?: number
   error?: string
+  /**
+   * 后端按执行证据算出的**权威判定**。
+   *
+   * 旧记录里没有这个字段 → 前端显示「未判定」，
+   * 不用退出码自己推断一个结论出来。
+   */
+  guard?: {
+    verdict?: string
+    label?: string
+    reason?: string
+    acceptance_covered?: boolean | null
+  } | null
 }
 
 const cache: Map<string, TaskResult> = new Map()
@@ -97,6 +113,8 @@ export function ingestRealTaskData(
         command: null,
         output: null,
         note: '执行器输出尚未通过 run.result 事件推送。',
+        guard: null,
+        entries: [],
       },
       files: [],
       events,
@@ -121,11 +139,22 @@ export function ingestRealTaskData(
       command: null,
       output: null,
       note: '执行器输出尚未通过 run.result 事件推送。',
+      guard: null,
+      entries: [],
     }
     existing.files = []
+    // 新一轮开始：上一轮的结果不再是"当前结果"。
+    // （但这不等于"从未执行过"——历史仍由 last_run_result 保留，
+    //   面板在新结果到达前的短暂空窗里显示「暂无运行」是可接受的。）
+    existing.last_result_status = null
   }
   existing.status = status
-  existing.run_label = run_label
+  // 有历史执行结果时，不要把副标题退回「尚未建立 Run」——
+  // 那是"从未执行过"的说法，与下方已恢复的变更/验证证据矛盾。
+  const hasHistory = existing.last_result_status != null
+  existing.run_label = hasHistory
+    ? existing.run_label
+    : run_label
   existing.title = data.title
   existing.run_id_marker = data.runId
   existing.events = events
@@ -156,6 +185,16 @@ export function ingestProjectExecuteResult(
 
   // 更新 files
   task.files = buildChangedFilesFromResult(parsed)
+
+  // 记住这次执行记录的状态：刷新后没有进行中的 Run，但**历史结果存在**，
+  // 界面必须如实说"有历史结果"，不能退回「暂无运行」（等于谎称从未执行过）。
+  task.last_result_status = typeof parsed.status === 'string' ? parsed.status : null
+
+  // 没有进行中的 Run 时，副标题不写"尚未建立 Run"——那与下方已有的
+  // 变更/验证证据自相矛盾。改为标明这是历史运行的结果。
+  if (task.status === 'no_run' && task.run_label.includes('尚未建立 Run')) {
+    task.run_label = `thread: ${threadId} · 历史运行结果（${task.last_result_status ?? '已记录'}）`
+  }
 
   // 强制触发 React 重渲染：替换整个缓存条目
   cache.set(threadId, { ...task })
@@ -204,62 +243,85 @@ function mapStreamStatus(status: StreamStatus | null): TaskStatus {
 }
 
 function buildValidationFromResult(result: ProjectExecuteResult): ValidationEvidence {
-  if (!result.verification || result.verification.length === 0) {
-    // 有 changes 但没有 verification：执行了但未运行验证命令
-    if (result.changes && result.changes.files && result.changes.files.length > 0) {
-      return {
-        status: 'not_run',
-        command: null,
-        output: null,
-        note: '本轮执行器运行完成，但未运行验证命令。',
-      }
-    }
-    // 没有任何结果
+  const entries = buildVerificationEntries(result.verification)
+  const guard = parseGuard(result.guard)
+  const primary = entries[0]
+
+  if (!guard) {
+    // 没有 guard（旧的执行记录里没有这个字段）→ **未判定**。
+    //
+    // 这里刻意**不**按退出码自己推断结论：前端推断出来的结论曾经和
+    // 展示的证据对不上（面板说"失败（退出码 0）"，实际退出码是 2）。
+    // 没有判定字段就如实说没有判定。
     return {
       status: 'not_run',
-      command: null,
-      output: null,
-      note: '执行器输出当前未通过 SSE 推送。',
+      command: primary?.command ?? null,
+      output: primary?.output ?? null,
+      note:
+        entries.length > 0
+          ? '这条执行记录里没有判定字段（guard），结论未判定；下方只列原始命令与退出码。'
+          : '这条执行记录里没有判定字段（guard），也没有验证命令。',
+      guard: null,
+      entries,
     }
   }
 
-  const verifications = result.verification
-  const allPassed = verifications.every((v) => v.exit_code === 0)
-  const anyFailed = verifications.some((v) => v.exit_code != null && v.exit_code !== 0)
-
-  let status: ValidationEvidence['status']
-  if (result.status === 'completed') {
-    status = allPassed ? 'passed' : anyFailed ? 'failed' : 'not_run'
-  } else if (result.status === 'stopped') {
-    status = 'interrupted'
-  } else {
-    status = 'interrupted'
-  }
-
-  // 合并多个验证命令：取第一个命令作为主证据
-  const primary = verifications[0]
-  if (!primary) {
-    return {
-      status: 'not_run',
-      command: null,
-      output: null,
-      note: '验证命令无记录。',
-    }
-  }
+  // status 只是 guard 的镜像：前端不独立产生结论。
+  const status: ValidationStatus =
+    guard.verdict === 'verified'
+      ? 'passed'
+      : guard.verdict === 'failed'
+        ? 'failed'
+        : 'unverified'
 
   return {
     status,
-    command: primary.command ?? null,
-    output: primary.output ?? null,
-    note:
-      status === 'passed'
-        ? '验证命令已执行且全部退出码为 0。'
-        : status === 'failed'
-          ? `验证失败（退出码 ${primary.exit_code ?? '未知'}）。`
-          : status === 'interrupted'
-            ? '任务被停止，验证未完成。'
-            : '执行完成但未运行验证命令。',
+    command: primary?.command ?? null,
+    output: primary?.output ?? null,
+    note: guard.reason,
+    guard,
+    entries,
   }
+}
+
+/** 解析后端 guard 字段；结构不认识就当"没有判定"（不猜、不补） */
+function parseGuard(raw: ProjectExecuteResult['guard']): GuardEvidence | null {
+  if (!raw || typeof raw !== 'object') return null
+  const verdict = raw.verdict
+  if (typeof verdict !== 'string') return null
+  if (verdict !== 'verified' && verdict !== 'unverified' && verdict !== 'failed') {
+    return null
+  }
+  return {
+    verdict: verdict as GuardVerdict,
+    label: typeof raw.label === 'string' ? raw.label : '',
+    reason: typeof raw.reason === 'string' ? raw.reason : '',
+    acceptance_covered:
+      typeof raw.acceptance_covered === 'boolean' ? raw.acceptance_covered : null,
+  }
+}
+
+/**
+ * 把 verification 列表变成逐条结构化证据。
+ *
+ * 退出码缺失（后端没解析出来）就是 null —— **绝不默认成 0**：
+ * 默认成 0 等于把"没读到"说成"通过了"。
+ */
+function buildVerificationEntries(
+  list: ProjectExecuteResult['verification'],
+): VerificationEntry[] {
+  if (!Array.isArray(list)) return []
+  return list.map((item) => {
+    const raw = item?.exit_code
+    const exitCode =
+      typeof raw === 'number' && Number.isInteger(raw) ? raw : null
+    return {
+      command: typeof item?.command === 'string' ? item.command : '',
+      exit_code: exitCode,
+      passed: exitCode === null ? null : exitCode === 0,
+      output: typeof item?.output === 'string' ? item.output : null,
+    }
+  })
 }
 
 function buildChangedFilesFromResult(result: ProjectExecuteResult): ChangedFile[] {

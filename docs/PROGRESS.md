@@ -2,7 +2,7 @@
 
 ## TEST-01：默认离线测试与真实 harness mock 接线（2026-11-03）
 
-- 状态：**READY_FOR_REVIEW** —— 隔离副本经其独立审查；**本机（Windows）已合入并复跑通过**；本机合入部分**尚未独立复审**。未 commit/push/merge。
+- 状态：**READY_FOR_REVIEW** —— 隔离副本经其独立审查；**本机（Windows）已合入并复跑通过**；本机合入部分**尚未独立复审**。已交付：提交 `528babd`，PR **#8**（base = `automation/tool-07`），**未 merge**。
 - 会话：codex-test01-20261103-isolated（隔离副本实现）；claude-worker-20261010-2015（2026-11-04 本机合入与复跑）。
 - 源码基线：隔离副本 a29af0c3fbcbbadca3a5159521a0884f35f25ad7；本机实际基线 **edd5d64**（= a29af0c + 662bbe2 BACKEND-02 修复 + edd5d64 复审结论记录），两者相差两个**仅后端**提交，本阶段未触及。
 - 662bbe2 尚未推送，未伪造该基线；本阶段不修改其生产文件或两个测试文件。
@@ -4490,3 +4490,353 @@ MCP 相关失败报 `MCPError: Connection closed`（环境问题），本轮**�
 - **生产启用仍未处理**：`api/app.py:173` 的 `disable_budget=True` **未翻转**。
   按复审意见，BUDGET-01 的生产启用**作为单独阶段**处理，不在本次收尾顺手做。
 - 未 commit / push / merge。
+
+---
+
+## HANDOVER-01：上下文与任务交接（2026-11-06）
+
+- 任务 ID：HANDOVER-01
+- 会话标识：claude-handover-20261106-1
+- 目标版本：基线 `528babd`（= TEST-01，PR #8）；分支 `automation/handover-01`（worktree `D:/tmp/handover-01-pr`）
+- 状态：**实现完成；宿主侧与真实 harness 子进程端到端均已验证通过**
+  （用户已于 2026-11-06 显式授权执行 `D:/项目解读/harnessagent`）
+- 交付：已 commit / push 到分支 `automation/handover-01`，PR base = `automation/test-01`（**接在 TEST-01 之上**）；**未 merge**
+
+### 一、这一轮闭合的实际缺口
+
+`project_execute` 的四要素（task / context / scope / acceptance）与结果里的
+`changes` / `verification` **机制本来就在**。缺的是**主 Agent 的行为契约**：
+
+1. `PROJECT_SESSION_PROMPT` 从没告诉主 Agent 该往四个参数里填什么、汇总时该引用哪些证据；
+2. `context` / `scope` / `acceptance` 为空时**静默** —— 执行 Agent 照样收到固定的
+   `_TASK_RULES`，但"用户确认的边界没交过去"这件事，主 Agent 和用户**都看不见**，
+   只能等执行结果不对才发现。
+
+`docs/PROGRESS.md` 2026-10-13 的记录已把"context 可选/为空是交接缺口"标为**确认**的未闭合项。
+本轮把它改成**会话内可见**（工具结果里带 `handover.missing`），而不是继续靠提示词约定。
+
+### 二、改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/mini_deerflow/agent.py` | `PROJECT_SESSION_PROMPT` 追加「任务交接契约」段（+15 行）：派发前先澄清并拿到确认、四个参数各自的分工、汇总时只认 `changes` 与 `verification` |
+| `src/mini_deerflow/project_tools.py` | ① 新增 `_build_handover()` 盘点本次交接带了哪些要素；② `_execute` 归一化 `scope`/`acceptance` 并把 `handover` 放进**全部 4 个终态**结果体（completed / stopped / timeout / failed）；③ 工具 `description` 写明四参数分工与证据来源（+46 / −8） |
+| `tests/test_task_handover_e2e.py` | **新增** 4 个用例（下节） |
+
+### 三、验收用例
+
+| 用例 | 覆盖 | 状态 |
+|---|---|---|
+| `test_真实任务_目标与边界交给执行Agent_改动与测试证据回到同一会话` | **真 harness 子进程**：主 Agent → `project_execute` → 真 harness → 真写文件、真跑 pytest → 同一会话拿回 `changes` + `verification` + `handover` | ✅ passed（1 passed in 5.67s） |
+| `test_任务交接_仓内执行器替身_四要素与证据回到同一会话` | 同一套断言，但执行侧换成仓内替身（**不执行任何外部仓库代码**） | ✅ passed |
+| `test_交接缺要素时_缺口在会话内可见` | `_build_handover` 缺要素时 `complete=False` 且 `missing` 可见 | ✅ passed |
+| `test_项目会话提示词写明交接契约` | 防回归：契约段被静默删掉就红 | ✅ passed |
+
+真 harness 那条与仓内替身那条**共用同一套断言**（`_assert_handover_roundtrip`），
+差别只在执行侧跑在哪。仓内替身 `_InProcRunner` 只顶替"跑 harness 子进程"这一步，
+**写文件与 pytest 都是真实执行**；宿主侧（prompt 组装 → 快照 diff → verification 解析 →
+handover 盘点 → 同一会话回传）**全部走生产代码**，没有被替身绕过。
+
+真 harness 那条另外断言了三项隔离事实（证据来自**子进程自报**，不是父进程推断）：
+LLM 端点是本地 mock、子进程没有继承任何真实凭据变量名、子进程够不到非回环地址。
+
+
+### 四、验证证据（实际执行）
+
+所有命令在 worktree `D:/tmp/handover-01` 执行，且 `PYTHONPATH` 指向 `D:/tmp/handover-01/src`
+（**必须**：本机 `mini_deerflow` 是指向主工作区的 editable 安装，不加这个前缀，
+测的是主工作区的代码，不是本分支的）。
+
+| 范围 | 结果 |
+|---|---|
+| `tests/test_task_handover_e2e.py`（**含真 harness 那条**，最终交付状态，无任何叠加） | **4 passed** in 6.35s |
+| `test_agent.py` + `test_agent_skill_context.py` + `test_context_agent.py` + `test_budget_lifecycle.py` + `test_tools.py` + `test_tool_registry.py` + `test_tool_contracts.py` + `test_tool_authorization.py` + `test_tool_authorization_integration.py` + `test_agent_tool_permissions.py` + `test_thread_tool_persistence.py` | **235 passed** in 5.16s |
+| `test_api_runs.py` + `test_api_runs_stream.py` + `test_api_e2e.py` + `test_subagent_executor.py` + `test_subagent_integration.py` + `test_cancel_semantics.py` + `test_tool_loop_21b.py` + `test_tool07_process_tree_recovery.py` + `test_context_compactor.py` + `test_agent_memory_context.py` + `test_skill_context.py` | **228 passed** in 20.78s |
+| **宿主侧合计** | **467 passed / 0 failed** |
+
+依赖外部仓库的 4 个回归文件（需显式 `HARNESS_ROOT`，见第五节）：
+
+| 范围 | 结果 |
+|---|---|
+| `tests/test_harness_runner_integration.py` | **16 passed** in 28.81s |
+| `tests/test_tool07_harness_permission_e2e.py` + `tests/test_tool07_demo_timeout.py` | **4 passed** in 17.93s |
+| `tests/test_project_execute_e2e.py` + `tests/test_task_handover_e2e.py` | **17 passed** in 14.34s |
+| **合计** | **37 passed / 0 failed** |
+
+真实副作用证据（由用例自身断言，非模型自述）：工作区里确实出现了
+`calc.py` / `test_calc.py`；`changes` 里这两个文件 `status == "added"` 且
+`unified_diff` 含 `def add`；`verification` 里 pytest 那条 `exit_code == 0`。
+
+**外部仓库未被改动**：跑前/跑后对 harness 仓库全部 **72 个源文件**做 md5 快照，
+比对**完全一致**；HEAD 仍为 `89fa546ea7a30cbeefb0f6292b928bd2cb01ce26`
+（与复审记录所用版本相同）；仓库内未跟踪的 `test.txt` 跑前就存在、内容未变。
+
+### 五、运行前的隔离核对（用户明确要求：先核对再跑）
+
+**基线 `4c9354b` 不含 TEST-01 的离线守卫**（TEST-01 只暂存在主工作区），
+所以守卫状态是**本轮自己核对**的，不是假定的：
+
+| 核对项 | 方法 | 结果 |
+|---|---|---|
+| harness 仓库有没有 `.env` / MCP 配置 | 直接查看 | **没有** `.env`（只有 `.env.example`）、**没有** `.mcp.json` → `load_dotenv` 无从注入端点 |
+| harness 有哪些网络面 | 读 `noninteractive.py` / `agent.py` / `tools/pool.py` | 非交互模式只开 5 个内置工具（bash / read_file / write_file / edit_file / glob），**不初始化 MCP**（`mcp_clients` 为空），唯一网络面是 OpenAI SDK 打到 `base_url` |
+| 子进程会不会继承真实凭据 | 用 `HarnessRunner.build_env()` 构造**真实子进程环境**再枚举变量名 | **会**：`DASHSCOPE_API_KEY` / `DEEPSEEK_API_KEY` / `TOKENAPI_KEY` / `MIMO_API_KEY` / `CLAUDE_CODE_MESSAGING_TOKEN` 全部被继承（`build_env` 只在测试注入 `.env` 时才清 MINIMAX/MIMO 一族，生产路径直接继承） |
+| 子进程能不能连到真实端点 | 父进程与**真实 harness 子进程**各自尝试连 RFC 5737 保留地址 `203.0.113.1` | **都被拦**：`TEST_NETWORK_BLOCKED`；回环地址**放行**（mock 可达） |
+| 处置 | 测试内自行处置 | ① 上述 5 个真实凭据变量在**父进程**先删掉，子进程就继承不到；② 守卫由**本用例自带**（`GUARD_SOURCE` 写进临时目录后注入子进程 `PYTHONPATH`），不依赖别的分支 |
+
+结果：**测试用例不依赖 TEST-01 也能自证隔离**——真 harness 子进程自己报出
+`base_url = http://127.0.0.1:<mock 端口>`、`model = mock-model`、
+环境变量名里**没有**任何真实凭据、非回环连接被**拦**、回环**通**。
+
+### 六、依赖外部仓库的 4 个回归文件：为什么需要额外一层
+
+`tests/test_harness_runner_integration.py` 在**基线版**里把 mock 地址塞进
+`MIMO_BASE_URL`，而 harness 实际读的是 `HARNESS_MIMO_BASE_URL` → 回落到默认真实端点
+`https://api.xiaomimimo.com/v1`。**TEST-01 的暂存版已修掉这一点**
+（专用 `env_file` + 显式回环 endpoint + 清空 MINIMAX 一族 + 端口改 0 由 OS 分配）。
+
+所以这 4 个文件的通过结果是**叠加 TEST-01 已暂存的隔离改动后**取得的：
+
+| 叠加内容 | 来源 | 用途 |
+|---|---|---|
+| `tests/conftest.py`（全局离线守卫 + PYTHONPATH 前置） | 主工作区**已暂存**的 TEST-01 版本 | 让父/子进程都装上守卫 |
+| `tests/_offline_guard/sitecustomize.py` | 同上 | 守卫实现 |
+| `tests/test_harness_runner_integration.py` | 同上 | 修掉 `MIMO_BASE_URL` 变量名错误 |
+
+叠加**只用于本轮验证**，验证后已从工作树移除（`git checkout --` 回到基线 `4c9354b` 的
+`tests/conftest.py` 与 `tests/test_harness_runner_integration.py`，并删除
+`tests/_offline_guard/`）。
+
+**提交前只读核对（2026-11-06，交付前最后一次）**：
+
+| 核对项 | 结果 |
+|---|---|
+| HANDOVER-01 的待交付差异 | **恰好 4 个文件**：`src/mini_deerflow/agent.py`（+15）、`src/mini_deerflow/project_tools.py`（+46/−8）、`docs/PROGRESS.md`（+142）、新增 `tests/test_task_handover_e2e.py`（未跟踪） |
+| 暂存区 | **空**（`git diff --cached --stat` 无输出）—— 交付内容全部处于"已改未暂存 / 未跟踪"状态 |
+| 临时探针 | **已移除**：`.offline_guard/`（`probe_offline.py`、`run_pytest.py`）、`src/sitecustomize.py`（临时装守卫用的副本）均不存在 |
+| TEST-01 叠加物 | **已移除**：`tests/_offline_guard/` 目录不存在；`tests/conftest.py` 与 `tests/test_harness_runner_integration.py` 与基线 `4c9354b` **逐字节一致**（`git diff` 无输出） |
+| 遗留 stash | `stash@{0}`（`WIP on automation/tool-06`）是**别的会话**留下的，本轮从未执行 `git stash`，**未触碰** |
+
+> 顺带记录一个**真实缺陷**：基线版的 `test_harness_runner_integration.py` 若在**没有**
+> 离线守卫的环境里跑，会真的去连 `api.xiaomimimo.com`（带假 key）。本轮跑基线版时
+> 6 个用例报 `APIConnectionError` —— 那正是守卫把这次外连拦下的表现，不是断言失败。
+> TEST-01 已修；这说明 **TEST-01 与 HANDOVER-01 必须一起交付**，否则那 4 个文件会外连。
+
+### 六之二、交付顺序（用户 2026-11-06 明确）
+
+1. **先交付 TEST-01**（分支 `automation/test-01`，7 个文件，提交 `528babd`，PR #8，base = `automation/tool-07`）。
+2. **再以包含 TEST-01 的基线交付 HANDOVER-01 + GUARD-01**（本分支 `automation/handover-01`，6 个文件，
+   base = `automation/test-01`）。
+3. 两者**保留独立改动**，不合并成一个提交。
+
+理由：交接专项测试在**未叠加** TEST-01 时即 4 passed（自证隔离）；
+而依赖外部仓库的那 4 个回归文件**必须在 TEST-01 的隔离前置之上**才通过
+（基线版会外连真实端点，见上）。
+
+
+### 七、仍未验证的事项（**单列，不扩大本轮范围**）
+
+| 项 | 说明 |
+|---|---|
+| ⚪ **真实模型会不会先澄清、再按要求派发** | 本轮全部用脚本化替身驱动主 Agent，验证的是**机制**（四要素被交出去、证据回到同一会话、缺项可见）。**现有证据不能证明真实模型一定会先向用户澄清、也不会只填 task**。`handover.missing` 让缺项**可见**，提示词给出**指引**，但两者都不是行为保证。这项需要真实模型实测，**本轮未做**。 |
+| ⚪ 前端是否露出 `handover` / `handover.missing` | 本轮**未做**（超出本任务范围）。 |
+| ⚪ `lead_agent/` 里的 GoalContract / 澄清 / 批量派发 | 仍是**未接入运行时**的独立实现（有单测、无调用点）。本轮**不碰**。 |
+| ⚪ Windows 桌面人工体验、浏览器验收 | **未做**。 |
+| ⚪ 真实付费 Provider | **未调用**（用户授权明确要求只用本地 mock 与假凭据）。 |
+
+### 八、边界与下一步
+
+**两条交付边界（收口时必须一起说清）**：
+
+1. **TEST-01 是那组回归测试的隔离前置。** 依赖外部仓库的 4 个回归文件是在
+   **叠加 TEST-01** 后通过的；交接专项测试则在**未叠加**时通过（自证隔离）。
+   → **先交付 TEST-01，再以包含它的基线交付 HANDOVER-01，两者保留独立改动**（见第六之二）。
+2. **机制通过，真实模型行为仍未验证。** 已证实的是：四项信息能传过去、
+   改动与测试证据能回到同一会话、缺项能被发现。
+   **未证实**的是：真实模型会不会主动澄清并把字段填齐。
+   → 汇报时不得把"机制可用"说成"交接行为达标"。
+
+其它边界：
+
+- 本轮**已 commit / push，不 merge**：TEST-01 的 7 个文件已单独交付（提交 `528babd`，
+  PR #8，base = `automation/tool-07`），本分支（`automation/handover-01`）**接在它之上**；
+  `docs/superpowers/` 保留未动；全局 `settings.json` 未动。
+- 本轮只改宿主侧行为契约，**未改 harness 协议、未改前端、未改预算与 Trace**。
+- 下一步进入**验证与 Guard**阶段，先解决"主 Agent 什么时候可以说'已完成'，
+  什么时候只能说'有改动，但未验证'或'验证失败'"。
+  该问题与本轮的 `verification` / `handover` 字段直接相关：
+  现在**证据已经回得来**了，但**主 Agent 依据什么口径把证据翻译成"已完成"**，
+  还没有被约束过 —— 那是下一阶段要定的口径，不是本轮顺手带过的。
+  （本阶段遗留：真实模型实测主 Agent 是否先澄清、是否填齐四要素。）
+- 再往后才是 TRACE-01 的 PR #7 合并顺序（先 TOOL-07，再把 PR base 重指到 `master` 复查 diff）。
+
+---
+
+## 验证与 Guard：结论必须和证据一致（2026-11-06）
+
+- 任务 ID：GUARD-01
+- 会话标识：claude-guard-20261106-1
+- 目标版本：基线 `528babd`（= TEST-01，PR #8）+ HANDOVER-01；分支 `automation/handover-01`（worktree `D:/tmp/handover-01-pr`）
+- 状态：**实现完成；宿主侧定向与回归验证通过**；外部仓库回归项被权限层拦截，**本轮不再申请执行**（见第六节）
+- 交付：与 HANDOVER-01 **同分支、同提交**（PR base = `automation/test-01`）；**未 merge**
+- 与 HANDOVER-01 **改动相互独立**（新增 2 个文件 + 3 个文件追加改动）
+
+### 一、这一轮闭合的实际缺口
+
+HANDOVER-01 让证据**回得来**了（`changes` + `verification`），但**没人把证据翻译成结论**：
+
+1. `project_execute` 至今**没有任何一处代码判断"这些证据够不够支撑'已完成'"**。
+   `status == "completed"` 只说明 **harness 进程跑完了**，不说明**用户的验收条件已满足** ——
+   "跑完了但根本没跑测试"和"测试全绿"在结果里长得一样。
+2. `acceptance`（用户确认过的验收条件）此前只是 prompt 里的一行字，**从不参与判定**。
+3. 主 Agent 的结论是**自由文本**，与证据之间**没有任何约束** ——
+   模型写"已完成"没有任何东西会拦它。
+
+仓里已有正确的词汇（`tool_contracts.py:292`「工具调用成功不等于业务验收通过」；
+`lead_agent/models.py` 的 `EvidenceReceipt → VerificationResult → VerifiedFact`），
+但 `lead_agent/` **未接入运行时**。本阶段做的是那条链在**运行期**的最小落地：
+只判"能不能升格"，不碰事实建模。
+
+### 二、判定口径（三值，**由代码判定**）
+
+新增 `src/mini_deerflow/verification_guard.py`，从"命令 + 退出码 + 验收条件"算出结论：
+
+| verdict | label | 触发条件 |
+|---|---|---|
+| `verified` | 验证通过 | 有验证命令、退出码全为 0、且与验收条件建立关联 |
+| `unverified` | 未验证 / 有改动但未验证 | 没有验证命令 / 退出码无法解析 / 验收条件与实际命令无法建立关联 |
+| `failed` | 验证失败 | 有验证命令退出码非 0 |
+
+降级规则（**全部朝保守方向倒**）：
+
+- 证据不足往"未验证"降，不往"通过"升；`exit_code` 解析不出来 → `unverified`。
+- **失败优先**：只要有一条命令退出码非 0 就是 `failed`，别的命令全过也不算通过。
+- **保守关联检查**：验收条件里点名的命令（pytest / npm test / cargo test / ruff …）
+  没有对应的执行记录 → `unverified`。理由：**"跑过 pytest"不等于"用户要的那条 pytest 被跑了"**。
+  关联用**整词相等**（`make` 不会被 `cmake --build` 误判成命中）。
+- **多条执行取最保守的一个**：一轮里跑三次任务，只要有一次失败，整体就不能是"通过"。
+- 没有改动且没验证时措辞是"未验证"，有改动时才是"有改动但未验证"。
+
+### 三、改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/mini_deerflow/verification_guard.py` | **新增**：三值判定 `evaluate_verification`、最保守合并 `summarize_verdicts`、从工具结果抽判定 `collect_guard_verdicts`（**不只信工具给的字段，本模块自己再算一遍**）、解析模型自述结论 `parse_declared_verdict`、结论纠正 `rewrite_conclusion` |
+| `src/mini_deerflow/project_tools.py` | ① `_execute` 算出 `guard` 并放进**全部 4 个终态**结果体（completed / stopped / timeout / failed），同时回传 `acceptance` 原文；② `launch_failed` / `protocol_error` 两条**拿不到验证记录**的路径也带 `guard`（`_err_with_guard`），否则它们会成为结论闸门的漏洞；③ 工具 `description` 写明 **status=completed ≠ 验收条件已满足**，结论以 `guard` 为准 |
+| `src/mini_deerflow/agent.py` | ① 导入 guard 三个函数；② 本轮收集所有执行判定（`guard_verdicts`）；③ **`FinalAnswer` 闸门**：结论与代码判定冲突（或没给结论）→ 纠正为代码判定，纠正记录进 `trace`（`action="conclusion_corrected"`）；④ `PROJECT_SESSION_PROMPT` 追加「验证结论契约」段 |
+| `tests/test_verification_guard.py` | **新增** 19 个用例（下节；交付版本实跑 19 passed） |
+| `tests/test_task_handover_e2e.py` | 断言随契约更新：新增 `guard.verdict == "verified"` 断言；原先"最终回答 == 模型产出的那一条"改为"模型原文被保留 **且** 最终回答带上权威结论行" |
+
+### 四、验收用例与证据
+
+**三层验收**（`tests/test_verification_guard.py`，17 passed）：
+
+1. **判定层**（单元，10 个）：无命令 → 未验证；退出码非 0 → 失败；全过且对得上 → 通过；
+   全过但与验收无关（跑的是 `ls`、验收要 `pytest`）→ **保守降级为未验证**；
+   退出码解析不出 → 未验证；多条取最保守；结论标签解析；冲突时按代码判定纠正；
+   一致时原样保留。
+2. **工具层**（集成，2 个）：执行器跑完（`status == "completed"`、`ok is True`）但一条命令都没跑 →
+   `guard.verdict == "unverified"`。**这就是"harness 执行结束 ≠ 验收条件已满足"的落点。**
+   执行器**根本起不来**（`launch_failed`）→ `guard.verdict == "failed"`，
+   错误响应里同样带判定，不给模型留"已完成"的口子。
+3. **会话层**（端到端，参数化 3 个 + 3 个）：**同一条任务链路**跑出三种结果，
+   主 Agent 的结论必须与证据一致：
+
+   | 执行侧证据 | 代码判定 | 主 Agent 自述 | 最终结论 |
+   |---|---|---|---|
+   | 跑过 pytest，退出码 0 | `verified` | 验证通过 | 验证通过（原样保留） |
+   | 只写文件，**没跑命令** | `unverified` | **验证通过**（过度宣称） | **有改动但未验证**（被纠正） |
+   | 跑过 pytest，退出码 1 | `failed` | **验证通过**（过度宣称） | **验证失败**（被纠正） |
+
+   两个被纠正的场景额外断言：最终回答里**不含**"验证结论：验证通过"、
+   含纠正标注与判定依据、`trace` 里有 `conclusion_corrected` 记录且其 `verdict` 与代码判定一致。
+
+**"撤掉修复即失败"验证**（沿用 BUDGET-01 的做法，探针用完即删）：
+
+| 探针 | 结果 |
+|---|---|
+| 把 Agent 侧闸门摘掉（`rewrite_conclusion` 改为原样返回） | **2 failed**（"未验证""验证失败"两档的过度宣称原样放行） |
+| 把判定改成"永远通过" | **3 failed**（工具层与两档会话层全部失守） |
+
+### 五、验证证据（实际执行）
+
+| 命令 | 结果 |
+|---|---|
+| `pytest tests/test_verification_guard.py tests/test_task_handover_e2e.py tests/test_agent.py tests/test_context_agent.py tests/test_tool_e2e_behavior.py tests/test_agent_tool_permissions.py tests/test_agent_skill_context.py tests/test_api_runs.py tests/test_cancel_semantics.py tests/test_budget_lifecycle.py -k "not 真实任务"` | **193 passed, 1 deselected** |
+| `pytest tests/test_task_handover_e2e.py::test_真实任务_...`（**真实 harness 子进程**） | **1 passed**（本阶段内、授权有效期内执行过一次；含新增的 `guard.verdict == "verified"` 断言） |
+| `pytest tests/ --ignore=（4 个依赖外部仓库的文件）` | **3627 passed, 1 skipped, 15 failed** |
+
+**15 个失败与本阶段无关**（已定位到根因，非本轮改动引入）：
+`test_mcp.py`(11) / `test_subagent_allowed_tools.py`(3) / `test_phase21b_events.py`(1)
+全部是 MCP 相关。直接跑夹具即复现：
+
+```
+python tests/fixtures/mcp_test_server.py
+ModuleNotFoundError: No module named 'mcp.server.fastmcp'.
+This is mcp 2.x, where FastMCP was renamed to MCPServer ...
+```
+
+即**开发机装的 `mcp` 是 2.x，仓里夹具还是 1.x 的 `FastMCP` API** → MCP 服务器起不来 →
+连不上（`MCPError: Connection closed`）。属**既有环境缺陷**，本阶段未碰 MCP。
+
+### 六、未做 / 未验证（**单列，不扩大范围**）
+
+| 项 | 说明 |
+|---|---|
+| ⛔ **`tests/test_project_execute_e2e.py` 等 4 个外部仓库回归文件** | 本轮**被权限层拦截**，未执行。拦截原因：该文件会执行 `D:/项目解读/harnessagent` 的代码，而**上一次授权被限定为"一次执行"**。**用户已明确本轮不再申请执行**，故不再发起授权请求。这 4 个文件对当前改动的回归状态为 **"未验证"** —— 既不是"通过"，也不是"失败"，不得据此宣称回归无问题。 |
+| ⚪ **真实模型会不会主动给出结论标签** | 本轮全部用脚本化替身驱动主 Agent。已证实的是：**即使模型过度宣称，系统也会纠正它**。未证实的是：真实模型会不会**主动**按契约写 `验证结论：xxx` 行（提示词已要求，行为未实测）。 |
+| ⚪ **模型叙述正文里的措辞不改写** | 系统保证的是"最终回答里的**权威判定行**与证据一致，且冲突被显式标注"。模型正文里若有"已完成"这类措辞，本阶段**不做正则改写**（改写正文容易把话说坏）。要更强的保证需另设机制。 |
+| ⚪ 前端是否露出 `guard` / 结论标签 | **未做**（超出本任务范围）。 |
+| ⚪ `lead_agent/` 接入运行时 | 仍是**未接入**的独立实现，本阶段**不碰**。 |
+| ⚪ 真实付费 Provider | **未调用**（只用仓内替身与本地 mock）。 |
+
+### 七、边界与下一步
+
+- 本轮**不 merge**；**已 commit / push** 到分支 `automation/handover-01`，base = `automation/test-01`。
+  待交付的 **6 个**文件已合成一个提交（HANDOVER-01 的 4 个 + 本阶段的 2 个新增 / 3 个改动，
+  **改动相互独立**，按既定顺序接在 TEST-01 之后交付）。
+- 交付口径必须同时说清三条边界：
+  1. **TEST-01 是那组外部仓库回归文件的隔离前置**（HANDOVER-01 第六节）。
+  2. **机制通过，真实模型行为仍未验证**（HANDOVER-01 第七节；本阶段第六节同口径）。
+  3. **外部仓库的 4 个回归文件在本阶段是"未验证"** —— 不是"通过"，也不是"失败"。
+- 下一步可选：① 真实模型实测结论标签行为；② 前端露出 `guard`；
+  ③（**需另行授权**）补跑 4 个外部仓库回归文件 —— 本轮**不申请**。
+  再往后仍是 TRACE-01 的 PR #7 合并顺序。
+
+### 八、本轮收口核查（2026-11-06）
+
+**Guard 误报专项核查**：只查一个场景 —— *验收条件要求跑 `pytest`，但实际只执行了
+`echo pytest` 且退出码为 0，能否被误判为"验证通过"*。
+
+| 层级 | 核查方式 | 结果 |
+|---|---|---|
+| 判定层（单元） | `evaluate_verification([{"command": "echo pytest", "exit_code": 0}], "验收要求跑 pytest")` | `verdict = unverified`、`acceptance_covered = False` —— **未误报** |
+| 工具层 | `project_execute` 把 `acceptance` 一并传给 `evaluate_verification`，`echo pytest` 的**验证签名为空集**（首 token `echo` 不在 `_VERIFICATION_EXECUTABLES` 里） | 落到 `unverified` |
+| 会话层（端到端） | `tests/test_verification_guard.py::test_命令只是提到pytest而没有真的跑_会话结论也被纠正`（跑 `echo pytest`，退出码 0） | 主 Agent 的"验证通过"自述**被纠正**为"有改动但未验证" |
+
+**结论：不存在该误报，判定逻辑未改动。** `echo pytest` 提到 pytest 但**没有跑 pytest**，
+不计入验收关联（`cmd` 里的 pytest 词面命中不算数，关联要求首 token 真的可执行）。
+
+**Guard 专项复跑**（`PYTHONPATH=src`，基线 = 含 TEST-01 的 `528babd`）：
+
+| 命令 | 结果 |
+|---|---|
+| `pytest tests/test_verification_guard.py -q` | **19 passed** in 5.23s |
+| `pytest tests/test_task_handover_e2e.py -q -k "not 真实任务"` | **3 passed, 1 deselected** in 2.73s（deselect 的是依赖外部仓库的真 harness 那条，见第六节 ⛔） |
+
+**本轮未重跑全量**，未开新的独立复审，未触碰 PR #6 / #7。
+
+---
+
+## 交付记录（2026-11-06 收口）
+
+| 交付 | 分支 | 提交 | PR |
+|---|---|---|---|
+| TEST-01（7 个文件） | `automation/test-01` | `528babd` | **#8** https://github.com/feather011/mini-deerflow/pull/8 （base = `automation/tool-07`） |
+| HANDOVER-01 + GUARD-01（6 个文件） | `automation/handover-01` | `2adc6db`（内容提交） | **#9** https://github.com/feather011/mini-deerflow/pull/9 （base = `automation/test-01`） |
+
+- 授权范围：提交、推送、开 PR；**不合并**。两个 PR 均**不自动合并**。
+- 关联检查状态：**已关联的检查通过**（定向检查；**不等于所有验收条件已满足**）。
+- 4 个依赖外部仓库的回归文件：**未验证**（本轮不再申请执行）。
+- 未重跑全量、未开新复审、未触碰 PR #6 / #7。
+
