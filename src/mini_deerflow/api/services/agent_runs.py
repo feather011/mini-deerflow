@@ -17,6 +17,8 @@ from typing import Protocol
 from mini_deerflow.middleware import BudgetExceededError, CancellationToken
 from mini_deerflow.thread_run_coordinator import ThreadRunCoordinator
 from mini_deerflow.thread_store import ThreadNotFoundError, ThreadStore
+from mini_deerflow.tool_authorization import RunAuthority
+from mini_deerflow.tool_contracts import ExecutorPrincipal
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -213,6 +215,53 @@ class AgentRunService:
         run_id = run_id or self.generate_run_id()
         self._coordinator.try_acquire(thread_id, run_id)
 
+        # TOOL-04 R5/R6 round 4：真实生产者
+        # 在 run 启动时把 RunAuthority + CancellationToken 注入到 runtime，
+        # 供 execute 端作为可信父权限的查找来源；失败/cancel 路径 unregister。
+        # 没有 self._runtime 时（测试或独立调用）静默跳过——执行端会因找不到 authority 拒绝。
+        # R6 round 5：按 thread 是否属项目会话选择能力集——与 agent.py 同一规则，
+        # 不能从待执行工具反推或自授能力。普通会话：基础三项；
+        # 项目会话：基础三项 + PROJECT_READ + PROJECT_EXEC_DELEGATE。
+        if getattr(self, "_runtime", None) is not None:
+            try:
+                from mini_deerflow.tool_contracts import ToolCapability
+                try:
+                    _thread = self._store.get(thread_id)  # type: ignore[union-attr]
+                    is_project = bool(getattr(_thread, "project_id", None))
+                except Exception:
+                    is_project = False
+                if is_project:
+                    default_caps = frozenset({
+                        ToolCapability.COMPUTE,
+                        ToolCapability.SESSION_HISTORY_READ,
+                        ToolCapability.SESSION_STATE_WRITE,
+                        ToolCapability.PROJECT_READ,
+                        ToolCapability.PROJECT_EXEC_DELEGATE,
+                        # TOOL-06：网络只读
+                        ToolCapability.NETWORK_READ,
+                    })
+                else:
+                    default_caps = frozenset({
+                        ToolCapability.COMPUTE,
+                        ToolCapability.SESSION_HISTORY_READ,
+                        ToolCapability.SESSION_STATE_WRITE,
+                        # TOOL-06：网络只读
+                        ToolCapability.NETWORK_READ,
+                    })
+            except Exception:
+                default_caps = frozenset()
+            try:
+                project_id = self._store.get(thread_id).project_id  # type: ignore[union-attr]
+            except Exception:
+                project_id = None
+            authority = RunAuthority(
+                principal=ExecutorPrincipal.MAIN_AGENT,
+                thread_id=thread_id,
+                run_id=run_id,
+                project_id=project_id,
+                granted_capabilities=default_caps,
+            )
+            self._runtime.register_run(run_id, authority, cancellation_token)
         try:
             try:
                 # 把 cancellation_token 透传给 IntegratedAgent.run → Agent.run → 工具
@@ -220,6 +269,12 @@ class AgentRunService:
                     thread_id, message, run_id=run_id, cancellation_token=cancellation_token
                 )
             except BudgetExceededError as exc:
+                # 主动停止：取消令牌已置位 → 报"已取消"，不是预算耗尽。
+                # 与 finally 中的 cancelled 判定保持一致（同一事实、同一语义），
+                # 否则 SSE 终态会退化成 run.failed，前端无法区分
+                # "用户点了停止" 与 "任务真的失败"。
+                if cancellation_token is not None and cancellation_token.is_cancelled():
+                    raise AgentRunCancelledError(thread_id, run_id) from exc
                 # 根据 resource 区分"主动停止"与"模型超时"
                 if exc.resource == "model_call_timeout":
                     raise AgentRunTimeoutError(
@@ -246,4 +301,12 @@ class AgentRunService:
                 answer=answer,
             )
         finally:
+            # TOOL-04 R5/R6 round 4：清理权威记录
+            # cancelled=True 表示本次 run 被取消（AgentRunCancelledError 路径），
+            # 保持取消标记以拒绝旧 run 的确认执行；非取消路径清空即可。
+            was_cancelled = False
+            if cancellation_token is not None and cancellation_token.is_cancelled():
+                was_cancelled = True
+            if getattr(self, "_runtime", None) is not None:
+                self._runtime.unregister_run(run_id, cancelled=was_cancelled)
             self._coordinator.release(thread_id, run_id=run_id)

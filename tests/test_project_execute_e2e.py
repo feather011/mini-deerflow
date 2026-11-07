@@ -407,6 +407,7 @@ def test_锁释放_异常后能重新获取(
     2. 用一个会抛出异常的 FakeRunner（is_configured=True，但 run() 抛出异常）创建 project_execute 工具
     3. 调用 project_execute 工具 → 工具内部获取锁后，runner.run() 抛出异常 → finally 块释放锁
     4. 验证：锁在工具调用后是可重新获取的（不处于永久占用状态）
+    5. 验证：对外错误是**受控**错误码与受控文案，原始异常文本不外泄（TOOL-07 契约）
     """
     import uuid
     unique = uuid.uuid4().hex[:8]
@@ -453,7 +454,17 @@ def test_锁释放_异常后能重新获取(
 
     # 验证返回了错误（因为 runner 抛异常）
     assert result.get("ok") is False
-    assert "模拟 harness 异常" in result.get("error", "") or "RuntimeError" in result.get("error", "")
+    # TOOL-07：对外只给**受控**错误码与受控文案 —— 原始异常的 message 可能带
+    # 绝对路径、内部栈或凭据片段，一律只进日志、不外泄。
+    assert result.get("code") == "PROJECT_TOOL_INTERNAL_ERROR", (
+        f"内部错误应给出受控错误码，实际: {result.get('code')!r}"
+    )
+    assert result.get("error") == "工具内部错误，请重试或联系管理员", (
+        f"内部错误应给出受控文案，实际: {result.get('error')!r}"
+    )
+    # 反向检查：原始异常文本与异常类型名都不得出现在对外结果里。
+    assert "模拟 harness 异常" not in result_str, "原始异常文本泄漏到对外结果"
+    assert "RuntimeError" not in result_str, "异常类型名泄漏到对外结果"
 
     # 关键：锁已释放，可以重新获取
     lock = _get_project_lock(project_id)

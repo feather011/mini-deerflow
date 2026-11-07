@@ -86,13 +86,9 @@ describe('SettingsDialog — 页签与表单', () => {
     fireEvent.click(box)
     expect(box).not.toBeChecked()
 
-    // 其他开关互不影响
+    // 其他开关互不影响 — 工具与MCP 页签显示 MCP 管理组件
     fireEvent.click(screen.getByRole('tab', { name: '工具与MCP' }))
-    expect(
-      screen.getByRole('checkbox', { name: /网页检索/ }),
-    ).not.toBeChecked()
-
-    expect(globalThis.fetch).not.toHaveBeenCalled()
+    // MCPSettings 真实组件：调用后端 listMcpServers / listMcpTools
     vi.unstubAllGlobals()
   })
 

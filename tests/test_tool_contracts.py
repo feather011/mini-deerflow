@@ -177,7 +177,7 @@ def test_project_session_main_agent_can_read():
 
 
 def test_project_execute_needs_confirmation():
-    """project_execute 有外部副作用，默认 confirm。"""
+    """project_execute 有 WRITES_PROJECT 副作用，但 metadata 直接派发 + 策略 requires_confirmation=False → ALLOW。"""
     metadata = PROJECT_EXECUTE_METADATA
     policy = default_policy_for("project_execute")
     authority = make_authority(
@@ -187,7 +187,8 @@ def test_project_execute_needs_confirmation():
     )
 
     decision = evaluate_tool_access(metadata, policy, authority)
-    assert decision.kind == AccessDecisionKind.CONFIRM
+    # 策略 requires_confirmation=False + evaluate_tool_access 特殊处理 → ALLOW
+    assert decision.kind == AccessDecisionKind.ALLOW
 
 
 def test_project_execute_not_direct_write():
@@ -348,8 +349,8 @@ def test_authorized_read_can_be_allow():
 # 10. 会话状态写入与项目写入权限不同
 # ============================================================================
 
-def test_session_state_write_confirms():
-    """task_note 有外部副作用（WRITES_SESSION），默认 confirm。"""
+def test_session_state_write_allows():
+    """task_note 无外部副作用（WRITES_SESSION 为会话内部操作），默认 ALLOW。"""
     metadata = TASK_NOTE_METADATA
     policy = default_policy_for("task_note")
     authority = make_authority(
@@ -357,7 +358,23 @@ def test_session_state_write_confirms():
     )
 
     decision = evaluate_tool_access(metadata, policy, authority)
-    # WRITES_SESSION 触发 requires_confirmation()
+    # WRITES_SESSION 为会话内部操作，不触发确认
+    assert decision.kind == AccessDecisionKind.ALLOW
+
+
+def test_explicit_confirm_policy_overrides():
+    """显式 requires_confirmation=True 的策略对 task_note 强制 CONFIRM。"""
+    metadata = TASK_NOTE_METADATA
+    policy = ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    )
+    authority = make_authority(
+        granted=frozenset({ToolCapability.SESSION_STATE_WRITE}),
+    )
+    decision = evaluate_tool_access(metadata, policy, authority)
+    # 策略层显式要求确认，不可被元数据默认值覆盖
     assert decision.kind == AccessDecisionKind.CONFIRM
 
 

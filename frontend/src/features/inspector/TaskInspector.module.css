@@ -225,6 +225,14 @@
   padding: 6px 0;
 }
 
+.diffTruncated {
+  padding: 6px 10px;
+  font-size: 10px;
+  color: var(--color-text-muted, #6b7280);
+  background: var(--color-bg-subtle, #f9fafb);
+  border-bottom: 1px solid var(--color-border, #e5e7eb);
+}
+
 .diffLine {
   display: flex;
   white-space: pre;

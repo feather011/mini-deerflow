@@ -392,5 +392,106 @@ class TestSubagentCollect(unittest.TestCase):
         manager.shutdown()
 
 
+class TestSubagentToolLoopCancel(unittest.TestCase):
+    """B1：子代理的工具循环里，取消 / 超时后**后续工具不得启动**。
+
+    步骤开始处有取消与超时检查，但工具之间原本没有 —— 一次响应给出多个
+    调用时，父任务停止或子任务超时后，剩余工具仍会执行完。
+    """
+
+    def _make_runner(self, *, model, registry, token, timeout_seconds=None):
+        from mini_deerflow.subagent_models import SubagentTask
+
+        # 超时时长挂在**子任务**上（SubagentRunner 从 task.timeout_seconds
+        # 透传给内层 agent），不是 runner 的构造参数。
+        task = SubagentTask(
+            task_id="cancel-test",
+            parent_run_id="run-0",
+            parent_thread_id="main",
+            instruction="test",
+            status=TaskStatus.QUEUED,
+            created_at=time.monotonic(),
+            timeout_seconds=timeout_seconds,
+        )
+        store = InMemoryThreadStore()
+        store.create("main")
+        return SubagentRunner(
+            task=task,
+            model=model,
+            registry=registry,
+            store=store,
+            budget=SubagentBudget(),
+            cancellation_token=token,
+        )
+
+    def _registry_with(self, handler):
+        from mini_deerflow.tools import Tool, ToolRegistry
+
+        registry = ToolRegistry()
+        registry.register(Tool(
+            name="calculator",
+            description="记录调用",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+        ))
+        return registry
+
+    def test_取消后剩余工具不执行(self):
+        from mini_deerflow.models import ToolCalls
+        from mini_deerflow.tools import Tool
+
+        token = CancellationToken()
+        executed = []
+
+        def _handler(args):
+            executed.append("calculator")
+            token.cancel()
+            return "2"
+
+        model = ScriptedModel([
+            ToolCalls(calls=(
+                ToolCall(name="calculator", arguments={}, id="toolu_1"),
+                ToolCall(name="calculator", arguments={}, id="toolu_2"),
+            )),
+        ])
+        runner = self._make_runner(
+            model=model,
+            registry=self._registry_with(_handler),
+            token=token,
+        )
+        result = runner.run()
+        # 第一个工具执行了，第二个没有
+        self.assertEqual(executed, ["calculator"])
+        self.assertNotEqual(result.terminal_status, TaskStatus.SUCCEEDED)
+
+    def test_超时后剩余工具不执行(self):
+        from mini_deerflow.models import ToolCalls
+
+        executed = []
+
+        def _handler(args):
+            executed.append("calculator")
+            time.sleep(0.3)  # 睡过 deadline
+            return "2"
+
+        model = ScriptedModel([
+            ToolCalls(calls=(
+                ToolCall(name="calculator", arguments={}, id="toolu_1"),
+                ToolCall(name="calculator", arguments={}, id="toolu_2"),
+            )),
+        ])
+        runner = self._make_runner(
+            model=model,
+            registry=self._registry_with(_handler),
+            token=CancellationToken(),
+            timeout_seconds=0.1,
+        )
+        result = runner.run()
+        # 第一个工具执行了，第二个没有（超时检查拦下）
+        self.assertEqual(executed, ["calculator"])
+        self.assertNotEqual(result.terminal_status, TaskStatus.SUCCEEDED)
+
+
+
 if __name__ == "__main__":
     unittest.main()

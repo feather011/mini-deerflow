@@ -101,7 +101,8 @@ describe('realTaskAdapter 缓存归属', () => {
 
 describe('realTaskAdapter 状态映射', () => {
   const statusCases: Array<{ status: StreamStatus | null; expected: string }> = [
-    { status: 'idle', expected: 'running' },
+    // idle / null 都意味着"还没有任何 Run"，不能说成运行中
+    { status: 'idle', expected: 'no_run' },
     { status: 'connecting', expected: 'running' },
     { status: 'streaming', expected: 'running' },
     { status: 'completed', expected: 'completed' },
@@ -110,7 +111,7 @@ describe('realTaskAdapter 状态映射', () => {
     { status: 'stopped', expected: 'stopped' },
     { status: 'cancelled', expected: 'stopped' },
     { status: 'timed_out', expected: 'timeout' },
-    { status: null, expected: 'running' },
+    { status: null, expected: 'no_run' },
   ]
 
   for (const { status, expected } of statusCases) {
@@ -124,6 +125,109 @@ describe('realTaskAdapter 状态映射', () => {
       expect(realTaskAdapter.getTask('thread-Z')?.status).toBe(expected)
     })
   }
+})
+
+// ---- 无 Run 语义 + run_id_marker 回归防护 ----
+
+describe('realTaskAdapter 无 Run 语义', () => {
+  it('流未开始（idle）时状态是 no_run，不得是 running', () => {
+    ingestRealTaskData('thread-IDLE', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: 'IDLE',
+    })
+    expect(realTaskAdapter.getTask('thread-IDLE')?.status).not.toBe('running')
+    expect(realTaskAdapter.getTask('thread-IDLE')?.status).toBe('no_run')
+  })
+
+  it('无流信息（null）时同样是 no_run', () => {
+    ingestRealTaskData('thread-NULL', {
+      streamStatus: null,
+      events: [],
+      runId: null,
+      title: 'NULL',
+    })
+    expect(realTaskAdapter.getTask('thread-NULL')?.status).toBe('no_run')
+  })
+
+  it('无 Run 时副标题与「暂无运行」一致（都说明尚未建立 Run）', () => {
+    ingestRealTaskData('thread-LBL', {
+      streamStatus: 'idle',
+      events: [],
+      runId: null,
+      title: 'LBL',
+    })
+    expect(realTaskAdapter.getTask('thread-LBL')?.run_label).toContain('尚未建立 Run')
+  })
+
+  it('首次 ingest 就必须落盘 run_id_marker', () => {
+    // 不变式：首次建立 task 时记录的 run_id_marker 必须等于当前 runId。
+    // 缺省（undefined）会让下一轮把同一个 run 误判成"新 run"从而清空结果。
+    ingestRealTaskData('thread-MARK', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-1',
+      title: 'MARK',
+    })
+    expect(realTaskAdapter.getTask('thread-MARK')?.run_id_marker).toBe('run-1')
+  })
+
+  it('同一 run 内后续事件不会清空 run.result 已写入的文件', () => {
+    // 首次 ingest 就带着 runId（重连后立刻收到事件的情形）
+    ingestRealTaskData('thread-RM', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-1',
+      title: 'RM',
+    })
+    ingestProjectExecuteResult(
+      'thread-RM',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: {
+          files: [
+            { path: 'hello.c', status: 'added', unified_diff: '@@ -0,0 +1,1 @@\n+line1' },
+          ],
+        },
+      }),
+    )
+    expect(realTaskAdapter.getTask('thread-RM')?.files).toHaveLength(1)
+
+    // 同一 run 的终态事件再进来一次 —— 文件必须还在
+    ingestRealTaskData('thread-RM', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-1',
+      title: 'RM',
+    })
+    expect(realTaskAdapter.getTask('thread-RM')?.files).toHaveLength(1)
+  })
+
+  it('换了一个 runId 才清空上一轮结果', () => {
+    ingestRealTaskData('thread-RM2', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-1',
+      title: 'RM2',
+    })
+    ingestProjectExecuteResult(
+      'thread-RM2',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: { files: [{ path: 'a.c', status: 'added', unified_diff: '@@ -0,0 +1,1 @@\n+x' }] },
+      }),
+    )
+    ingestRealTaskData('thread-RM2', {
+      streamStatus: 'streaming',
+      events: [],
+      runId: 'run-2',
+      title: 'RM2',
+    })
+    expect(realTaskAdapter.getTask('thread-RM2')?.files).toEqual([])
+  })
 })
 
 // ---- 已知限制：files / validation 占位 ----
@@ -277,5 +381,280 @@ describe('realTaskAdapter 重新进入 thread', () => {
       title: 'R2',
     })
     expect(realTaskAdapter.getTask('thread-R2')?.files).toEqual([])
+  })
+})
+
+// ---- 变化文件：diff 正文与计数（F1） ----
+
+describe('realTaskAdapter 变化文件 diff', () => {
+  it('新增文件带 unified_diff 时：计数按 diff 正文行数，且 diff 行可渲染', () => {
+    ingestRealTaskData('thread-D1', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d1',
+      title: 'D1',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'hello.c',
+            status: 'added',
+            unified_diff:
+              '--- /dev/null\n+++ b/hello.c\n@@ -0,0 +1,2 @@\n+#include <stdio.h>\n+int main(){return 0;}',
+            diff_truncated: false,
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-D1', result)
+
+    const file = realTaskAdapter.getTask('thread-D1')?.files[0]
+    expect(file?.change).toBe('A')
+    expect(file?.added).toBe(2)
+    expect(file?.removed).toBe(0)
+    expect(file?.diff).toHaveLength(2)
+    expect(file?.diff[0]?.type).toBe('add')
+    expect(file?.diff[0]?.text).toBe('#include <stdio.h>')
+    expect(file?.diff[1]?.new_line).toBe(2)
+  })
+
+  it('修改文件：added / removed 计数与 diff 正文一致', () => {
+    ingestRealTaskData('thread-D2', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d2',
+      title: 'D2',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'a.py',
+            status: 'modified',
+            change: 'content_changed',
+            unified_diff:
+              '--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n line1\n-line2\n+CHANGED\n line3',
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-D2', result)
+
+    const file = realTaskAdapter.getTask('thread-D2')?.files[0]
+    expect(file?.change).toBe('M')
+    expect(file?.added).toBe(1)
+    expect(file?.removed).toBe(1)
+    expect(file?.diff.map((l) => l.type)).toEqual([
+      'context',
+      'remove',
+      'add',
+      'context',
+    ])
+    // 上下文行不带 diff 的前导空格（渲染时由组件补一个）
+    expect(file?.diff[0]?.text).toBe('line1')
+  })
+
+  it('hunk 内的 "--- "/"+++ " 内容行不被误当文件头丢掉', () => {
+    ingestRealTaskData('thread-D3', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d3',
+      title: 'D3',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'x.md',
+            status: 'modified',
+            unified_diff:
+              '--- a/x.md\n+++ b/x.md\n@@ -1,2 +1,2 @@\n---- old heading\n+++ new heading',
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-D3', result)
+
+    const file = realTaskAdapter.getTask('thread-D3')?.files[0]
+    // 两行都在（removed 1 行、added 1 行），没有因为 "---"/"+++" 前缀被吞掉
+    expect(file?.diff).toHaveLength(2)
+    expect(file?.removed).toBe(1)
+    expect(file?.added).toBe(1)
+    expect(file?.diff[0]?.text).toBe('--- old heading')
+    expect(file?.diff[1]?.text).toBe('++ new heading')
+  })
+
+  it('diff 被截断时透出 diff_truncated 标记', () => {
+    ingestRealTaskData('thread-D4', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d4',
+      title: 'D4',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: {
+        files: [
+          {
+            path: 'big.py',
+            status: 'added',
+            unified_diff: '--- /dev/null\n+++ b/big.py\n@@ -0,0 +1,1 @@\n+x = 1',
+            diff_truncated: true,
+          },
+        ],
+      },
+    })
+    ingestProjectExecuteResult('thread-D4', result)
+    expect(realTaskAdapter.getTask('thread-D4')?.files[0]?.diff_truncated).toBe(true)
+  })
+
+  it('没有 diff 正文时计数不谎报（新增文件 added 为 0）', () => {
+    ingestRealTaskData('thread-D5', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-d5',
+      title: 'D5',
+    })
+    const result = JSON.stringify({
+      ok: true,
+      status: 'completed',
+      changes: { files: [{ path: 'bin.dat', status: 'added', reason: 'binary file' }] },
+    })
+    ingestProjectExecuteResult('thread-D5', result)
+
+    const file = realTaskAdapter.getTask('thread-D5')?.files[0]
+    expect(file?.added).toBe(0)
+    expect(file?.removed).toBe(0)
+    expect(file?.diff).toEqual([])
+  })
+})
+
+// ---- F1：多段 hunk ----
+
+/**
+ * 真实场景：30 行文件改第 2 行与第 25 行，difflib 会拆成**两个** hunk
+ * （改动点相隔超过上下文行数 3）。第二个块头 `@@ -22,7 +22,7 @@` 若被当成
+ * 正文行，后面的行号会接着第一段累加 —— CHANGED_AT_25 会显示成第 10 行。
+ */
+const TWO_HUNK_DIFF = [
+  '--- a/demo.txt',
+  '+++ b/demo.txt',
+  '@@ -1,5 +1,5 @@',
+  ' line1',
+  '-line2',
+  '+CHANGED_AT_2',
+  ' line3',
+  ' line4',
+  ' line5',
+  '@@ -22,7 +22,7 @@',
+  ' line22',
+  ' line23',
+  ' line24',
+  '-line25',
+  '+CHANGED_AT_25',
+  ' line26',
+  ' line27',
+  ' line28',
+].join('\n')
+
+describe('realTaskAdapter 多段 hunk 解析', () => {
+  const ingestTwoHunk = (threadId: string) => {
+    ingestRealTaskData(threadId, {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-two-hunk',
+      title: '两段 hunk',
+    })
+    ingestProjectExecuteResult(
+      threadId,
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: {
+          files: [{ path: 'demo.txt', status: 'modified', unified_diff: TWO_HUNK_DIFF }],
+        },
+      }),
+    )
+    return realTaskAdapter.getTask(threadId)?.files[0]
+  }
+
+  it('块头不会被当成正文行渲染', () => {
+    const file = ingestTwoHunk('thread-H1')
+    expect(file?.diff.some((l) => l.text.startsWith('@@'))).toBe(false)
+    expect(file?.diff.map((l) => l.text)).not.toContain('@@ -22,7 +22,7 @@')
+  })
+
+  it('第二个 hunk 的行号按块头重设（CHANGED_AT_25 是第 25 行，不是第 10 行）', () => {
+    const file = ingestTwoHunk('thread-H2')
+    const changed25 = file?.diff.find((l) => l.text === 'CHANGED_AT_25')
+    expect(changed25?.new_line).toBe(25)
+    expect(changed25?.type).toBe('add')
+
+    const removed25 = file?.diff.find((l) => l.text === 'line25')
+    expect(removed25?.old_line).toBe(25)
+    expect(removed25?.type).toBe('remove')
+  })
+
+  it('第一个 hunk 的行号同样正确', () => {
+    const file = ingestTwoHunk('thread-H3')
+    const changed2 = file?.diff.find((l) => l.text === 'CHANGED_AT_2')
+    expect(changed2?.new_line).toBe(2)
+    const removed2 = file?.diff.find((l) => l.text === 'line2')
+    expect(removed2?.old_line).toBe(2)
+  })
+
+  it('上下文行在第二个 hunk 内的行号连续', () => {
+    const file = ingestTwoHunk('thread-H4')
+    const ctx22 = file?.diff.find((l) => l.text === 'line22')
+    expect(ctx22?.old_line).toBe(22)
+    expect(ctx22?.new_line).toBe(22)
+    const ctx28 = file?.diff.find((l) => l.text === 'line28')
+    expect(ctx28?.old_line).toBe(28)
+    expect(ctx28?.new_line).toBe(28)
+  })
+
+  it('计数覆盖两个 hunk 的全部改动', () => {
+    const file = ingestTwoHunk('thread-H5')
+    expect(file?.added).toBe(2)
+    expect(file?.removed).toBe(2)
+  })
+
+  it('hunk 内的 `--- `/`+++ ` 仍是内容行，不被当成文件头丢掉', () => {
+    // 被删掉的一行内容是 `-- 注释`：去掉首个 '-' 后是 '- 注释'，
+    // 渲染时仍要能看到
+    ingestRealTaskData('thread-H6', {
+      streamStatus: 'completed',
+      events: [],
+      runId: 'run-h6',
+      title: 'H6',
+    })
+    ingestProjectExecuteResult(
+      'thread-H6',
+      JSON.stringify({
+        ok: true,
+        status: 'completed',
+        changes: {
+          files: [
+            {
+              path: 'c.txt',
+              status: 'modified',
+              unified_diff:
+                '--- a/c.txt\n+++ b/c.txt\n@@ -1,3 +1,3 @@\n line1\n--- 注释\n+++ 新增行\n line3',
+            },
+          ],
+        },
+      }),
+    )
+    const file = realTaskAdapter.getTask('thread-H6')?.files[0]
+    expect(file?.diff.some((l) => l.text === '-- 注释')).toBe(true)
+    expect(file?.diff.some((l) => l.text === '++ 新增行')).toBe(true)
   })
 })

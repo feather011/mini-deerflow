@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import AsyncIterator, Callable
 
@@ -37,17 +39,25 @@ from mini_deerflow.api.routes.threads import router as threads_router
 from mini_deerflow.api.routes.files import router as files_router
 from mini_deerflow.api.routes.context_usage import router as context_usage_router
 from mini_deerflow.api.routes.projects import router as projects_router
+from mini_deerflow.api.routes.mcp import router as mcp_router
+from mini_deerflow.api.routes.confirmations import router as confirmations_router
 from mini_deerflow.api.schemas.errors import (
     ErrorCode,
     build_error_response,
     safe_message,
 )
 from mini_deerflow.mcp_config import load_mcp_config
-from mini_deerflow.model_config import load_model_settings
+from mini_deerflow.model_config import PROVIDER_VAR, load_model_settings
+from mini_deerflow.model_errors import ModelConfigError
 from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_config
 from mini_deerflow.thread_store import InMemoryThreadStore, SQLiteThreadStore
 from mini_deerflow.project_store import InMemoryProjectStore, SQLiteProjectStore
 from mini_deerflow.tools import create_default_registry
+from mini_deerflow.web_tools import (
+    HostPolicy as WebHostPolicy,
+    WebToolConfig,
+    build_web_search_provider_from_config,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,9 +98,59 @@ def _build_project_store(settings: ApiSettings):
     return SQLiteProjectStore(settings.db_path)
 
 
+def build_web_host_policy(settings: ApiSettings) -> WebHostPolicy:
+    """根据 ApiSettings 构造 SSRF 防护策略。
+
+    - 默认拒绝 loopback / 私有网络 / IP 字面量
+    - 显式白名单（精确匹配，lowercase）
+    - `WEB_ALLOW_LOOPBACK=1` 时放行 loopback（仅 CI/测试用）
+    """
+    return WebHostPolicy(
+        allow_loopback=bool(settings.web_allow_loopback),
+        allow_private_networks=False,
+        allow_ip_literal=False,
+        allowed_hosts=frozenset(h.lower() for h in settings.web_allowed_hosts),
+    )
+
+
+def _require_configured_model_provider() -> None:
+    """正常模式必须显式配置模型 provider，否则明确报错。
+
+    `MINI_DEERFLOW_MODEL_PROVIDER` 的**代码默认值是 fake**，而 FakeModel
+    只会重复固定文案。配置缺失时若放行，界面看起来"能聊天"，实际上
+    完全不具备正常对话能力 —— 这正是人工验收时看到的现象。
+    这里宁可启动失败，也不让正常模式悄悄退回固定回复。
+
+    拦的是**完全没配置**，不是 `provider=fake`：测试套件
+    （`tests/conftest.py` 的 autouse fixture）与容器部署验收
+    （`scripts/compose_persistence_check.py`）都**显式**写 fake，
+    那是它们有意的选择，必须继续可用。
+
+    本模块顶部的 `load_dotenv(...)` 已在 import 时把 `.env` 并入
+    `os.environ`，因此查 `os.environ` 同时覆盖「系统环境变量」与「`.env`」
+    两层，优先级也与 `load_model_settings()` 一致（环境变量 > .env）。
+    """
+    if (os.environ.get(PROVIDER_VAR) or "").strip():
+        return
+
+    raise ModelConfigError(
+        f"正常模式未配置 {PROVIDER_VAR}。\n"
+        "该变量的默认值是 fake，而 fake 只会重复固定回复，不具备正常聊天能力；"
+        "因此这里明确报错，而不是悄悄退回固定回复。\n"
+        "请配置真实 provider 之一：\n"
+        f"  {PROVIDER_VAR}=minimax 并设置 MINIMAX_API_KEY\n"
+        f"  {PROVIDER_VAR}=mimo    并设置 MIMO_API_KEY\n"
+        "若只想跑流程验收，请用测试入口 scripts/tool07_acceptance_server.py"
+        "（脚本模型，只用于流程验收）。"
+    )
+
+
 def _default_runtime_factory(
     settings: ApiSettings | None = None,
 ) -> "RuntimeContext":
+    # 先校验再装配：配置缺失时要立刻失败，不能先建出一堆资源再报错。
+    _require_configured_model_provider()
+
     # 与 CLI 一致注入默认工具（create_default_registry）。
     # 裸 ToolRegistry() 是空表，会导致任何 ToolCall 都以 ToolNotFoundError 失败。
     #
@@ -98,7 +158,7 @@ def _default_runtime_factory(
     # 阶段既不读配置也不创建客户端，更不发网络请求。
     resolved = settings or ApiSettings()
     ws_root = resolved.workspaces_root
-    return create_runtime(
+    runtime = create_runtime(
         store=_build_store(resolved),
         project_store=_build_project_store(resolved),
         registry=create_default_registry(),
@@ -111,10 +171,120 @@ def _default_runtime_factory(
             harness_root=resolved.harness_root,
             harness_timeout_seconds=resolved.harness_timeout_seconds,
             disable_budget=True,
+            # TOOL-06：网络只读配置
+            web_read_timeout_s=resolved.web_read_timeout_s,
+            web_host_policy=build_web_host_policy(resolved),
+            # R4：先用 unavailable 启动；MCP 启动后再二次注入真实 executor
+            web_search_provider=build_web_search_provider_from_config(
+                kind=resolved.web_search_provider_kind,
+                fake_results=list(resolved.web_search_fake_results),
+                mcp_executor=None,
+                mcp_tool_name=resolved.web_search_mcp_tool,
+            ),
             **load_context_config(),
         ),
         workspaces_root=ws_root,
     )
+
+    # R4：MCP 启动后二次注入真实搜索 Provider
+    # kind=mcp + web_search_mcp_server 已配置 + MCPManager 已就绪 →
+    # 把 mcp_manager._invoke 按**真实签名** (qualified, args, timeout) -> str
+    # 包装成 executor，并用当前可信 run 上下文挂上目标工具的授权复核。
+    if (
+        resolved.web_search_provider_kind == "mcp"
+        and resolved.web_search_mcp_server
+        and getattr(runtime, "mcp_manager", None) is not None
+    ):
+        server_name = resolved.web_search_mcp_server
+        tool_name = resolved.web_search_mcp_tool
+        mcp_manager = runtime.mcp_manager
+        # 验证该 server 已注册并暴露目标工具
+        qualified = f"mcp__{server_name}__{tool_name}"
+        if qualified in mcp_manager.registered_names:
+            # 超时：复用 MCP server 的 call_timeout（缺省 30s）
+            try:
+                from mini_deerflow.mcp_manager import find_server_config
+
+                call_timeout = find_server_config(
+                    load_mcp_config(), server_name
+                ).call_timeout
+            except LookupError:
+                # 服务器未在配置中 → 回落默认值
+                call_timeout = 30.0
+            # 其他异常（MCPConfigError / OSError 等）不捕获，由调用方处理
+
+            def _mcp_executor(_tool: str, args: dict) -> str:
+                # 真实契约：第三个位置参数 timeout；返回值是 **JSON 字符串**
+                return mcp_manager._invoke(qualified, args, call_timeout)
+
+            # 授权复核：与 Agent._do_tool_call 第三层同一套判定
+            policy_reg = getattr(
+                runtime.integrated_agent._agent, "_tool_policy_registry", None
+            )
+
+            def _context_guard(context: object | None) -> None:
+                if policy_reg is None:
+                    return  # 未启用策略层时不做额外判定（前两层仍生效）
+                from mini_deerflow.tool_authorization import (
+                    check_tool_access,
+                    session_capabilities,
+                )
+
+                thread_id = getattr(context, "thread_id", None) or ""
+                run_id = getattr(context, "run_id", "") or ""
+                project_id = None
+                store = getattr(policy_reg, "_thread_store", None)
+                if thread_id and store is not None:
+                    try:
+                        project_id = store.get(thread_id).project_id
+                    except Exception:
+                        project_id = None
+                authority = policy_reg.get_authority(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    project_id=project_id,
+                    granted_capabilities=session_capabilities(project_id),
+                )
+                decision = check_tool_access(policy_reg, qualified, authority)
+                if decision.is_denied or decision.is_confirm:
+                    from mini_deerflow.web_tools import WebToolPolicyError
+
+                    raise WebToolPolicyError(
+                        f"目标 MCP 工具 {qualified} 未授权: {decision.reason}"
+                    )
+
+            from mini_deerflow.web_tools import create_web_tools
+
+            new_provider = build_web_search_provider_from_config(
+                kind="mcp",
+                mcp_executor=_mcp_executor,
+                mcp_tool_name=tool_name,
+                context_guard=_context_guard,
+            )
+            # 替换 config 上的 provider；并重建 web_search 工具以使用新 provider
+            runtime.config = replace(
+                runtime.config, web_search_provider=new_provider
+            )
+            # 找到 Agent 持有的 registry（私有属性）
+            agent = runtime.integrated_agent._agent
+            agent_registry = getattr(agent, "_registry", None)
+            if agent_registry is not None:
+                try:
+                    agent_registry.unregister("web_search")
+                except Exception:
+                    pass
+                new_tools = create_web_tools(
+                    WebToolConfig(
+                        timeout_s=runtime.config.web_read_timeout_s,
+                        host_policy=runtime.config.web_host_policy,
+                    ),
+                    provider=new_provider,
+                )
+                agent_registry.register_many(
+                    [t for t in new_tools if t.name == "web_search"]
+                )
+
+    return runtime
 
 
 def _settings_runtime_factory(settings: ApiSettings) -> "RuntimeContext":
@@ -286,6 +456,14 @@ def create_app(
     )
     app.include_router(
         projects_router,
+        prefix=resolved_settings.api_prefix,
+    )
+    app.include_router(
+        mcp_router,
+        prefix=resolved_settings.api_prefix,
+    )
+    app.include_router(
+        confirmations_router,
         prefix=resolved_settings.api_prefix,
     )
 

@@ -74,6 +74,10 @@ class MCPServerConfig:
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT
     call_timeout: float = DEFAULT_CALL_TIMEOUT
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    # TOOL-03 R2：可信分类。空集合 = 不分类 → 默认拒绝；
+    # 有分类时按声明的能力/副作用构造 ToolMetadata。
+    tool_capabilities: frozenset[str] = field(default_factory=frozenset)
+    tool_side_effects: frozenset[str] = field(default_factory=frozenset)
 
     def __repr__(self) -> str:
         # 显式重写：env 可能装着子进程专用凭据，不能被默认 repr 打出来
@@ -130,6 +134,14 @@ def parse_server_config(raw: Mapping[str, Any], index: int) -> MCPServerConfig:
     if not isinstance(max_output, int) or isinstance(max_output, bool) or max_output <= 0:
         raise MCPConfigError(f"{where}.max_output_bytes 必须是正整数")
 
+    # TOOL-03 R2：可信分类（可选）
+    raw_caps = raw.get("tool_capabilities", [])
+    if not isinstance(raw_caps, list) or not all(isinstance(c, str) for c in raw_caps):
+        raise MCPConfigError(f"{where}.tool_capabilities 必须是字符串数组")
+    raw_sides = raw.get("tool_side_effects", [])
+    if not isinstance(raw_sides, list) or not all(isinstance(s, str) for s in raw_sides):
+        raise MCPConfigError(f"{where}.tool_side_effects 必须是字符串数组")
+
     return MCPServerConfig(
         name=name,
         command=command,
@@ -140,6 +152,8 @@ def parse_server_config(raw: Mapping[str, Any], index: int) -> MCPServerConfig:
         startup_timeout=_positive_float("startup_timeout", DEFAULT_STARTUP_TIMEOUT),
         call_timeout=_positive_float("call_timeout", DEFAULT_CALL_TIMEOUT),
         max_output_bytes=max_output,
+        tool_capabilities=frozenset(raw_caps),
+        tool_side_effects=frozenset(raw_sides),
     )
 
 

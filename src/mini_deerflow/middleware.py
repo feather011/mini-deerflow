@@ -40,7 +40,9 @@ class ExecutionContext:
     attempt: int = 1
     started_at: float = field(default_factory=time.monotonic)
     cancellation_token: "CancellationToken | None" = None
-    budget: "Budget | None" = None
+    # BUDGET-01：本次运行的预算。可以是 `Budget` 本体，也可以是子代理的
+    # `ChildBudget` 视图（复审 B1：继续委派时原样传递，链条不中断）。
+    budget: "Budget | ChildBudget | None" = None
     parent_span_id: str | None = None
     span_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -48,6 +50,8 @@ class ExecutionContext:
     # 值为一个累积 token 文本的列表引用；model.stream_decide() 每 yield 一个 token
     # 就 append 进去。RunEventMiddleware.success() 读取此字段，逐 token 发布 model.token 事件。
     token_accumulator: "list[str] | None" = None
+    # TOOL-02：工具授权检查通过后的已授予能力集合，供 handler（如 subagent_submit）读取并传递给子任务
+    granted_capabilities: frozenset = field(default_factory=frozenset)
 
     def is_cancelled(self) -> bool:
         return self.cancellation_token.is_cancelled() if self.cancellation_token else False
@@ -520,6 +524,28 @@ class Budget:
         with self._lock:
             return self._max_depth_seen
 
+    def derive(self) -> "Budget":
+        """按**同样的额度上限**派生一个独立的计数器（计数从 0 开始）。
+
+        BUDGET-01：预算的**生命周期**必须与「一次运行」对齐，而不是与进程
+        对齐。进程级共享的计数器会让**运行 A 消耗掉运行 B 的额度**。
+
+        用法：Agent 持有一个只作为「上限模板」的 Budget 实例，每次 run() 用
+        `derive()` 派生一个本次运行专属的计数器。父子 Agent 共享**同一个**
+        派生实例 → 子代理消耗真实计入父运行。
+
+        只复制上限，不复制计数；新实例有自己的锁，与原实例互不影响。
+        """
+        return Budget(
+            max_steps=self.max_steps,
+            max_model_calls=self.max_model_calls,
+            max_tool_calls=self.max_tool_calls,
+            max_subagent_tasks=self.max_subagent_tasks,
+            max_subagent_depth=self.max_subagent_depth,
+            max_wall_time_seconds=self.max_wall_time_seconds,
+            max_summary_calls=self.max_summary_calls,
+        )
+
     def check_wall_time(self, started_at: float) -> bool:
         if self.max_wall_time_seconds is None:
             return True
@@ -685,6 +711,118 @@ class BudgetExceededError(Exception):
         )
 
 
+# --- 子代理额度视图（BUDGET-01） ---
+
+
+class ChildBudget:
+    """子代理的额度视图：**父运行的额度 + （可选）模型自填的更严局部上限**。
+
+    两条规则同时成立：
+
+    1. **计入父运行** —— 每次消耗都记到父运行的同一个 Budget 实例上，
+       父的 `max_model_calls` / `max_tool_calls` 对子代理同样生效；
+    2. **不能扩额** —— 模型自填的局部上限只能**收紧**：局部先检查（更严的
+       先挡），父额度随后照常计数。
+
+    过去这里直接用独立的 `SubagentBudget` 顶替父额度，子代理的消耗完全不
+    进父计数器 —— 等于凭空多出一份额度。
+    """
+
+    __slots__ = ("_parent", "_local")
+
+    def __init__(
+        self,
+        parent: "Budget | ChildBudget | None",
+        local: Budget | None,
+    ) -> None:
+        # 复审 B1：parent 允许再套一层 ChildBudget —— 带局部额度的子代理
+        # 继续委派时，上一层的 ChildBudget 视图原样传进来，链条一路链到根。
+        self._parent = parent
+        self._local = local
+
+    # --- 额度消耗 ---
+
+    def consume_step(self) -> None:
+        if self._local is not None:
+            self._local.consume_step()
+        if self._parent is not None:
+            self._parent.consume_step()
+
+    def consume_model_call(self) -> None:
+        if self._local is not None:
+            self._local.consume_model_call()
+        if self._parent is not None:
+            self._parent.consume_model_call()
+
+    def consume_tool_call(self) -> None:
+        if self._local is not None:
+            self._local.consume_tool_call()
+        if self._parent is not None:
+            self._parent.consume_tool_call()
+
+    def consume_subagent_task(self, depth: int) -> None:
+        if self._parent is not None:
+            self._parent.consume_subagent_task(depth)
+
+    def consume_summary_call(self) -> None:
+        if self._local is not None:
+            self._local.consume_summary_call()
+        if self._parent is not None:
+            self._parent.consume_summary_call()
+
+    # --- 只读属性：子代理用 max_steps 决定自己的步数上限 ---
+
+    @property
+    def max_steps(self) -> int | None:
+        """局部上限优先（更严的那个）；只有一边有时取那一边。"""
+        if self._local is not None and self._local.max_steps is not None:
+            return self._local.max_steps
+        return self._parent.max_steps if self._parent is not None else None
+
+    @property
+    def max_model_calls(self) -> int | None:
+        if self._local is not None and self._local.max_model_calls is not None:
+            return self._local.max_model_calls
+        return self._parent.max_model_calls if self._parent is not None else None
+
+    @property
+    def max_tool_calls(self) -> int | None:
+        if self._local is not None and self._local.max_tool_calls is not None:
+            return self._local.max_tool_calls
+        return self._parent.max_tool_calls if self._parent is not None else None
+
+    @property
+    def max_subagent_depth(self) -> int | None:
+        return self._parent.max_subagent_depth if self._parent is not None else None
+
+    def check_depth(self, depth: int) -> bool:
+        if self._parent is not None:
+            return self._parent.check_depth(depth)
+        return True
+
+
+def build_child_budget(
+    parent: "Budget | ChildBudget | None",
+    local: Budget | None,
+) -> "Budget | ChildBudget | None":
+    """组合父运行额度与模型自填的局部上限。
+
+    - 父有、局部无 → 直接用父的实例（父子共享同一个计数器）；
+    - 父有、局部有 → 用 `ChildBudget` 视图（局部只能收紧）；
+    - 父无、局部有 → 用局部的（原语义：调用方自持额度）；
+    - 两边都无 → None（不限制）。
+
+    复审 B1：`parent` 允许是上一层的 `ChildBudget` 视图 —— 带局部额度的
+    子代理继续委派时，链条 `ChildBudget(ChildBudget(...root...), local)`
+    一路向上，根计数器不丢。
+    """
+    if parent is None:
+        return local
+    if local is None:
+        return parent
+    return ChildBudget(parent, local)
+
+
 class BudgetMiddleware(Middleware[T]):
     """预算检查中间件。"""
 
@@ -692,7 +830,12 @@ class BudgetMiddleware(Middleware[T]):
         self._budget = budget
 
     def before(self, ctx: ExecutionContext) -> None:
-        ctx.budget = self._budget
+        # BUDGET-01：只在 ctx 尚未带预算时发布本中间件的预算。
+        # 调用方（Agent.run）会先把**本次运行**的预算放进 ctx —— 那是
+        # 与运行对齐的计数器；这里若无条件覆盖，就会把 per-run 预算
+        # 换回进程级的模板实例，父子共享与「不同运行互不消耗」都会失效。
+        if ctx.budget is None:
+            ctx.budget = self._budget
 
     def success(self, ctx: ExecutionContext, result: T) -> T:
         return result

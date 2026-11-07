@@ -212,6 +212,9 @@ function DiffView({ file }: { file: ChangedFile }) {
   return (
     <div className={styles.diff}>
       <div className={styles.diffHead}>{file.path} · 本轮变化</div>
+      {file.diff_truncated && (
+        <div className={styles.diffTruncated}>diff 正文过长，已截断显示</div>
+      )}
       <div className={styles.diffLines}>
         {file.diff.map((line, index) => (
           <div

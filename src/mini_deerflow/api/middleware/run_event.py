@@ -17,7 +17,12 @@ import logging
 import threading
 from typing import Any
 
-from mini_deerflow.api.schemas.streaming import RunEvent, RunEventType
+from mini_deerflow.api.schemas.streaming import (
+    RunEvent,
+    RunEventType,
+    failure_text,
+    tool_failure_text,
+)
 from mini_deerflow.api.services.event_broker import RunEventBroker
 from mini_deerflow.middleware import ExecutionContext, Middleware, OperationType
 from mini_deerflow.thread_store import ThreadStore
@@ -169,7 +174,11 @@ class RunEventMiddleware(Middleware[Any]):
                 thread_id,
                 RunEventType.MODEL_FAILED,
                 operation="model",
-                error=f"Model 调用失败 ({exc.__class__.__name__})",
+                # 带上具体原因（仅限按约定不含敏感信息的异常类型），
+                # 否则使用者只能看到 "ModelProtocolError" 这类代号，无法判断出了什么事
+                error=failure_text(
+                    f"Model 调用失败 ({exc.__class__.__name__})", exc
+                ),
             )
         elif op == OperationType.TOOL_CALL:
             self._publish(
@@ -178,7 +187,8 @@ class RunEventMiddleware(Middleware[Any]):
                 RunEventType.TOOL_FAILED,
                 operation="tool",
                 tool_name=ctx.operation_name,
-                error=f"Tool 调用失败 ({exc.__class__.__name__})",
+                # 工具名 + 稳定错误码 + 安全说明；不放行原始异常 message
+                error=tool_failure_text(ctx.operation_name, exc),
             )
         return exc
 

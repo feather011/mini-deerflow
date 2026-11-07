@@ -159,6 +159,77 @@ class TestFastAPI走统一Factory:
             ctx.shutdown()
 
 
+class Test正常模式不得静默退回固定回复:
+    """人工验收返修 · 第 1 项。
+
+    人工验收时"普通会话"只会重复同一段固定文案，根因是
+    `MINI_DEERFLOW_MODEL_PROVIDER` 的**默认值就是 fake**：配置缺失时
+    `create_model()` 静默返回 `FakeModel`，界面看起来"能用"，
+    实际不具备任何正常聊天能力。
+
+    修法不是"禁止 fake"——`fake` 是 20 个测试文件与容器部署验收
+    （`scripts/compose_persistence_check.py`）的合法选择。
+    真正要拦的是**完全没配置**：生产入口必须在启动时明确报错。
+    """
+
+    def test_未配置_provider_时生产入口报错_而非返回固定回复(self, monkeypatch) -> None:
+        from mini_deerflow.api import app as api_app
+
+        monkeypatch.delenv("MINI_DEERFLOW_MODEL_PROVIDER", raising=False)
+
+        with pytest.raises(ModelConfigError) as exc:
+            api_app._default_runtime_factory()
+
+        assert "MINI_DEERFLOW_MODEL_PROVIDER" in str(exc.value)
+
+    def test_未配置时_error_里必须点明这会导致固定回复(self, monkeypatch) -> None:
+        """报错要说清后果，否则用户只会看到一堆环境变量名。"""
+        from mini_deerflow.api import app as api_app
+
+        monkeypatch.delenv("MINI_DEERFLOW_MODEL_PROVIDER", raising=False)
+
+        with pytest.raises(ModelConfigError) as exc:
+            api_app._default_runtime_factory()
+
+        message = str(exc.value)
+        assert "fake" in message
+        assert "固定" in message
+
+    def test_显式配置_fake_仍被接受_不破坏测试与容器验收(self, monkeypatch) -> None:
+        """conftest 与 compose 验收都是**显式**写 fake 的，必须继续可用。"""
+        from mini_deerflow.api import app as api_app
+
+        monkeypatch.setenv("MINI_DEERFLOW_MODEL_PROVIDER", "fake")
+
+        ctx = api_app._default_runtime_factory()
+        try:
+            assert isinstance(ctx.agent._model, FakeModel)
+        finally:
+            ctx.shutdown()
+
+    def test_显式配置真实_provider_正常启动(self, monkeypatch) -> None:
+        from mini_deerflow.api import app as api_app
+
+        monkeypatch.setenv("MINI_DEERFLOW_MODEL_PROVIDER", "minimax")
+        monkeypatch.setenv("MINIMAX_API_KEY", KEY)
+
+        ctx = api_app._default_runtime_factory()
+        try:
+            assert isinstance(ctx.agent._model, AnthropicCompatModel)
+        finally:
+            ctx.shutdown()
+
+    def test_注入自定义_runtime_factory_的入口不受影响(self, monkeypatch) -> None:
+        """验收脚本传入自己的 runtime_factory，根本不读模型配置。"""
+        from mini_deerflow.api import app as api_app
+
+        monkeypatch.delenv("MINI_DEERFLOW_MODEL_PROVIDER", raising=False)
+        sentinel = FakeModel()
+
+        # create_app(runtime_factory=...) 走的是注入的工厂，不经过默认工厂
+        assert callable(api_app._build_factory(None, lambda: sentinel))
+
+
 class TestCLI走统一Factory:
     def test_cli_把_load_model_settings_结果注入_runtime(self, monkeypatch) -> None:
         import mini_deerflow.cli as cli

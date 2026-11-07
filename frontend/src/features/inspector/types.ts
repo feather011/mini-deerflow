@@ -5,8 +5,14 @@
  * - 任务状态与验证状态分开建模（执行完成 ≠ 业务验收通过）
  * - 没有命令证据（command/output 为 null）时，UI 不得显示测试通过
  */
-/** 任务状态 */
+/**
+ * 任务状态
+ *
+ * `no_run` 与 `running` 必须分开：还没有任何 Run 时说"运行中"是假的
+ * （产品口径：暂无运行）。
+ */
 export type TaskStatus =
+  | 'no_run'
   | 'running'
   | 'completed'
   | 'failed'
@@ -44,6 +50,8 @@ export interface ChangedFile {
   added: number
   removed: number
   diff: DiffLine[]
+  /** diff 正文被截断（后端只给前若干行） */
+  diff_truncated?: boolean
 }
 
 /** 验证证据 */
@@ -79,7 +87,16 @@ export interface TaskResult {
   run_id_marker: string | null
 }
 
-/** 任务结果数据源接口：当前由 mockTaskAdapter 实现，后续可替换为真实 API */
+/** 任务结果数据来源：real=真实运行结果，mock=演示数据 */
+export type TaskDataSource = 'real' | 'mock'
+
+/** 任务结果数据源接口：生产路径用 realTaskAdapter，mockTaskAdapter 仅供测试 */
 export interface TaskAdapter {
+  /**
+   * 数据来源标记。
+   * UI 依据它决定是否标注"模拟数据" —— 不能与面板开合之类的 UI 状态挂钩：
+   * 真实 harness 产出的文件与 diff 不是模拟数据。
+   */
+  dataSource: TaskDataSource
   getTask(threadId: string | null): TaskResult | null
 }

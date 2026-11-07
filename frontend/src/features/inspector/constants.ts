@@ -3,6 +3,8 @@ export type PillTone = 'success' | 'warning' | 'danger' | 'neutral'
 
 /** 任务状态 → 文案与语义色 */
 export const TASK_STATUS_META = {
+  // 还没有任何 Run：中性色，不冒充"运行中"
+  no_run: { label: '暂无运行', tone: 'neutral' as const },
   running: { label: '运行中', tone: 'warning' as const },
   completed: { label: '已完成', tone: 'success' as const },
   failed: { label: '失败', tone: 'danger' as const },

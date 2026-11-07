@@ -275,6 +275,8 @@ const DEMO_TASKS: Record<string, TaskResult> = {
 
 /** 模拟适配器：按 threadId 归属取任务；未登记的 id 与 null 返回 null */
 export const mockTaskAdapter: TaskAdapter = {
+  // 演示数据：UI 据此标注"模拟数据"
+  dataSource: 'mock',
   getTask(threadId: string | null): TaskResult | null {
     if (!threadId) return null
     return DEMO_TASKS[threadId] ?? null

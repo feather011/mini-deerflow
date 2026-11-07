@@ -84,6 +84,35 @@
   transition: background 0.15s;
 }
 
+.actionRow {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+
+.stopBtn {
+  padding: 8px 16px;
+  background: #fff;
+  color: var(--color-danger, #dc2626);
+  border: 1px solid var(--color-danger, #dc2626);
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.stopBtn:hover:not(:disabled) {
+  background: #fef2f2;
+}
+
+.stopBtn:disabled {
+  color: var(--color-text-muted, #6b7280);
+  border-color: var(--color-border, #e5e7eb);
+  cursor: not-allowed;
+}
+
 .sendBtn:hover:not(:disabled) {
   background: #1d4ed8;
 }

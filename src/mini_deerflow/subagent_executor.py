@@ -20,7 +20,15 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from typing import TYPE_CHECKING, Callable
 
 from mini_deerflow.agent import Agent
-from mini_deerflow.models import FakeModel, FinalAnswer, Message, Model, ToolCall
+from mini_deerflow.models import (
+    Decision,
+    FakeModel,
+    FinalAnswer,
+    Message,
+    Model,
+    ToolCall,
+    ToolCalls,
+)
 from mini_deerflow.tool_contracts import ExecutorPrincipal
 
 if TYPE_CHECKING:
@@ -51,7 +59,12 @@ from mini_deerflow.tool_authorization import ToolPolicyRegistry
 from mini_deerflow.middleware import (  # noqa: E402, F401
     Budget as SubagentBudget,
     BudgetExceededError,
+    ChildBudget,
 )
+
+# 预算既可以是 Budget 本体，也可以是 ChildBudget 视图（父子共享 + 局部更严）。
+# 二者接口一致：consume_* 与 max_* 读属性。
+BudgetLike = SubagentBudget | ChildBudget
 
 
 # --- Cancellation Token ---
@@ -90,7 +103,7 @@ class SubagentRunner:
     model: Model
     registry: ToolRegistry
     store: ThreadStore
-    budget: SubagentBudget
+    budget: BudgetLike
     cancellation_token: CancellationToken
     # 用于 Trace 关联
     parent_run_id: str = ""
@@ -100,6 +113,10 @@ class SubagentRunner:
     context_assembler: ContextAssembler | None = None
     # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
     tool_policy_registry: "ToolPolicyRegistry | None" = None
+    # TOOL-02：子任务从父 Agent 继承的已授予能力
+    parent_granted_capabilities: frozenset = field(default_factory=frozenset)
+    # TOOL-02：子任务继承父 Agent 的 project_id
+    parent_project_id: str | None = None
 
     def run(self) -> SubagentResult:
         """执行子任务并返回结果。"""
@@ -111,10 +128,15 @@ class SubagentRunner:
             if self.task.status == TaskStatus.QUEUED:
                 self.task.transition_to(TaskStatus.RUNNING)
 
-            # 创建独立 Thread
+            # 创建独立 Thread（继承父项目的 project_id）
             if self.store.exists(thread_id):
                 self.store.delete(thread_id)
             self.store.create(thread_id)
+            # TOOL-02（R2a-2）：子线程继承父项目的 project_id，使项目工具可访问
+            if self.parent_project_id is not None:
+                sub_thread = self.store.get(thread_id)
+                sub_thread.project_id = self.parent_project_id
+                self.store.save(sub_thread)
 
             started_at = time.monotonic()
             if self.task.started_at is not None:
@@ -148,6 +170,10 @@ class SubagentRunner:
                 run_id=self.run_id,
                 # TOOL-02：子代理与父共享策略注册表，principal = MINI_SUBAGENT
                 tool_policy_registry=self.tool_policy_registry,
+                # TOOL-02：子任务从父 Agent 继承的已授予能力
+                parent_granted_capabilities=self.parent_granted_capabilities,
+                # TOOL-02：子任务继承父 Agent 的 project_id
+                parent_project_id=self.parent_project_id,
             )
 
             # 检查取消（在开始前）
@@ -166,6 +192,11 @@ class SubagentRunner:
                 output=output,
                 run_id=self.run_id,
             )
+
+        except _DeadlineExceededError:
+            # 复审 B2：超时是**独立的终态**，不能与主动取消混为一谈，
+            # 也不能被标成 SUCCEEDED（模型在截止时间之后才返回时尤其明显）。
+            return self._mark_timed_out_and_result()
 
         except _CancelledError:
             return self._mark_cancelled_and_result()
@@ -229,9 +260,32 @@ class SubagentRunner:
             run_id=self.run_id,
         )
 
+    def _mark_timed_out_and_result(self) -> SubagentResult:
+        """标记超时并返回结果（与主动取消区分开）。"""
+        self._safe_transition(TaskStatus.TIMED_OUT)
+        return SubagentResult.from_task(
+            self.task,
+            output="",
+            error_type="TimeoutError",
+            error_message="任务超时",
+            run_id=self.run_id,
+        )
+
 
 class _CancelledError(Exception):
     """协作取消信号。"""
+    pass
+
+
+class _DeadlineExceededError(Exception):
+    """子任务超时信号。
+
+    复审 B2：超时与「主动取消」是**两种不同的终态** ——
+    - 主动取消（cancellation token）→ `CANCELLED`；
+    - 超过 `timeout_seconds` 的截止时间 → `TIMED_OUT`。
+
+    过去两者共用 `_CancelledError`，超时被标成"被取消"，原因不准确。
+    """
     pass
 
 
@@ -244,12 +298,12 @@ class _CancellableModel:
     """包装 Model，在每次 decide 前检查取消并原子消费 model 预算。"""
     __slots__ = ("_model", "_token", "_budget")
 
-    def __init__(self, model: Model, token: CancellationToken, budget: SubagentBudget) -> None:
+    def __init__(self, model: Model, token: CancellationToken, budget: BudgetLike) -> None:
         self._model = model
         self._token = token
         self._budget = budget
 
-    def decide(self, messages: list[Message], tools=None) -> ToolCall | FinalAnswer:
+    def decide(self, messages: list[Message], tools=None) -> Decision:
         if self._token.is_cancelled():
             raise _CancelledError()
         # 在真正发起 model 调用前原子消费额度
@@ -272,7 +326,7 @@ class _BudgetAwareAgent:
         registry: ToolRegistry,
         store: ThreadStore,
         max_steps: int | None,
-        budget: SubagentBudget,
+        budget: BudgetLike,
         cancellation_token: CancellationToken,
         timeout_seconds: float | None = None,
         allowed_tools: tuple[str, ...] | None = None,
@@ -280,6 +334,10 @@ class _BudgetAwareAgent:
         run_id: str = "",
         # TOOL-02：子代理策略注册表（与父共享），principal = MINI_SUBAGENT
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
+        # TOOL-02：子任务从父 Agent 继承的已授予能力
+        parent_granted_capabilities: frozenset = frozenset(),
+        # TOOL-02：子任务继承父 Agent 的 project_id（项目会话上下文）
+        parent_project_id: str | None = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -301,11 +359,15 @@ class _BudgetAwareAgent:
         self._last_assembled: "object | None" = None
         # TOOL-02：子代理与父共享策略注册表
         self._tool_policy_registry = tool_policy_registry
+        # TOOL-02：子任务从父 Agent 继承的已授予能力（由 subagent_submit handler 设置）
+        self._parent_granted_capabilities: frozenset = parent_granted_capabilities
+        # TOOL-02：子任务继承父 Agent 的 project_id
+        self._parent_project_id: str | None = parent_project_id
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
         if self._deadline is not None and time.monotonic() > self._deadline:
-            raise _CancelledError()
+            raise _DeadlineExceededError()
 
     def run(self, thread_id: str, instruction: str) -> str:
         thread = self._store.get(thread_id)
@@ -326,6 +388,24 @@ class _BudgetAwareAgent:
         # 本地工具、mcp__* 工具、子代理工具一视同仁——这里按名字过滤，
         # 不区分来源，因此三类工具同时受限。
         model_tools = filter_tool_specs(self._registry.tool_specs(), self._allowed)
+
+        # TOOL-02 第二层（R2b）：策略可见性过滤——DENY 工具隐藏，ALLOW/CONFIRM 可见
+        if self._tool_policy_registry is not None:
+            from mini_deerflow.tool_authorization import check_tool_access
+            authority = self._tool_policy_registry.get_authority(
+                thread_id=thread_id,
+                run_id=self._run_id,
+                project_id=self._parent_project_id,
+                granted_capabilities=self._parent_granted_capabilities,
+                principal=ExecutorPrincipal.MINI_SUBAGENT,
+            )
+            visible_names: set[str] = set()
+            for spec in model_tools:
+                decision = check_tool_access(self._tool_policy_registry, spec.name, authority)
+                if decision.is_denied:
+                    continue
+                visible_names.add(spec.name)
+            model_tools = [s for s in model_tools if s.name in visible_names]
 
         for step in range(1, self._max_steps + 1):
             # 取消检查
@@ -356,6 +436,14 @@ class _BudgetAwareAgent:
                 model_messages = list(working_messages)
             decision = self._model.decide(model_messages, model_tools)
 
+            # 复审 B2：模型调用可能耗时很久 —— 返回后、采纳结果前必须
+            # **复查取消与截止时间**（与步骤开始处同一套信号）。
+            # 否则「模型调用期间越过 deadline」的 FinalAnswer 会被直接采纳，
+            # 超时的子任务被标成 SUCCEEDED —— 超时没有准确收口。
+            if self._token.is_cancelled():
+                raise _CancelledError()
+            self._check_deadline()
+
             if isinstance(decision, FinalAnswer):
                 assistant_message = Message(role="assistant", content=decision.content)
                 pending.append(assistant_message)
@@ -363,53 +451,81 @@ class _BudgetAwareAgent:
                 self._store.save(thread)
                 return decision.content
 
-            if isinstance(decision, ToolCall):
-                # 工具调用前原子消费额度（成功/失败都计入）
-                try:
-                    self._budget.consume_tool_call()
-                except BudgetExceededError as e:
-                    raise _BudgetExhaustedError(str(e)) from e
+            if isinstance(decision, (ToolCall, ToolCalls)):
+                # 模型可能在**一次响应**里发起多个工具调用（ToolCalls）。
+                # 全部执行、全部回灌 —— 绝不静默丢弃其中任何一个。
+                # 执行是**串行**的：后一个工具要看到前一个的结果。
+                calls: tuple[ToolCall, ...] = (
+                    decision.calls if isinstance(decision, ToolCalls) else (decision,)
+                )
 
                 # 21B：与主 Agent 一致——先落 tool_use（带 call_id），
                 # 再落紧邻的 tool 结果，供下一轮 decide() 按 call_id 配对还原。
                 # 落库的 tool 消息不带 id，持久化形状与 21B 之前一致。
-                working_messages.append(Message(
-                    role="assistant",
-                    content=f"调用工具 {decision.name}，参数: {decision.arguments}",
-                    tool_call_id=decision.id,
-                    tool_name=decision.name,
-                    tool_arguments=dict(decision.arguments),
-                ))
+                # 一次响应多个调用时这 N 条 assistant 消息必须**连续**（重建时合成
+                # 同一个 assistant turn），N 条 tool 结果同样必须连续。
+                for call in calls:
+                    working_messages.append(Message(
+                        role="assistant",
+                        content=f"调用工具 {call.name}，参数: {call.arguments}",
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        tool_arguments=dict(call.arguments),
+                    ))
 
-                # 纵深防御第二层（执行限制）：模型可能凭上下文里的名字
-                # "凭记忆"伪造一个未授权工具（暴露限制挡不住这种情况），
-                # 所以执行前必须再校验一次，越权直接抛 ToolNotAllowedError。
-                ensure_tool_allowed(decision.name, self._allowed)
+                # 串行执行：后一个工具要看到前一个的结果
+                for call in calls:
+                    # 取消 / 超时检查：**每个后续工具启动前**都要确认。
+                    # 步骤开始（379-382 行）有检查，但工具之间没有 ——
+                    # 一次响应给出多个调用时，超时或取消后剩余工具仍会执行。
+                    if self._token.is_cancelled():
+                        raise _CancelledError()
+                    self._check_deadline()
 
-                # TOOL-02 第三层：细粒度授权（MINI_SUBAGENT principal + 继承能力）
-                if self._tool_policy_registry is not None:
-                    from mini_deerflow.tool_authorization import check_tool_access
-                    authority = self._tool_policy_registry.get_authority(
+                    # 工具调用前原子消费额度（成功/失败都计入）
+                    try:
+                        self._budget.consume_tool_call()
+                    except BudgetExceededError as e:
+                        raise _BudgetExhaustedError(str(e)) from e
+
+                    # 纵深防御第二层（执行限制）：模型可能凭上下文里的名字
+                    # "凭记忆"伪造一个未授权工具（暴露限制挡不住这种情况），
+                    # 所以执行前必须再校验一次，越权直接抛 ToolNotAllowedError。
+                    ensure_tool_allowed(call.name, self._allowed)
+
+                    # TOOL-02 第三层：细粒度授权（MINI_SUBAGENT principal + 继承能力）
+                    if self._tool_policy_registry is not None:
+                        from mini_deerflow.tool_authorization import check_tool_access
+                        authority = self._tool_policy_registry.get_authority(
+                            thread_id=thread_id,
+                            run_id=self._run_id,
+                            project_id=self._parent_project_id,
+                            granted_capabilities=self._parent_granted_capabilities,  # 子代理由父授权决定
+                            principal=ExecutorPrincipal.MINI_SUBAGENT,
+                        )
+                        auth_decision = check_tool_access(
+                            self._tool_policy_registry, call.name, authority
+                        )
+                        if auth_decision.is_denied or auth_decision.is_confirm:
+                            from mini_deerflow.tool_authorization import ToolAuthorizationError
+                            raise ToolAuthorizationError(auth_decision)
+
+                    # TOOL-02：构造执行上下文，包含父授权能力（供 subagent_submit handler 提取并传递）
+                    from mini_deerflow.middleware import ExecutionContext
+                    tool_ctx = ExecutionContext(
                         thread_id=thread_id,
                         run_id=self._run_id,
-                        project_id=None,
-                        granted_capabilities=frozenset(),  # 子代理由父授权决定
-                        principal=ExecutorPrincipal.MINI_SUBAGENT,
+                        granted_capabilities=self._parent_granted_capabilities,
+                        cancellation_token=self._token,
+                        budget=self._budget,
                     )
-                    auth_decision = check_tool_access(
-                        self._tool_policy_registry, decision.name, authority
+                    result = self._registry.execute(call.name, call.arguments, context=tool_ctx)
+                    # 与主 Agent 一致：工具往返只留在 working_messages（本轮喂模型），
+                    # **不写入 pending**——Thread 只提交 user 与最终 assistant，
+                    # 避免落库一条没有配对 tool_use 的孤儿 tool_result。
+                    working_messages.append(
+                        Message(role="tool", content=result, tool_call_id=call.id)
                     )
-                    if auth_decision.is_denied or auth_decision.is_confirm:
-                        from mini_deerflow.tool_authorization import ToolAuthorizationError
-                        raise ToolAuthorizationError(auth_decision)
-
-                result = self._registry.execute(decision.name, decision.arguments)
-                # 与主 Agent 一致：工具往返只留在 working_messages（本轮喂模型），
-                # **不写入 pending**——Thread 只提交 user 与最终 assistant，
-                # 避免落库一条没有配对 tool_use 的孤儿 tool_result。
-                working_messages.append(
-                    Message(role="tool", content=result, tool_call_id=decision.id)
-                )
 
         raise RuntimeError(f"Subagent 在 {self._max_steps} 步内未完成")
 
@@ -438,6 +554,8 @@ class SubagentManager:
         shared_budget: SubagentBudget | None = None,
         context_assembler: ContextAssembler | None = None,
         tool_policy_registry: "ToolPolicyRegistry | None" = None,
+        # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问和 project_id 反查）
+        thread_store: ThreadStore | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency 必须 >= 1")
@@ -459,6 +577,8 @@ class SubagentManager:
         self._context_assembler = context_assembler
         # TOOL-02：子代理持有与父相同的策略注册表，principal = MINI_SUBAGENT
         self._tool_policy_registry = tool_policy_registry
+        # TOOL-02：子代理与父共享 ThreadStore（用于项目文件访问）
+        self._store = thread_store
 
         self._lock = threading.Lock()
         self._tasks: dict[str, SubagentTask] = {}
@@ -483,10 +603,14 @@ class SubagentManager:
         parent_task_id: str | None = None,
         depth: int = 1,
         timeout_seconds: float | None = None,
-        budget: SubagentBudget | None = None,
+        budget: BudgetLike | None = None,
         model: Model | None = None,
         registry: ToolRegistry | None = None,
         context_policy: SubagentContextPolicy | None = None,
+        # TOOL-02：父 Agent 已授予子任务的能力集合
+        parent_granted_capabilities: frozenset = frozenset(),
+        # TOOL-02：父 Agent 的 project_id（继承项目会话上下文）
+        parent_project_id: str | None = None,
     ) -> SubagentTask:
         """提交一个子任务。
 
@@ -497,9 +621,15 @@ class SubagentManager:
         if self._shutdown:
             raise RuntimeError("Manager 已关闭，不能提交新任务")
 
+        # BUDGET-01：子任务额度必须记到**本次运行**的预算上。
+        # `budget` 由调用方（父 Agent 的 subagent_submit handler）从执行上下文
+        # 取出 —— 那是与运行对齐的计数器，父子共享同一个实例。
+        # 只有在没有带预算的直连调用时才回退到 Manager 的 shared_budget。
+        effective_budget = budget if budget is not None else self._shared_budget
+
         # 父子共享 Budget：原子扣减 + 深度校验
-        if self._shared_budget is not None:
-            self._shared_budget.consume_subagent_task(depth)
+        if effective_budget is not None:
+            effective_budget.consume_subagent_task(depth)
 
         # 深度检查（向后兼容，即使没有 shared_budget 也允许 Manager 内部 max_depth 限制）
         if depth > self._max_depth:
@@ -531,6 +661,10 @@ class SubagentManager:
             depth=depth,
             timeout_seconds=timeout_seconds or self._default_timeout,
             context_policy=context_policy,
+            # TOOL-02：父 Agent 已授予子任务的能力集合
+            parent_granted_capabilities=parent_granted_capabilities,
+            # TOOL-02：父 Agent 的 project_id
+            parent_project_id=parent_project_id,
         )
 
         token = CancellationToken()
@@ -559,7 +693,7 @@ class SubagentManager:
         token: CancellationToken,
         model: Model | None,
         registry: ToolRegistry | None,
-        budget: SubagentBudget | None,
+        budget: BudgetLike | None,
     ) -> None:
         """在 worker 线程中执行任务。"""
         # 先在锁内做状态确认和转换，释放锁后再处理取消分支（避免重入死锁）
@@ -587,11 +721,17 @@ class SubagentManager:
                 task=task_obj,
                 model=model or FakeModel(),
                 registry=registry or ToolRegistry(),
-                store=InMemoryThreadStore(),
+                store=self._store or InMemoryThreadStore(),
                 budget=effective_budget,
                 cancellation_token=token,
                 parent_run_id=task.parent_run_id,
                 context_assembler=self._context_assembler,
+                # TOOL-02：子代理与父共享策略注册表
+                tool_policy_registry=self._tool_policy_registry,
+                # TOOL-02：子任务从父 Agent 继承的已授予能力
+                parent_granted_capabilities=task.parent_granted_capabilities,
+                # TOOL-02：子任务继承父 Agent 的 project_id
+                parent_project_id=task.parent_project_id,
             )
 
             result = runner.run()

@@ -3,6 +3,8 @@
 验证 Runtime 注入、模型可见性过滤、Subagent 权限隔离的端到端行为。
 """
 
+import json
+
 import pytest
 
 from mini_deerflow.agent import Agent
@@ -25,6 +27,7 @@ from mini_deerflow.tool_contracts import (
     CALCULATOR_METADATA,
     PROJECT_EXECUTE_METADATA,
     SANDBOX_WRITE_FILE_METADATA,
+    TASK_NOTE_METADATA,
     ToolCapability,
     ToolSourceKind,
     ToolSideEffect,
@@ -127,30 +130,40 @@ def test_confirm_tool_visible_to_model():
     """confirm 工具在可见列表中，模型可以看到。"""
     registry = ToolPolicyRegistry()
 
-    # project_execute 策略改为直接派发（requires_confirmation=False），
-    # 但 metadata 副作用 WRITES_PROJECT 仍触发 CONFIRM
+    # project_execute 策略 requires_confirmation=False + 特殊处理 → ALLOW
     metadata, policy = registry.get("project_execute")
     assert metadata is not None
     assert not metadata.uncategorized  # 未分类才会隐藏
-    # 策略直接派发，但 metadata 副作用导致 confirm
+    # project_execute 默认直接派发
     assert policy.requires_confirmation is False
-    assert metadata.requires_confirmation() is True
+    assert metadata.requires_confirmation() is True  # WRITES_PROJECT 副作用存在
+    # 但 evaluate_tool_access 中 project_execute 特殊处理 → ALLOW
+    authority = RunAuthority(
+        principal=ExecutorPrincipal.MAIN_AGENT,
+        thread_id="t1",
+        run_id="r1",
+        project_id="proj-1",
+        granted_capabilities=frozenset({ToolCapability.PROJECT_EXEC_DELEGATE}),
+    )
+    decision = evaluate_tool_access(metadata, policy, authority)
+    assert decision.kind == AccessDecisionKind.ALLOW  # 直接派发
 
 
 def test_confirm_tool_handler_not_executed():
-    """confirm 工具被调用时，handler 不执行（需用户确认）。"""
+    """显式 requires_confirmation=True 的策略触发 CONFIRM，handler 不执行。"""
+    from mini_deerflow.tool_contracts import ToolPolicy, ExecutorPrincipal
+
     registry = ToolPolicyRegistry()
 
     store = InMemoryThreadStore()
     store.create("t1")
-    # 项目会话才能通过第二层 allow list 检查，到达第三层 confirm 判定
     thread = store.get("t1")
-    thread.project_id = "proj-1"
+    thread.project_id = "proj-1"  # 项目会话
     store.save(thread)
 
     class FakeModel:
         def decide(self, messages, tools=None):
-            return ToolCall(name="project_execute", arguments={"task": "create file"})
+            return ToolCall(name="task_note", arguments={"content": "note"})
 
     executed = False
 
@@ -159,6 +172,14 @@ def test_confirm_tool_handler_not_executed():
         executed = True
         return '{"ok": true}'
 
+    # 注入显式确认策略
+    policy = ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    )
+    registry._policies["task_note"] = policy
+
     agent = Agent(
         model=FakeModel(),
         registry=ToolRegistry(),
@@ -166,24 +187,18 @@ def test_confirm_tool_handler_not_executed():
         tool_policy_registry=registry,
     )
     agent._registry.register(Tool(
-        name="project_execute",
-        description="执行",
+        name="task_note",
+        description="记笔记",
         parameters={"type": "object", "properties": {}},
         handler=my_handler,
     ))
 
-    # confirm 抛出 ToolAuthorizationError
-    # 注意：agent.run() 内部 get_authority(granted_capabilities=frozenset()) 硬编码空集，
-    # project_execute 需要 PROJECT_EXEC_DELEGATE，在 capability_missing 层就被 DENY 了。
-    # （confirm 判定需要调用方注入真实 granted_capabilities，这里测的是当前默认行为）
+    # 显式策略 requires_confirmation=True → CONFIRM → ToolAuthorizationError
     with pytest.raises(ToolAuthorizationError) as exc_info:
-        agent.run("t1", "创建文件")
+        agent.run("t1", "记个笔记")
 
-    # 当前行为：capability_missing → DENY（granted_capabilities 为空）
-    # 未来若 agent.run() 从 thread/context 传入真实 capabilities，这里应改为 CONFIRM
-    assert exc_info.value.decision.kind == AccessDecisionKind.DENY
-    assert exc_info.value.decision.reason_code == "capability_missing"
-    assert not executed, "handler 不应被执行"
+    assert exc_info.value.decision.kind == AccessDecisionKind.CONFIRM
+    assert not executed, "confirm 工具 handler 不应被执行"
 
 
 # ============================================================================
@@ -304,38 +319,47 @@ def test_normal_session_cannot_get_project_abilities():
 # ============================================================================
 
 def test_confirm_branch_reached_with_sufficient_capability():
-    """授予所需能力后，project_execute 策略触发 CONFIRM，handler 未执行。"""
+    """task_note 默认 ALLOW；显式策略 requires_confirmation=True 才触发 CONFIRM。"""
     registry = ToolPolicyRegistry()
-
-    # 直接用 check_tool_access 验证 CONFIRM 路径
-    # agent.run() 硬编码 granted_capabilities=frozenset()，
-    # 因此通过策略层直接测试（模拟真实授权场景）
     authority = RunAuthority(
         principal=ExecutorPrincipal.MAIN_AGENT,
         thread_id="t1",
         run_id="r1",
         project_id="proj-1",
-        granted_capabilities=frozenset({ToolCapability.PROJECT_EXEC_DELEGATE}),
+        granted_capabilities=frozenset({ToolCapability.SESSION_STATE_WRITE}),
     )
-    decision = check_tool_access(registry, "project_execute", authority)
-    assert decision.kind == AccessDecisionKind.CONFIRM
-    assert decision.reason_code == "requires_confirmation"
-    # reason 文本因副作用描述不同，具体文本以实际返回为准
-    assert "确认" in decision.reason
+    # 默认策略 → ALLOW
+    decision = check_tool_access(registry, "task_note", authority)
+    assert decision.kind == AccessDecisionKind.ALLOW
+
+    # 显式确认策略 → CONFIRM
+    policy = ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    )
+    registry._policies["task_note"] = policy
+    decision2 = check_tool_access(registry, "task_note", authority)
+    assert decision2.kind == AccessDecisionKind.CONFIRM
+    assert decision2.reason_code == "requires_confirmation"
 
 
 def test_confirm_handler_not_executed_via_evaluate():
-    """evaluate_tool_access 返回 CONFIRM 时，调用方必须阻止执行。"""
-    registry = ToolPolicyRegistry()
+    """evaluate_tool_access 对显式确认策略返回 CONFIRM，调用方必须阻止执行。"""
     authority = RunAuthority(
         principal=ExecutorPrincipal.MAIN_AGENT,
         thread_id="t1",
         run_id="r1",
         project_id="proj-1",
-        granted_capabilities=frozenset({ToolCapability.PROJECT_EXEC_DELEGATE}),
+        granted_capabilities=frozenset({ToolCapability.SESSION_STATE_WRITE}),
     )
-    metadata, policy = registry.get("project_execute")
-    decision = evaluate_tool_access(metadata, policy, authority)
+    # 显式确认策略
+    policy = ToolPolicy(
+        enabled=True,
+        allowed_principals=frozenset({ExecutorPrincipal.MAIN_AGENT}),
+        requires_confirmation=True,
+    )
+    decision = evaluate_tool_access(TASK_NOTE_METADATA, policy, authority)
     assert decision.kind == AccessDecisionKind.CONFIRM
     # 调用方应抛 ToolAuthorizationError 阻止执行
     error = ToolAuthorizationError(decision)
@@ -440,3 +464,285 @@ def test_mini_subagent_cannot_delegate_to_subagent():
     assert decision.kind == AccessDecisionKind.DENY
     assert decision.reason_code == "principal_not_allowed"
 
+
+# ---------------------------------------------------------------------------
+# TOOL-07：子 Agent 授权不随派发扩大
+# ---------------------------------------------------------------------------
+
+
+def test_subagent_authority_not_expanded_by_dispatch_roundtrip():
+    """派发回来的结果不扩大子 Agent 的授权。
+
+    子 Agent 拿到父授予的能力集合后，即使父在别处持有更强能力，
+    子 Agent 的 RunAuthority 也只能用它自己那套。
+    """
+    registry = ToolPolicyRegistry()
+
+    # 父（主代理）持有 PROJECT_EXEC_DELEGATE
+    parent_authority = RunAuthority(
+        principal=ExecutorPrincipal.MAIN_AGENT,
+        thread_id="t-1", run_id="r1", project_id="p1",
+        granted_capabilities=frozenset({
+            ToolCapability.PROJECT_READ,
+            ToolCapability.PROJECT_EXEC_DELEGATE,
+        }),
+    )
+    assert check_tool_access(
+        registry, "project_execute", parent_authority
+    ).kind is not AccessDecisionKind.DENY
+
+    # 子 Agent 只被授予 PROJECT_READ（派发后回来的结果不改这一点）
+    child_authority = RunAuthority(
+        principal=ExecutorPrincipal.MINI_SUBAGENT,
+        thread_id="t-1", run_id="r2", project_id="p1",
+        granted_capabilities=frozenset({ToolCapability.PROJECT_READ}),
+    )
+    decision = check_tool_access(registry, "project_execute", child_authority)
+    assert decision.kind is AccessDecisionKind.DENY, (
+        f"子 Agent 不应具备派发执行能力: {decision}"
+    )
+
+
+def test_subagent_authority_is_thread_scoped():
+    """子 Agent 的授权绑定到它自己的 run_id，不能借用父的 run_id。"""
+    registry = ToolPolicyRegistry()
+
+    child_authority = RunAuthority(
+        principal=ExecutorPrincipal.MINI_SUBAGENT,
+        thread_id="t-1", run_id="r-child", project_id="p1",
+        granted_capabilities=frozenset({ToolCapability.COMPUTE}),
+    )
+    # 父的 run_id 不该出现在子 Agent 的授权里
+    assert child_authority.run_id == "r-child"
+    assert child_authority.principal is ExecutorPrincipal.MINI_SUBAGENT
+
+    # 拿父的 run_id 构造 authority，principal 仍是子，结论不变
+    borrowed = RunAuthority(
+        principal=ExecutorPrincipal.MINI_SUBAGENT,
+        thread_id="t-1", run_id="r-parent", project_id="p1",
+        granted_capabilities=frozenset({ToolCapability.COMPUTE}),
+    )
+    a = check_tool_access(registry, "project_execute", child_authority)
+    b = check_tool_access(registry, "project_execute", borrowed)
+    assert a.kind is b.kind, "run_id 不应改变授权结论"
+
+
+# ---------------------------------------------------------------------------
+# TOOL-07 C5：真实派发链路的授权证据
+# （不是直接构造 authority 调 check_tool_access，而是走
+#  _SubmitHandler → SubagentManager.submit → task → runner → BudgetAwareAgent）
+# ---------------------------------------------------------------------------
+
+
+def test_subagent_dispatch_inherits_parent_caps_exactly(monkeypatch):
+    """R5 真实派发：Manager 执行一次；父能力原样继承；缺能力工具被拒且 handler=0。
+
+    证据链（任一环节丢能力，下面的执行断言都会失败）：
+      _SubmitHandler(从 ExecutionContext 取 granted_capabilities)
+        → SubagentManager.submit(parent_granted_capabilities=..., model=..., registry=...)
+        → Manager 的 worker 线程装配 SubagentRunner（同一个 Task 只跑一次）
+        → 子任务真的跑（manager.collect 等结果）
+        → manager.shutdown 收尾
+
+    R5 修订要点：
+    - 只由**原来的 Manager** 执行同一个 Task 一次：不再手工构造 SubagentRunner
+      重跑（那会绕过 Manager→Runner 的装配，且与 submit 已提交的任务重复执行）。
+      脚本模型 / 真实注册表依赖**只在 submit 调用**里注入，继承参数原样传递。
+    - 缺能力用例换成"主体本可使用"的工具：project_read_file 的默认策略允许
+      MINI_SUBAGENT（principal 维度不拦），父**故意不授** PROJECT_READ，
+      断言拒绝原因码为 capability_missing，且 handler 一次都没跑。
+      （原来的 project_execute 已被 principal 维度直接拒掉，无法区分能力缺失。）
+    - 授权结论用真实 registry 判定（记录真实执行路径上的判定结果）。
+    """
+    from collections import deque
+    import mini_deerflow.tool_authorization as tool_auth
+    from mini_deerflow.subagent_executor import (
+        SubagentBudget,
+        SubagentManager,
+    )
+    from mini_deerflow.subagent_tools import _SubmitHandler
+    from mini_deerflow.tool_authorization import ToolPolicy as _TP
+    from mini_deerflow.tool_contracts import ExecutorPrincipal as _EP
+
+    store = InMemoryThreadStore()
+    # 项目会话：project_id 非 None，子代理的项目工具才过得了作用域这一关
+    store.create("t-sub-dispatch", project_id="p-sub")
+
+    # 父只授 COMPUTE：PROJECT_READ 故意不给（用于制造 capability_missing）
+    parent_caps = frozenset({ToolCapability.COMPUTE})
+
+    policy_registry = ToolPolicyRegistry(thread_store=store)
+    # calculator 默认只允许 MAIN_AGENT；本测试关心"父能力是否被原样继承"，
+    # 因此显式放开 principal，避免与 principal 维度耦合。
+    policy_registry.set_policy(
+        "calculator",
+        _TP(
+            enabled=True,
+            allowed_principals=frozenset({_EP.MAIN_AGENT, _EP.MINI_SUBAGENT}),
+        ),
+    )
+    # project_read_file 用内置默认策略（allowed_principals 含 MINI_SUBAGENT）
+
+    registry = ToolRegistry()
+
+    calculator_calls: list[str] = []
+
+    def calc_handler(arguments, context=None):
+        calculator_calls.append(str(arguments.get("expression", "")))
+        return "42"
+
+    registry.register(Tool(
+        name="calculator",
+        description="纯记录",
+        parameters={"type": "object", "properties": {}},
+        handler=calc_handler,
+    ))
+
+    project_read_calls: list[str] = []
+
+    def read_handler(arguments, context=None):
+        project_read_calls.append(str(arguments))
+        return "should-not-reach"
+
+    registry.register(Tool(
+        name="project_read_file",
+        description="本应因缺 PROJECT_READ 被拒",
+        parameters={"type": "object", "properties": {}},
+        handler=read_handler,
+    ))
+
+    manager = SubagentManager(
+        max_concurrency=1,
+        max_depth=3,
+        max_tasks_per_parent=10,
+        default_timeout=15.0,
+        default_budget=SubagentBudget(
+            max_steps=4, max_model_calls=10, max_tool_calls=10,
+        ),
+        tool_policy_registry=policy_registry,
+        thread_store=store,
+    )
+
+    # 决定脚本：先 calculator（父授权 → 真实执行），
+    # 再 project_read_file（主体可用但缺能力 → 应被拒）
+    decisions_q: deque = deque([
+        ToolCall(name="calculator", arguments={"expression": "1+1"}),
+        ToolCall(name="project_read_file", arguments={"path": "README.md"}),
+        FinalAnswer(content="subagent 任务结束"),
+    ])
+    decisions_log: list[str] = []
+    seen_messages: list[list] = []
+
+    class R5Model:
+        def decide(self, messages, tools=None):
+            seen_messages.append(list(messages))
+            self.next = decisions_q.popleft()
+            decisions_log.append(
+                self.next.name if hasattr(self.next, "name") else "final"
+            )
+            return self.next
+
+    model = R5Model()
+
+    # 记录真实执行路径上的授权判定（子代理内部按需 import，
+    # 因此 patch 模块属性即可观测）
+    real_check = tool_auth.check_tool_access
+    decisions: list[tuple[str, str, str]] = []
+
+    def _recording_check(registry_, tool_name, authority):
+        decision = real_check(registry_, tool_name, authority)
+        decisions.append((tool_name, decision.kind.name, decision.reason_code))
+        return decision
+
+    monkeypatch.setattr(tool_auth, "check_tool_access", _recording_check)
+
+    handler = _SubmitHandler(
+        manager=manager,
+        parent_run_id="parent-run-1",
+        parent_thread_id="t-sub-dispatch",
+        depth=1,
+        thread_store=store,
+        # 依赖只在 submit 调用里注入（Manager 的唯一装配入口）
+        model=model,
+        registry=registry,
+    )
+
+    # 与 ExecutionContext 同构的上下文，携带父授权能力
+    ctx = type("Ctx", (), {
+        "run_id": "parent-run-1",
+        "thread_id": "t-sub-dispatch",
+        "granted_capabilities": parent_caps,
+    })()
+
+    data = json.loads(handler(
+        {"instruction": "派发派发"},
+        ctx,
+    ))
+    assert data.get("ok"), f"派发应成功: {data}"
+    task_id = data["task_id"]
+
+    try:
+        # 断言一：task 真的进入了 manager，且父能力原样传递
+        task = manager._tasks[task_id]
+        assert task.parent_granted_capabilities == parent_caps, (
+            f"子任务能力应与父授权完全一致: "
+            f"got {set(task.parent_granted_capabilities)}, want {set(parent_caps)}"
+        )
+        # 继承的项目上下文也要原样带下去（作用域判断依赖它）
+        assert task.parent_project_id == "p-sub", (
+            f"子任务应继承父的 project_id，实际: {task.parent_project_id}"
+        )
+
+        # 断言二：等**原来那个 Manager** 把这个 Task 跑完
+        result = manager.collect(task_id, timeout=30)
+    finally:
+        manager.shutdown(cancel_pending=True)
+
+    # 断言三：calculator **真的**被调用了一次（父授权 → 真实执行）
+    assert calculator_calls == ["1+1"], (
+        f"父授权 calculator，子代理应实际执行；calls={calculator_calls}, "
+        f"decisions={decisions_log}, error_type={result.error_type}, "
+        f"run output={result.output!r}"
+    )
+
+    # 断言四：执行结果真的进了子代理的上下文（不是只在 handler 里跑过）
+    tool_messages = [
+        m for messages in seen_messages for m in messages
+        if getattr(m, "role", None) == "tool"
+    ]
+    assert tool_messages, (
+        f"子代理的上下文里应出现工具结果消息；decisions={decisions_log}"
+    )
+    assert any("42" in str(getattr(m, "content", "")) for m in tool_messages), (
+        f"子代理上下文应包含 calculator 的真实返回值 42："
+        f"{[getattr(m, 'content', '') for m in tool_messages]}"
+    )
+
+    # 断言五：project_read_file **从未**被调用（缺能力 → handler=0）
+    assert project_read_calls == [], (
+        f"缺能力工具必须被授权闸拒，handler 一次都没跑；"
+        f"project_read_calls={project_read_calls}"
+    )
+
+    # 断言六：拒绝原因码是 capability_missing（主体本可用，缺的是能力）
+    denied = [
+        d for d in decisions
+        if d[0] == "project_read_file" and d[1] == "DENY"
+    ]
+    assert denied, f"未观察到 project_read_file 的拒绝判定：{decisions}"
+    assert {d[2] for d in denied} == {"capability_missing"}, (
+        f"拒绝原因码应为 capability_missing，实际: {denied}"
+    )
+    allowed = [d for d in decisions if d[0] == "calculator" and d[1] == "ALLOW"]
+    assert allowed, f"calculator 应被判定为 ALLOW，实际: {decisions}"
+
+    # 断言七：模型确实按脚本发起了两次调用
+    assert decisions_log == ["calculator", "project_read_file"], (
+        f"模型决策序列不符预期: {decisions_log}"
+    )
+
+    # 断言八：终态是 FAILED，且失败类型确实是 ToolAuthorizationError
+    assert result.error_type == "ToolAuthorizationError", (
+        f"project_read_file 应被授权闸拒，error_type 应为"
+        f"ToolAuthorizationError，实际: {result.error_type}"
+    )

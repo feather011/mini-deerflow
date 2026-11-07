@@ -29,10 +29,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum
 from typing import Any, Mapping
 
 import anyio
+from anyio import BrokenResourceError
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
 try:
@@ -58,6 +61,24 @@ _TIMEOUT_BACKSTOP = 2.0
 
 class MCPStartupError(RuntimeError):
     """required MCP 服务器启动失败（fail-closed）。"""
+
+
+# TOOL-03 R5：服务器状态。failure_kind/failure_message 仅安全码/脱敏摘要，
+# 不含 env 或完整命令参数。
+class ServerStatus(Enum):
+    NOT_STARTED = "not_started"
+    RUNNING = "running"
+    FAILED = "failed"
+    STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class ServerState:
+    name: str
+    status: ServerStatus
+    tool_count: int
+    failure_kind: str | None
+    failure_message: str | None
 
 
 def build_child_env(whitelist: Mapping[str, str]) -> dict[str, str]:
@@ -97,10 +118,14 @@ async def _session_task(
     try:
         # MCP 2.x: stdio_client 是 async generator，yield (read_stream, write_stream, process)
         async with stdio_client(params) as (read_stream, write_stream):
+            # R4：mcp 2.2.0+ 的 ClientSession 若把 timedelta 写入
+            # `_session_read_timeout_seconds`，initialize 内部 anyio.current_time() + self._budget
+            # 会以 float + timedelta 抛 TypeError。这里传 None（每次 send_request
+            # 显式传 read_timeout_seconds），规避 session 级预算的 buggy 算术。
             client = ClientSession(
                 read_stream,
                 write_stream,
-                read_timeout_seconds=timedelta(seconds=init_timeout),
+                read_timeout_seconds=None,
             )
             async with client:
                 # MCP 2.x: ClientSession 不会自动初始化，需要显式调用
@@ -141,6 +166,40 @@ def _safe_error(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+# TOOL-03 R5：失败分类。只返回受控枚举值，不暴露任意第三方文本。
+_FAILURE_KIND_STARTUP_TIMEOUT = "startup_timeout"
+_FAILURE_KIND_INIT_FAILED = "init_failed"
+_FAILURE_KIND_TRANSPORT = "transport_error"
+_FAILURE_KIND_PROTOCOL = "protocol_error"
+_FAILURE_KIND_OTHER = "startup_error"
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """根据异常类型返回受控的安全分类码。"""
+    etype = type(exc).__name__
+    if "Timeout" in etype:
+        return _FAILURE_KIND_STARTUP_TIMEOUT
+    if "Broken" in etype or "Connection" in etype or "Transport" in etype:
+        return _FAILURE_KIND_TRANSPORT
+    if "Protocol" in etype or "JSON" in etype or "RPC" in etype:
+        return _FAILURE_KIND_PROTOCOL
+    return _FAILURE_KIND_OTHER
+
+
+def _safe_failure_message(server_name: str, exc: BaseException) -> str:
+    """返回受控的固定安全描述，不含供应商异常 str(exc)。"""
+    kind = _classify_failure(exc)
+    if kind == _FAILURE_KIND_STARTUP_TIMEOUT:
+        return f"服务器 {server_name} 在启动超时内未就绪"
+    if kind == _FAILURE_KIND_INIT_FAILED:
+        return f"服务器 {server_name} 初始化失败"
+    if kind == _FAILURE_KIND_TRANSPORT:
+        return f"服务器 {server_name} 传输层错误"
+    if kind == _FAILURE_KIND_PROTOCOL:
+        return f"服务器 {server_name} 协议层错误"
+    return f"服务器 {server_name} 启动失败"
+
+
 class _Session:
     """一个已启动服务器的运行期记录。
 
@@ -167,6 +226,24 @@ class MCPClientManager:
         # qualified_name → (原始服务器名, 原始工具名)
         self._tools: dict[str, tuple[str, str]] = {}
         self._started = False
+        # TOOL-03 R4 round 3：记录本 manager 之前注册到 ToolRegistry 的工具名。
+        # stop→start 时先把自有工具从 registry 移除（仅自有，不动外来），
+        # 然后再注册新发现，避免报"自有名称冲突"。
+        self._owned_registry: ToolRegistry | None = None
+        self._owned_tool_names: set[str] = set()
+        # TOOL-03 R5：服务器状态。key=server name, value=ServerState
+        # 状态来源是「配置」而非「已运行」，因此启动失败/被禁用/被停止的服务器
+        # 仍出现在清单中。
+        self._server_states: dict[str, "ServerState"] = {
+            cfg.name: ServerState(
+                name=cfg.name,
+                status=ServerStatus.NOT_STARTED,
+                tool_count=0,
+                failure_kind=None,
+                failure_message=None,
+            )
+            for cfg in self._configs
+        }
 
     # ---------------------------------------------------------------- 状态
 
@@ -187,6 +264,14 @@ class MCPClientManager:
     def running_servers(self) -> tuple[str, ...]:
         return tuple(sorted(self._sessions))
 
+    def list_server_states(self) -> tuple[ServerState, ...]:
+        """TOOL-03 R5：返回所有已配置服务器的状态。
+
+        状态来源是「配置」，因此启动失败/被禁用/被停止的服务器
+        仍出现在清单中。
+        """
+        return tuple(self._server_states.values())
+
     # ---------------------------------------------------------------- 启动
 
     def start(self, registry: ToolRegistry) -> int:
@@ -199,6 +284,16 @@ class MCPClientManager:
         """
         if self._started or not self._configs:
             return 0
+
+        # TOOL-03 R4 round 3：stop→start 时清掉本 manager 之前注册到该 registry 的
+        # 工具（仅自有，不动外来），避免重复启动时自己跟自己冲突。
+        # 同时记录本轮使用的 registry，便于 stop 时回滚。
+        if self._owned_tool_names and self._owned_registry is registry:
+            for name in self._owned_tool_names:
+                self._owned_registry.unregister(name)
+            self._owned_tool_names.clear()
+            self._tools.clear()
+        self._owned_registry = registry
 
         # 桥只建一次：所有服务器共享同一个事件循环线程
         self._portal = AsyncPortal(name="mini-deerflow-mcp")
@@ -225,6 +320,16 @@ class MCPClientManager:
                     config.required,
                     _safe_error(exc),
                     exc_info=True,
+                )
+                # TOOL-03 R5：记录失败状态（脱敏：仅安全码 + 固定描述）
+                # 不返回任意第三方 str(exc)（供应商异常可能回显 env 凭据）。
+                safe_message = _safe_failure_message(config.name, exc)
+                self._server_states[config.name] = ServerState(
+                    name=config.name,
+                    status=ServerStatus.FAILED,
+                    tool_count=0,
+                    failure_kind=_classify_failure(exc),
+                    failure_message=safe_message,
                 )
                 if config.required:
                     failed_required.append(config.name)
@@ -262,7 +367,18 @@ class MCPClientManager:
         session = _Session(future, errors)
 
         if not ready.wait(timeout=config.startup_timeout):
-            self._signal_stop(session)
+            # TOOL-03 R4 round 3：超时回收——取消 future 并等待，让子进程退出。
+            # session.stopping 此刻可能尚未从 ctx 赋值（事件循环未跑过那段代码），
+            # 所以先 cancel future 触发 TaskGroup 拆解，再等 future 完成。
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            try:
+                future.result(timeout=5.0)
+            except BaseException:
+                # 包括 CancelledError / ExceptionGroup；这里不区分，因为子进程已死即可
+                pass
             self._discard(config.name)
             raise MCPStartupError(
                 f"服务器 {config.name} 在 {config.startup_timeout}s 内未就绪"
@@ -280,6 +396,15 @@ class MCPClientManager:
                 "MCP 服务器初始化未完成: server=%s init_ok=%s client=%s errors=%s",
                 config.name, init_ok, session.client is not None, errors,
             )
+            # TOOL-03 R4 round 3：同样取消 future 并等待。
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            try:
+                future.result(timeout=5.0)
+            except BaseException:
+                pass
             self._discard(config.name)
             raise MCPStartupError(f"服务器 {config.name} 连接后未完成初始化")
 
@@ -305,14 +430,19 @@ class MCPClientManager:
             call_timeout=config.call_timeout,
             max_output_bytes=config.max_output_bytes,
             invoker=self._invoke,
+            # TOOL-03 R2：可信分类
+            declared_capabilities=config.tool_capabilities,
+            declared_side_effects=config.tool_side_effects,
         )
 
         existing = {tool.name for tool in registry.list_tools()}
         registered = 0
+        registered_in_this_run: list[str] = []
         for mcp_tool in mcp_tools:
             spec, tool = adapter.to_tool(mcp_tool)
             detect_conflicts(existing, spec.name)
             if spec.name in self._tools:
+                # 理论上 start 顶部已清空 _tools；防御性兜底
                 raise MCPStartupError(f"工具名冲突: {spec.name}")
             self._tools[spec.name] = (config.name, getattr(mcp_tool, "name", ""))
             try:
@@ -321,10 +451,21 @@ class MCPClientManager:
                 del self._tools[spec.name]
                 raise
             existing.add(spec.name)
+            registered_in_this_run.append(spec.name)
             registered += 1
+        # 记入 manager 自有集合；下次 start 时清掉
+        self._owned_tool_names.update(registered_in_this_run)
 
         _LOGGER.info(
             "MCP 服务器已连接: server=%s tools=%d", config.name, registered
+        )
+        # TOOL-03 R5：标记运行状态
+        self._server_states[config.name] = ServerState(
+            name=config.name,
+            status=ServerStatus.RUNNING,
+            tool_count=registered,
+            failure_kind=None,
+            failure_message=None,
         )
         return registered
 
@@ -385,7 +526,9 @@ class MCPClientManager:
             coro = session.client.call_tool(
                 original_name,
                 dict(arguments),
-                read_timeout_seconds=timedelta(seconds=timeout),
+                # R4：mcp 2.2.0+ call_tool(read_timeout_seconds) 期望 float。
+                # 旧版 (1.27.x) 期望 timedelta；传 float 在两个版本都被接受。
+                read_timeout_seconds=float(timeout),
             )
             # 独立 timeout scope：只 cancel 这一个 tool call，不杀死 session
             result = portal.run(
@@ -432,6 +575,15 @@ class MCPClientManager:
                     "MCP 服务器关闭失败: server=%s error=%s",
                     name,
                     _safe_error(exc),
+                )
+            # TOOL-03 R5：标记为已停止
+            if name in self._server_states:
+                self._server_states[name] = ServerState(
+                    name=name,
+                    status=ServerStatus.STOPPED,
+                    tool_count=0,
+                    failure_kind=None,
+                    failure_message=None,
                 )
 
         # 桥最后关：前面所有收尾都要跑在它上面

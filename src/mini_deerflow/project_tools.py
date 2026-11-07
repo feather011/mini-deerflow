@@ -46,6 +46,7 @@ __all__ = [
     "PROJECT_GLOB_TOOL_NAME",
     "PROJECT_GREP_TOOL_NAME",
     "PROJECT_EXECUTE_TOOL_NAME",
+    "PROJECT_TOOL_CODES",
     "create_project_read_tools",
     "create_project_execute_tool",
 ]
@@ -55,6 +56,32 @@ PROJECT_EXECUTE_TOOL_NAME = "project_execute"
 PROJECT_READ_FILE_TOOL_NAME = "project_read_file"
 PROJECT_GLOB_TOOL_NAME = "project_glob"
 PROJECT_GREP_TOOL_NAME = "project_grep"
+
+
+# --- 项目工具的稳定错误码 ---
+#
+# 这些码进入**工具结果**（ok:false JSON 的 `code` 字段），也就是模型
+# 真正读到的那份错误。模型可以按码判断「改参重试」还是「如实转告用户」，
+# 不必解析文案。
+#
+# 为什么码在结果里而不在 SSE 事件里：项目工具的失败被 `_as_tool_result`
+# 转成 ok:false JSON，**异常不逃出 handler** —— 业务失败是**可恢复**的
+# （模型改参即可重试），不该让整轮 Run 失败，因此也**不会**产生
+# `tool.failed` 事件。稳定码的消费者是模型，不是事件流。
+PROJECT_TOOL_CODES: dict[str, str] = {
+    "usage": "PROJECT_TOOL_USAGE_ERROR",
+    "state": "PROJECT_TOOL_STATE_ERROR",
+    "file_unreadable": "PROJECT_TOOL_FILE_UNREADABLE",
+    "internal": "PROJECT_TOOL_INTERNAL_ERROR",
+    "launch_failed": "PROJECT_TOOL_LAUNCH_FAILED",
+    "protocol_error": "PROJECT_TOOL_PROTOCOL_ERROR",
+    "execute_stopped": "PROJECT_TOOL_STOPPED",
+    "execute_timeout": "PROJECT_TOOL_TIMEOUT",
+    "execute_failed": "PROJECT_TOOL_EXECUTE_FAILED",
+}
+
+# 错误文案的对外长度上限：文案会回灌给模型，超长既费 token 又撑爆展示
+_ERROR_TEXT_MAX = 300
 
 # --- 输出上限（超限截断并标注，不静默丢弃） ---
 
@@ -150,23 +177,72 @@ def _as_tool_result(action: str, fn):
 
     - usage_error：参数不合法，模型改参即可重试
     - error：会话 / 项目状态问题，重试无用，模型如实转告用户
+
+    **返回的 JSON 会作为 tool_result 回灌给模型**（也会出现在 `run.result`
+    事件里），因此文案必须受控：只给必要的相对路径，**不给服务端绝对路径、
+    不给原始异常文本**。原始异常一律留在服务端日志。
+
+    领域异常（`ProjectToolUsageError` / `ProjectToolStateError`）的文案由
+    本模块本地构造、逐条受控，可以直接对外；其它异常一律走兜底分支。
     """
 
     def wrapper(arguments: dict[str, object], context: object) -> str:
         try:
             return fn(arguments, context)
         except ProjectToolUsageError as exc:
-            return err_response(action, str(exc), kind="usage_error")
+            return err_response(
+                action,
+                _bounded_text(str(exc)),
+                kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
         except ProjectToolStateError as exc:
-            return err_response(action, str(exc), kind="error")
+            return err_response(
+                action,
+                _bounded_text(str(exc)),
+                kind="error",
+                code=PROJECT_TOOL_CODES["state"],
+            )
         except Exception as exc:  # noqa: BLE001 - runner.run() 等底层抛任意异常都兜住
             import logging
             logging.getLogger("mini_deerflow.project_tools").error(
-                "project_execute 异常（将在日志后转为错误响应）: %s", exc, exc_info=True
+                "project tool 异常（原文只进日志，对外只给受控说明）: %s", exc, exc_info=True
             )
-            return err_response(action, str(exc), kind="error")
+            # 原始异常的 message 可能带绝对路径、内部栈或凭据片段 → 不外泄。
+            return err_response(
+                action,
+                "工具内部错误，请重试或联系管理员",
+                kind="error",
+                code=PROJECT_TOOL_CODES["internal"],
+            )
 
     return wrapper
+
+
+def _bounded_text(text: str) -> str:
+    """把对外文案限制在 `_ERROR_TEXT_MAX` 以内。"""
+    text = text.strip()
+    if len(text) > _ERROR_TEXT_MAX:
+        return text[:_ERROR_TEXT_MAX] + "…"
+    return text
+
+
+def _executor_error(raw: str, fallback: str) -> str:
+    """执行器（harness）返回的原文只进服务端日志，对外给受控说明。
+
+    harness 的 error 可能带 harness 根目录、python 解释器路径等**服务端
+    绝对路径**；而这段文案会随工具结果回灌给模型 → 等于把服务端目录结构
+    发给外部 Provider。因此原文只进日志，对外只给 `fallback` 这句受控说明。
+
+    执行失败的具体原因由 `answer`（harness 的最终回答）承载 —— 那是模型
+    本来就该读的产物，不属于「原始异常」。
+    """
+    import logging
+    if raw:
+        logging.getLogger("mini_deerflow.project_tools").warning(
+            "执行器返回的原文（只进日志，对外只给受控说明）: %s", raw
+        )
+    return fallback
 
 
 def _bound_repo(
@@ -235,7 +311,15 @@ def create_project_read_tools(
             # 随后的边界检查自然拦下。
             candidate = repo.joinpath(*parts).resolve() if parts else repo
         except OSError as exc:
-            raise ProjectToolUsageError(f"{what}无法解析: {exc}") from None
+            # 原始 OSError 的 message 可能带绝对路径（POSIX 上形如
+            # "[Errno 13] Permission denied: '/home/user/secret'"），
+            # 而本异常会经 safe_failure_detail 直接进客户端 SSE 事件。
+            # 因此**客户端只拿受控说明**，原始异常与绝对路径留在服务端日志。
+            import logging
+            logging.getLogger("mini_deerflow.project_tools").warning(
+                "路径无法解析（%s）: %s", what, exc, exc_info=True
+            )
+            raise ProjectToolUsageError(f"{what}无法解析（路径不可访问）") from None
         if not _within(candidate, repo):
             raise ProjectToolUsageError(f"{what}越出仓库绑定目录（符号链接同样不允许）")
         return candidate
@@ -256,11 +340,13 @@ def create_project_read_tools(
             return err_response(
                 "read_file", f"文件不存在: {arguments.get('path')}",
                 kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
         if not target.is_file():
             return err_response(
                 "read_file", f"不是文件: {arguments.get('path')}",
                 kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
 
         offset = _int_arg(arguments, "offset", default=0, minimum=0)
@@ -274,7 +360,24 @@ def create_project_read_tools(
             with target.open("rb") as fh:
                 chunk = fh.read(READ_MAX_BYTES)
         except OSError as exc:
-            return err_response("read_file", f"文件无法读取: {exc}")
+            # OSError 的 message 会带**绝对路径**（POSIX 上形如
+            # "[Errno 13] Permission denied: '/home/user/secret'"，Windows 上
+            # 带盘符全路径）。本错误结果会回灌给模型 → 等于把服务端目录结构
+            # 发给外部 Provider。因此：**原始异常只进服务端日志**，对外只给
+            # 受控说明 + 仓库**相对**路径（模型改参要用）。
+            import logging
+            logging.getLogger("mini_deerflow.project_tools").warning(
+                "read_file 读取失败（%s）: %s",
+                _display_path(repo, target),
+                exc,
+                exc_info=True,
+            )
+            return err_response(
+                "read_file",
+                f"文件无法读取（权限或 IO 错误）：{_display_path(repo, target)}",
+                kind="error",
+                code=PROJECT_TOOL_CODES["file_unreadable"],
+            )
         text = chunk.decode("utf-8", errors="replace")
         lines = text.splitlines()
         byte_truncated = size > len(chunk)
@@ -300,21 +403,36 @@ def create_project_read_tools(
         repo = _repo_root(_require_thread_id(context))
         raw_pattern = arguments.get("pattern")
         if not isinstance(raw_pattern, str) or not raw_pattern.strip():
-            return err_response("glob", "pattern 不能为空", kind="usage_error")
+            return err_response(
+                "glob", "pattern 不能为空", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
         pattern = raw_pattern.strip().replace("\\", "/")
         if "\x00" in pattern:
-            return err_response("glob", "pattern 不能包含 NUL 字符", kind="usage_error")
+            return err_response(
+                "glob", "pattern 不能包含 NUL 字符", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
         if _looks_absolute(pattern) or ".." in pattern.split("/"):
             return err_response(
                 "glob", "pattern 必须是仓库内相对路径，且不含 '..'",
                 kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
 
         try:
             matches = sorted(repo.glob(pattern))
         except (OSError, ValueError) as exc:
             # ValueError：pathlib 拒绝的模式（如 "**" 之外的畸形写法）
-            return err_response("glob", f"pattern 非法: {exc}", kind="usage_error")
+            # OSError：可能带**绝对路径** → 原文只进日志，对外只给受控说明
+            import logging
+            logging.getLogger("mini_deerflow.project_tools").warning(
+                "glob pattern 非法: %s", exc, exc_info=True
+            )
+            return err_response(
+                "glob", "pattern 非法，无法展开", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
 
         hits: list[str] = []
         truncated = False
@@ -353,7 +471,10 @@ def create_project_read_tools(
         repo = _repo_root(_require_thread_id(context))
         raw_pattern = arguments.get("pattern")
         if not isinstance(raw_pattern, str) or not raw_pattern.strip():
-            return err_response("grep", "pattern 不能为空", kind="usage_error")
+            return err_response(
+                "grep", "pattern 不能为空", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
 
         base = _resolve_in_repo(
             repo, arguments.get("path") or ".", what="path"
@@ -362,6 +483,7 @@ def create_project_read_tools(
             return err_response(
                 "grep", f"路径不存在: {arguments.get('path')}",
                 kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
 
         max_hits = min(
@@ -380,7 +502,10 @@ def create_project_read_tools(
         if _USE_LITERAL:
             needle = raw_pattern.strip().lower() if arguments.get("ignore_case") else raw_pattern.strip()
             if not needle:
-                return err_response("grep", "pattern 不能为空", kind="usage_error")
+                return err_response(
+                    "grep", "pattern 不能为空", kind="usage_error",
+                    code=PROJECT_TOOL_CODES["usage"],
+                )
             deadline = time.monotonic() + _LITERAL_DEADLINE_SECONDS
             hits: list[dict] = []
             deadline_exceeded = False
@@ -433,7 +558,13 @@ def create_project_read_tools(
                 re.IGNORECASE if arguments.get("ignore_case") else 0,
             )
         except re.error as exc:
-            return err_response("grep", f"正则表达式非法: {exc}", kind="usage_error")
+            # re.error 的文案描述的是**模型给的 pattern**（如 "unterminated
+            # character set at position 5"），不含服务端路径 —— 模型靠它改参，
+            # 因此保留，但按上限截断（文案会回灌给模型）。
+            return err_response(
+                "grep", _bounded_text(f"正则表达式非法: {exc}"), kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
+            )
 
         deadline = time.monotonic() + _LITERAL_DEADLINE_SECONDS
         hits = []
@@ -579,6 +710,7 @@ def create_project_read_tools(
 SNAPSHOT_FILE_LIMIT = 10 * 1024 * 1024  # 10MB，单文件大小限制
 SNAPSHOT_DIR_LIMIT = 10000  # 目录深度限制
 SNAPSHOT_TOTAL_LIMIT = 50 * 1024 * 1024  # 50MB，总采集字节限制
+DIFF_MAX_LINES = 100  # diff 最多展示的行数（超出置 diff_truncated）
 TEXT_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".sh", ".bat", ".ps1", ".html", ".css", ".sql", ".xml", ".svg", ".c", ".cpp", ".h", ".hpp", ".java", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".r", ".m", ".lua", ".pl", ".pm", ".ex", ".exs", ".erl", ".hrl", ".clj", ".cljs", ".hs", ".fs", ".fsx", ".vb", ".cs", ".fs"}
 
 
@@ -675,6 +807,16 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
         if after_meta.get("type") == "binary":
             entry["reason"] = "binary file"
             entry["diff"] = None
+        else:
+            # 文本文件：给出完整 diff（新增文件 before 为空，即 /dev/null → 新文件）
+            diff_result = _compute_diff(
+                "",
+                after_meta.get("content", ""),
+                fromfile="/dev/null",
+                tofile=f"b/{path}",
+            )
+            entry["unified_diff"] = diff_result.get("unified", "")
+            entry["diff_truncated"] = diff_result.get("truncated", False)
         files.append(entry)
 
     # 删除文件（仅在 after 快照完整时判定）
@@ -712,7 +854,12 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
             before_content = before_meta.get("content", "")
             after_content = after_meta.get("content", "")
             if before_content != after_content:
-                diff_result = _compute_diff(before_content, after_content)
+                diff_result = _compute_diff(
+                    before_content,
+                    after_content,
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                )
                 files.append({
                     "path": path,
                     "status": "modified",
@@ -744,20 +891,40 @@ def _diff_snapshots(before: dict, after: dict, repo_path: "Path") -> dict:
     return {"files": files, "after_incomplete_deleted": after_incomplete_deleted}
 
 
-def _compute_diff(before: str, after: str) -> dict:
+def _compute_diff(
+    before: str,
+    after: str,
+    *,
+    fromfile: str = "",
+    tofile: str = "",
+) -> dict:
     """计算文本 diff，返回统一格式。
 
-    实现 Unified Diff 格式：只显示前 100 行 diff。
+    实现 Unified Diff 格式：只显示前 DIFF_MAX_LINES 行 diff。
+
+    换行必须显式处理：`difflib.unified_diff` 的控制行（--- / +++ / @@）在
+    `lineterm=""` 时**不带**结尾换行，直接 `"".join` 会把文件头、hunk 头和
+    首行内容粘成一行 —— 前端按行解析时整段 diff 都会丢失。因此这里用
+    `"\n".join` 逐行拼接。
     """
     try:
         import difflib
-        before_lines = before.splitlines(keepends=True)
-        after_lines = after.splitlines(keepends=True)
+        before_lines = before.splitlines()
+        after_lines = after.splitlines()
         diff = list(difflib.unified_diff(
-            before_lines, after_lines, lineterm="", n=3
+            before_lines,
+            after_lines,
+            fromfile=fromfile,
+            tofile=tofile,
+            lineterm="",
+            n=3,
         ))
-        unified = "".join(diff[:100])
-        return {"unified": unified, "truncated": len(diff) > 100}
+        truncated = len(diff) > DIFF_MAX_LINES
+        unified = "\n".join(diff[:DIFF_MAX_LINES])
+        if truncated:
+            # 用 "\" 开头：diff 工具惯例的元信息行，前端解析时跳过
+            unified += "\n\\ ... diff 已截断"
+        return {"unified": unified, "truncated": truncated}
     except Exception:
         return {"unified": "[diff failed]", "truncated": False}
 
@@ -786,11 +953,13 @@ def create_project_execute_tool(
         if not isinstance(task_raw, str) or not task_raw.strip():
             return err_response(
                 "execute", "task 不能为空", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
         context_raw = arguments.get("context", "")
         if not isinstance(context_raw, str):
             return err_response(
                 "execute", "context 必须是字符串", kind="usage_error",
+                code=PROJECT_TOOL_CODES["usage"],
             )
 
         # 从 context 提取取消令牌，转换为 stop_event 传给 HarnessRunner
@@ -801,6 +970,12 @@ def create_project_execute_tool(
         if cancellation_token is not None:
             stop_event = CancellationToStopEvent(cancellation_token)
 
+        # 事件观察回调（可选）：把 harness 的协议事件原样透传给上层。
+        # 由调用方通过上下文提供（生产链路暂不提供 → None → 无额外行为）；
+        # 验收测试用它被动观察执行过程，不去抢读 harness 的 stdout 管道。
+        raw_on_event = getattr(context, "on_event", None) if context is not None else None
+        on_event = raw_on_event if callable(raw_on_event) else None
+
         # 仓库占用检查（与 ProjectService.delete 共用同一锁实例）
         project_lock = get_lock(project_id) if get_lock else None
         if project_lock is not None and not project_lock.acquire(blocking=False):
@@ -808,6 +983,7 @@ def create_project_execute_tool(
                 "execute",
                 "该项目正在执行另一个任务，请等待完成后重试",
                 kind="error",
+                code=PROJECT_TOOL_CODES["state"],
             )
 
         def _release():
@@ -854,6 +1030,7 @@ def create_project_execute_tool(
                 "execute",
                 "执行器未配置，请联系管理员设置 harness 路径",
                 kind="error",
+                code=PROJECT_TOOL_CODES["internal"],
             )
 
         from mini_deerflow.harness_runner import (
@@ -872,6 +1049,7 @@ def create_project_execute_tool(
                 task_id=run_id,
                 repo_path=str(repo_path),
                 prompt=prompt,
+                on_event=on_event,
                 stop_event=stop_event,
             )
 
@@ -885,36 +1063,7 @@ def create_project_execute_tool(
             changes["snapshot_complete"] = after_complete
 
             if result.status == STATUS_COMPLETED:
-                # 从 tool_events 提取 bash 命令记录
-                # command: 优先用 full_command（500 字符），否则 args_preview（200 字符截断）
-                # exit_code: 从 bash 输出 "[exit N] output" 格式解析
-                # has_output: 是否有命令输出（不等于"验证通过"）
-                verification: list[dict] = []
-                bash_count = 0
-                for e in result.tool_events:
-                    if e.get("name") == "bash":
-                        bash_count += 1
-                        output = e.get("output", "")
-                        command_preview = e.get("command_preview") or e.get("args_preview", "")
-                        # 解析 exit_code：bash 输出格式 "[exit N] output"
-                        exit_code: int | None = None
-                        if output.startswith("[exit "):
-                            end = output.find("]", 7)
-                            if end > 0:
-                                try:
-                                    exit_code = int(output[6:end])
-                                except ValueError:
-                                    pass
-                        verification.append({
-                            "command": command_preview,
-                            "command_truncated": e.get("command_truncated", False),
-                            "output": output,
-                            "output_truncated": e.get("output_truncated", False),
-                            "exit_code": exit_code,
-                            "duration_s": e.get("duration_s"),
-                            "has_output": bool(output),
-                        })
-
+                verification = _build_verification(result)
                 body = {
                     "ok": True,
                     "status": "completed",
@@ -937,12 +1086,13 @@ def create_project_execute_tool(
                 body = {
                     "ok": False,
                     "status": "stopped",
+                    "code": PROJECT_TOOL_CODES["execute_stopped"],
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
-                    "error": result.error or "任务被停止",
+                    "error": _executor_error(result.error, "任务被停止"),
                     "tool_events": [
                         {"name": e["name"], "duration_s": e.get("duration_s")}
                         for e in result.tool_events
@@ -954,10 +1104,11 @@ def create_project_execute_tool(
                 body = {
                     "ok": False,
                     "status": "timeout",
+                    "code": PROJECT_TOOL_CODES["execute_timeout"],
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
                     "error": f"执行超时（{runner._timeout_seconds}s），任务已被终止",
                     "tool_events": [
@@ -970,25 +1121,33 @@ def create_project_execute_tool(
             elif result.status == STATUS_LAUNCH_FAILED:
                 return err_response(
                     "execute",
-                    f"执行器启动失败：{result.error}",
+                    _executor_error(result.error, "执行器启动失败，请检查执行器配置"),
                     kind="error",
+                    code=PROJECT_TOOL_CODES["launch_failed"],
                 )
             elif result.status == STATUS_PROTOCOL_ERROR:
                 return err_response(
                     "execute",
-                    f"执行器协议错误：{result.error}（{result.unmapped_lines} 行非法输出）",
+                    _executor_error(
+                        result.error,
+                        f"执行器协议错误（{result.unmapped_lines} 行非法输出）",
+                    ),
                     kind="error",
+                    code=PROJECT_TOOL_CODES["protocol_error"],
                 )
             else:  # STATUS_FAILED / unknown
                 body = {
                     "ok": False,
                     "status": result.status,
+                    "code": PROJECT_TOOL_CODES["execute_failed"],
                     "task_id": run_id,
                     "answer": result.final_answer,
                     "files_written": result.files_written,
-                    "verification": [],
+                    "verification": _build_verification(result),
                     "changes": changes,
-                    "error": result.error or f"执行失败（{result.status}）",
+                    "error": _executor_error(
+                        result.error, f"执行失败（{result.status}）"
+                    ),
                     "tool_events": [
                         {"name": e["name"], "duration_s": e.get("duration_s")}
                         for e in result.tool_events
@@ -1039,6 +1198,42 @@ def create_project_execute_tool(
         handler=_as_tool_result("execute", _execute),
         needs_context=True,
     )
+
+
+def _build_verification(result) -> list[dict]:
+    """从 harness 的 tool_events 抽出 bash 命令记录。
+
+    R2 修复：所有终态（completed / stopped / timeout / failed）共用
+    同一段事件转换，未完成的命令不再被伪报为空。模型/UI 可以看到
+    "已经跑过什么/还没跑过什么"——这是 cancelled mid-task 的关键反馈。
+    """
+    verification: list[dict] = []
+    for e in result.tool_events:
+        if e.get("name") != "bash":
+            continue
+        output = e.get("output", "")
+        command_preview = (
+            e.get("command_preview") or e.get("args_preview", "")
+        )
+        # 解析 exit_code：bash 输出格式 "[exit N] output"
+        exit_code: int | None = None
+        if output.startswith("[exit "):
+            end = output.find("]", 7)
+            if end > 0:
+                try:
+                    exit_code = int(output[6:end])
+                except ValueError:
+                    pass
+        verification.append({
+            "command": command_preview,
+            "command_truncated": e.get("command_truncated", False),
+            "output": output,
+            "output_truncated": e.get("output_truncated", False),
+            "exit_code": exit_code,
+            "duration_s": e.get("duration_s"),
+            "has_output": bool(output),
+        })
+    return verification
 
 
 def _require_thread_id(context: object) -> str:

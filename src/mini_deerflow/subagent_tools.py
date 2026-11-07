@@ -9,8 +9,9 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
+from mini_deerflow.middleware import Budget, ChildBudget, build_child_budget
 from mini_deerflow.subagent_executor import CancellationToken, SubagentBudget, SubagentManager
 from mini_deerflow.subagent_models import (
     SubagentContextPolicy,
@@ -18,6 +19,9 @@ from mini_deerflow.subagent_models import (
     TaskStatus,
 )
 from mini_deerflow.tools import Tool, ToolRegistry
+
+if TYPE_CHECKING:
+    from mini_deerflow.models import Model
 
 
 # --- 工具结果工厂 ---
@@ -84,7 +88,10 @@ def _check_int(args: dict, name: str, field: str, min_val: int | None = None) ->
 
 class _SubmitHandler:
     """subagent_submit handler。"""
-    __slots__ = ("_manager", "_parent_run_id", "_parent_thread_id", "_depth")
+    __slots__ = (
+        "_manager", "_parent_run_id", "_parent_thread_id", "_depth",
+        "_thread_store", "_model", "_registry",
+    )
 
     def __init__(
         self,
@@ -92,18 +99,61 @@ class _SubmitHandler:
         parent_run_id: str,
         parent_thread_id: str,
         depth: int = 1,
+        thread_store: "InMemoryThreadStore | None" = None,
+        model: "Model | None" = None,
+        registry: "ToolRegistry | None" = None,
     ) -> None:
         self._manager = manager
         self._parent_run_id = parent_run_id
         self._parent_thread_id = parent_thread_id
-        # 工具调用来源的子任务深度（父 Agent 视作 depth=0，本工具提交的子任务从 1 开始）
         self._depth = depth
+        # TOOL-02：子代理与父共享 ThreadStore（用于反查 project_id）
+        self._thread_store = thread_store
+        # 子任务执行依赖（模型 / 工具注册表）：由 submit 调用带入，
+        # 由 Manager 在 worker 线程里装配成 SubagentRunner。
+        # 不传则沿用 Manager 默认（FakeModel + 空注册表）。
+        self._model = model
+        self._registry = registry
 
-    def __call__(self, arguments: dict[str, object]) -> str:
+    def __call__(self, arguments: dict[str, object], context: object | None = None) -> str:
         tool_name = "subagent_submit"
         try:
             if not isinstance(arguments, dict):
                 raise SubagentToolError("arguments", "必须是 dict")
+
+            # TOOL-02（R2a-3-run）：从 context 提取父 Agent 的 run_id 和 thread_id（而非 hardcoded）
+            effective_parent_run_id = self._parent_run_id
+            effective_parent_thread_id = self._parent_thread_id
+            if context is not None:
+                if hasattr(context, "run_id"):
+                    ctx_run_id = getattr(context, "run_id")
+                    if ctx_run_id:
+                        effective_parent_run_id = ctx_run_id
+                if hasattr(context, "thread_id"):
+                    ctx_thread_id = getattr(context, "thread_id")
+                    if ctx_thread_id:
+                        effective_parent_thread_id = ctx_thread_id
+
+            # TOOL-02：从执行上下文提取父 Agent 已授予的能力，传递给子任务
+            parent_caps: frozenset = frozenset()
+            if context is not None:
+                if hasattr(context, "granted_capabilities"):
+                    parent_caps = getattr(context, "granted_capabilities") or frozenset()
+
+            # BUDGET-01：父运行的预算（Agent.run 放进 tool_ctx 的那一个）。
+            # 子代理必须与父**共享同一个**计数器 —— 子代理的模型/工具消耗
+            # 真实计入父运行，父的额度上限对子代理同样生效。
+            #
+            # 复审 B1：必须同时接受 `Budget` 与 `ChildBudget`。带局部额度的
+            # 子代理持有的是 `ChildBudget` 视图（不是 Budget 子类），只认
+            # Budget 会让**继续委派**在这一层把整条父预算链丢掉 —— 孙代理
+            # 的消耗从此不进根计数器。ChildBudget 作为 parent 传给
+            # build_child_budget 会继续向上链到根，链条不中断。
+            parent_budget: Budget | ChildBudget | None = None
+            if context is not None:
+                ctx_budget = getattr(context, "budget", None)
+                if isinstance(ctx_budget, (Budget, ChildBudget)):
+                    parent_budget = ctx_budget
 
             instruction = _check_str(arguments, tool_name, "instruction")
             timeout = _check_int(arguments, tool_name, "timeout_seconds", 1)
@@ -124,24 +174,43 @@ class _SubmitHandler:
                 allow_further_delegation=allow_delegation,
             )
 
-            # 构建 per-task budget。仅当调用方显式提供了局部上限时才创建独立 Budget；
-            # 默认（None）走 Manager 的 shared_budget，父子共享同一额度。
-            budget: SubagentBudget | None = None
+            # BUDGET-01：模型自填的局部上限**只能收紧，不能扩额**。
+            # 过去这里直接造一个独立的 SubagentBudget 顶替父额度 —— 子代理
+            # 的消耗完全不进父计数器，等于凭空扩出一份额度。
+            # 现在：父额度始终参与计数；模型自填的上限作为**附加的更严限制**，
+            # 由 ChildBudget 视图同时检查两边。
+            local_budget: SubagentBudget | None = None
             if max_model_calls or max_tool_calls or (max_steps and max_steps > 0):
-                budget = SubagentBudget(
-                    max_steps=max_steps,
+                local_budget = SubagentBudget(
+                    # 缺省（0）表示**不设局部步数上限**，不能当成"0 步"——
+                    # 否则模型只填 max_model_calls 就会把子代理直接卡死。
+                    max_steps=max_steps if max_steps and max_steps > 0 else None,
                     max_model_calls=max_model_calls if max_model_calls else None,
                     max_tool_calls=max_tool_calls if max_tool_calls else None,
                 )
+            budget = build_child_budget(parent_budget, local_budget)
+
+            # TOOL-02（R2a-1）：从共享 ThreadStore 获取父线程的 project_id，继承项目会话上下文
+            parent_project_id: str | None = None
+            if self._thread_store is not None:
+                try:
+                    parent_thread = self._thread_store.get(effective_parent_thread_id)
+                    parent_project_id = getattr(parent_thread, "project_id", None) or None
+                except Exception:
+                    pass  # 非项目会话时 project_id 为 None
 
             task = self._manager.submit(
                 instruction=instruction,
-                parent_run_id=self._parent_run_id,
-                parent_thread_id=self._parent_thread_id,
+                parent_run_id=effective_parent_run_id,
+                parent_thread_id=effective_parent_thread_id,
                 depth=self._depth,
                 timeout_seconds=timeout if timeout else None,
                 budget=budget,
+                model=self._model,
+                registry=self._registry,
                 context_policy=policy,
+                parent_granted_capabilities=parent_caps,
+                parent_project_id=parent_project_id,
             )
 
             return _ok(
@@ -296,6 +365,7 @@ def create_subagent_tools(
     manager: SubagentManager,
     parent_run_id: str,
     parent_thread_id: str,
+    thread_store: "InMemoryThreadStore | None" = None,
 ) -> list[Tool]:
     """创建 4 个 Subagent 工具。"""
     return [
@@ -341,7 +411,8 @@ def create_subagent_tools(
                 "required": ["instruction"],
                 "additionalProperties": False,
             },
-            handler=_SubmitHandler(manager, parent_run_id, parent_thread_id),
+            handler=_SubmitHandler(manager, parent_run_id, parent_thread_id, thread_store=thread_store),
+            needs_context=True,
         ),
         Tool(
             name="subagent_status",
