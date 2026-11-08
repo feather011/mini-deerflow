@@ -5898,3 +5898,16 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
 | 取消测试单跑稳定性 | 连跑 3 次 `pytest tests/test_subagent_wiring.py` | **14 passed × 3**（改造前全量跑会偶发失败） |
 | 后端全量 | `pytest tests/` | **3721 passed, 15 failed, 15 skipped, 42 subtests**（失败集合与基线逐条一致） |
 | 真实 API 重读计数 | `GET /api/threads/{父线程}` → `subagent_runs[0]` | **`model_calls=1`、`tool_calls=0`**（改造前恒为 0） |
+
+### 交付
+
+- **提交**（`master`，普通 push，无 force / 无 amend / 无历史改写）：
+  `d649bcd` 子代理隔离线程不再泄漏到用户会话列表 → `ca66069` 子任务记录如实记录调用次数 + 修掉取消测试的偶发失败 →
+  `1013f3c` 进度记录 → `0c2c665` 验收脚本写出前端 .env.local
+- **推送**：`947ae5b..0c2c665  master -> master`（fast-forward）
+- **推送前干净树验证**（`git archive 0c2c665` 导出副本，非工作区）：
+  后端全量 **15 failed, 3721 passed, 15 skipped, 42 subtests**；
+  与基线 `947ae5b` 的失败清单做 `comm` 差分 → **新增失败 0 项**。
+  （基线那次跑出 17 项，多出的 2 项是竞态偶发：本轮的取消测试已重写成确定性；
+  `test_tool07_process_tree_recovery.py` 是 TOOL-07 遗留的顺序敏感项，未改其代码。）
+- 前端：`npm run typecheck` 通过；`npx vitest run` → **45 files / 553 tests passed**。
