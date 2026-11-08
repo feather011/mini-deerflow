@@ -20,4 +20,5 @@ workspaces/
 # 前端临时目录
 frontend/pnpm-lock.yaml
 frontend/node_modules/
-frontend/.playwright-cli/
+# playwright-cli 的快照/日志产物（可能在任意目录）
+.playwright-cli/

@@ -5854,7 +5854,7 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
 | 会话列表不再泄漏 | `GET /api/threads` | **无任何 `subagent-` 条目**（修复前有） |
 | G6 API 重读 | `GET /api/threads/{父线程}` → `subagent_runs` | **1 条，`status=SUCCEEDED`，含子 Agent 产出** |
 | 浏览器实机（UI 层） | 前端 dev server `:5188` + Playwright | 卡片渲染 ✅；`reload()` 后卡片仍在 ✅；整页 `innerText` 无 `subagent-` 串 ✅ |
-| 证据截图 | `docs/evidence/subagent/` | `card-render.png` / `card-after-reload.png` / `card-after-fix-reload.png` |
+| 证据截图 | `docs/evidence/subagent/` | `card-render.png` / `card-after-reload.png`（**这两张能看到缺陷**：刷新后侧栏出现 `subagent-sa-…`） / `card-after-fix.png` / `card-after-fix-reload.png`（修复后：侧栏只剩用户会话） |
 
 ### 本轮新增的可复用验收工具
 
@@ -5864,6 +5864,18 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
 | `scripts/subagent_demo.py` | **终端验收入口**：直接跑主 Agent → 派发 → 子 Agent 产出 → 落库记录，打印全部中间产物。 |
 
 两个脚本都复用生产工具链路、SSE、落库、Trace，**只换模型**。
+
+### 更正：证据截图曾经截错页面（2026-11-08 12:55）
+
+`card-after-fix-reload.png` 的**第一版不是 mini-deerflow 的截图**，而是同一浏览器里
+另一个项目（OpenTutor）的页面 —— `playwright-cli screenshot` 截到了别的页面，而提交时
+没有回看图片内容。这是**证据造假性质**的错误（不是代码问题，但结论不可信），已更正：
+
+- 用**独立的 playwright 会话**在 `http://127.0.0.1:5190`（脚本模型验收后端 `:8331`）
+  重新走了一遍「新建会话 → 发消息 → 出现子任务卡 → F5 刷新」；
+- 两张新截图 `card-after-fix.png` / `card-after-fix-reload.png` **逐张回看确认**：
+  页面是 Mini DeerFlow、卡片 `sa-d960d26e7fe3` 已完成、**侧栏没有 `subagent-` 条目**；
+- 教训：截图类证据必须**打开看一遍**再提交，`eval` 读到的页面文本不能替代图片内容的核对。
 
 ### 未验证事项（不变）
 
