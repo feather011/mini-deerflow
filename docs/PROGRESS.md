@@ -5875,3 +5875,26 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
 
 - 真实模型实测（派发时机与频率）。
 - 真实 harness 路径。
+
+### 补充修复（同轮发现并当场修掉的两处"证据与事实不符"）
+
+| 项 | 问题 | 修复 |
+|---|---|---|
+| 子任务记录的调用次数 | `model_calls` / `tool_calls` **恒为 0** —— 字段在，但 `build_subagent_run_record()` 从没收到过真实值，`SubagentResult` 也没承载它们。等于在说谎。 | 子代理在模型调用 / 工具调用处累加计数；Runner 在**所有**返回路径（成功 / 取消 / 超时 / 失败）把真实计数写进 `SubagentResult`，记录随之如实落库。 |
+| `test_父取消_三项分别断言` 偶发失败 | 实测**整仓全量跑时失败、单跑必过**。根因：测试用「睡够 50ms 就放行子模型」解除阻塞 —— 机器繁忙时父还没来得及取消子任务，子任务已跑完并被标成 `SUCCEEDED`。 | 子模型的解除阻塞条件改成「**子任务自己的取消令牌真的被置位**」，由 `父取消 → 父的等待循环 → Manager.cancel → 子任务令牌置位` 这条真实链路驱动；线程里的断言改为回传主线程，避免失败被静默吞掉。 |
+
+**取消测试的偶发失败是怎么发现的**：整仓全量跑时比基线多出 2 项失败
+（`test_subagent_wiring.py::TestParentCancellationStopsChild` 与
+`test_tool07_process_tree_recovery.py`），单跑两者都过 → 说明是**竞态**而非
+逻辑错误。逐个复现后确认：`test_tool07_process_tree_recovery.py` 是**既有**
+的顺序敏感偶发项（TOOL-07 遗留，本轮未改动其代码，只如实记录）；本轮的
+取消测试是自己引入的，已按上述方式重写成确定性。
+
+**验证**
+
+| 验证 | 命令 | 结果 |
+|---|---|---|
+| Subagent 定向 | `pytest tests/test_subagent_wiring.py tests/test_subagent_models.py tests/test_subagent_runs_api.py tests/test_subagent_executor.py tests/test_subagent_integration.py` | **78 passed** |
+| 取消测试单跑稳定性 | 连跑 3 次 `pytest tests/test_subagent_wiring.py` | **14 passed × 3**（改造前全量跑会偶发失败） |
+| 后端全量 | `pytest tests/` | **3721 passed, 15 failed, 15 skipped, 42 subtests**（失败集合与基线逐条一致） |
+| 真实 API 重读计数 | `GET /api/threads/{父线程}` → `subagent_runs[0]` | **`model_calls=1`、`tool_calls=0`**（改造前恒为 0） |
