@@ -14,7 +14,7 @@
  */
 import { BrowserRouter, Routes, Route, useParams, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { ErrorBoundary } from './ErrorBoundary'
 import { TopBar } from './layout/TopBar'
 import { BackendStatusBar } from '../features/status'
@@ -91,7 +91,10 @@ function WorkspacePage() {
   const [panelOpen, setPanelOpen] = useState(false)
   // 右侧当前展示的子任务会话（点子任务通知条时打开）。
   // null = 不展示子任务会话，回到原右侧面板。
+  // 记录它属于哪个会话：切换会话时直接**派生**为不可见，
+  // 不用 useEffect + setState（那会多渲染一次，也会被 lint 拦）。
   const [subagentView, setSubagentView] = useState<{
+    threadId: string | null
     taskId: string
     instruction: string
   } | null>(null)
@@ -103,9 +106,8 @@ function WorkspacePage() {
 
   // 切换会话时收起子任务会话：上一个会话的子任务与当前会话无关，
   // 留着会让用户以为右侧内容属于当前会话。
-  useEffect(() => {
-    setSubagentView(null)
-  }, [threadId])
+  const activeSubagentView =
+    subagentView && subagentView.threadId === (threadId ?? null) ? subagentView : null
 
   // 右侧辅助面板的数据来源：真实 harness 结果（realTaskAdapter）。
   // 顶栏的「模拟数据」标识按**数据来源**决定，不与面板开合挂钩 ——
@@ -179,7 +181,11 @@ function WorkspacePage() {
       <main className="workspace-main">
         <ThreadMain
           onOpenSubagent={(card) => {
-            setSubagentView({ taskId: card.task_id, instruction: card.instruction })
+            setSubagentView({
+              threadId: threadId ?? null,
+              taskId: card.task_id,
+              instruction: card.instruction,
+            })
             // 窄屏下右侧栏靠 panelOpen 控制显隐；子任务会话必须一起打开
             setPanelOpen(true)
           }}
@@ -193,11 +199,11 @@ function WorkspacePage() {
         }`}
         aria-label="任务与文件面板"
       >
-        {subagentView ? (
+        {activeSubagentView ? (
           // 子任务会话覆盖右侧面板；「←」返回原来的右侧内容
           <SubagentConversationPanel
-            taskId={subagentView.taskId}
-            instruction={subagentView.instruction}
+            taskId={activeSubagentView.taskId}
+            instruction={activeSubagentView.instruction}
             onBack={() => setSubagentView(null)}
           />
         ) : panelOpen ? (
