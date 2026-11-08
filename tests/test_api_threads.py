@@ -217,6 +217,36 @@ def test_get_subagent_thread_still_readable_by_id() -> None:
     assert response.json()["thread_id"] == thread_id
 
 
+def test_post_threads_rejects_reserved_subagent_prefix() -> None:
+    """保留命名空间必须在入口挡住。
+
+    回归：列表按 `subagent-` 前缀过滤，但 POST 允许客户端自填 thread_id。
+    两者一撞，就会出现「创建成功（201）但列表里看不见、只能按 ID 直读」的
+    幽灵会话。现在直接 400，且**不留下任何线程**。
+    """
+    client, store = _make_client()
+    with client:
+        response = client.post("/api/threads", json={"thread_id": "subagent-user-made"})
+        listed = client.get("/api/threads")
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "subagent-" in body["error"]["message"], body
+    # 不能"先建后禁"：store 里也不该留下这条线程
+    assert store.list_threads() == ()
+    assert listed.json() == {"threads": []}
+
+
+def test_post_threads_still_accepts_normal_client_ids() -> None:
+    """普通自定义 ID 不受影响（别把整条创建路径一起挡死）。"""
+    client, store = _make_client()
+    with client:
+        response = client.post("/api/threads", json={"thread_id": "my-session-1"})
+    assert response.status_code == 201
+    assert response.json()["thread_id"] == "my-session-1"
+    assert [t.thread_id for t in store.list_threads()] == ["my-session-1"]
+
+
 # =============================================================================
 # 3. GET /api/threads/{thread_id}
 # =============================================================================

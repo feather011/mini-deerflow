@@ -12,7 +12,10 @@ import uuid
 from pathlib import Path
 
 from mini_deerflow.project_store import ProjectNotFoundError, ProjectStore
-from mini_deerflow.subagent_models import is_subagent_thread_id
+from mini_deerflow.subagent_models import (
+    SUBAGENT_THREAD_PREFIX,
+    is_subagent_thread_id,
+)
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import (
     ThreadAlreadyExistsError as StoreAlreadyExistsError,
@@ -43,6 +46,22 @@ class ThreadAlreadyExistsError(ThreadServiceError):
 
     def __init__(self, thread_id: str) -> None:
         super().__init__(f"线程已存在: {thread_id}")
+        self.thread_id = thread_id
+
+
+class ReservedThreadIdError(ThreadServiceError):
+    """客户端指定的 thread_id 落在服务端保留的命名空间里。
+
+    `subagent-` 前缀属于**子代理的隔离线程**（Subagent 首版）。用户会话
+    列表按这个前缀过滤掉子代理线程，所以一旦允许客户端自建同前缀的
+    thread_id，就会出现「创建成功但列表里看不见、只能按 ID 直读」的
+    幽灵会话。保留命名空间必须在入口处挡住，而不是靠前端不生成。
+    """
+
+    def __init__(self, thread_id: str) -> None:
+        super().__init__(
+            f"线程 ID 使用了保留前缀 {SUBAGENT_THREAD_PREFIX}：{thread_id}"
+        )
         self.thread_id = thread_id
 
 
@@ -90,6 +109,10 @@ class ThreadService:
         则在 {project_root}/sessions/{thread_id}/ 下创建会话目录。
         """
         new_id = thread_id if thread_id else self.generate_id()
+        # 保留命名空间：`subagent-` 是子代理的隔离线程，不是用户会话。
+        # 允许客户端自建同前缀的 ID，会得到「创建成功但列表里看不见」的幽灵会话。
+        if is_subagent_thread_id(new_id):
+            raise ReservedThreadIdError(new_id)
         try:
             state = self._store.create(new_id, project_id)
         except StoreAlreadyExistsError as exc:

@@ -5923,3 +5923,29 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
   （基线那次跑出 17 项，多出的 2 项是竞态偶发：本轮的取消测试已重写成确定性；
   `test_tool07_process_tree_recovery.py` 是 TOOL-07 遗留的顺序敏感项，未改其代码。）
 - 前端：`npm run typecheck` 通过；`npx vitest run` → **45 files / 553 tests passed**。
+
+### 补丁：`subagent-` 前缀成为真正的保留命名空间（人工审查发现）
+
+**问题**（人工审查时实测）：`ThreadService.list()` 按前缀过滤子代理线程，但
+`POST /api/threads` 允许客户端自填 `thread_id`。两者一撞，就出现**幽灵会话**：
+
+```
+POST /api/threads {"thread_id":"subagent-user-made"} → 201 创建成功
+GET  /api/threads                                     → 列表里没有它
+GET  /api/threads/subagent-user-made                  → 200 能读到
+```
+
+前端生成的是随机 hex，正常走不到；但保留命名空间不能靠"前端不会这么传"来守。
+
+**修复**：`ThreadService.create()` 在解析出最终 id 后直接拒绝保留前缀，
+抛 `ReservedThreadIdError` → 路由映射为 **400**（OpenAPI 补 400 说明）。
+在**入口**挡，而不是建完再隐藏 —— 实测 `/api/threads` 保持为空，store 里没留下线程。
+
+**边界确认**：子代理自己的隔离线程由 `SubagentRunner` **直接调 store** 创建，
+不经 `ThreadService.create`，因此不受此校验影响（回归测试覆盖）。
+
+| 验证 | 命令 | 结果 |
+|---|---|---|
+| 定向回归 | `pytest tests/test_api_threads.py tests/test_subagent_wiring.py tests/test_subagent_runs_api.py tests/test_subagent_e2e_flow.py tests/test_cli.py tests/test_serialization.py` | **105 passed** |
+| 新增回归 | 同上（3 项） | 保留前缀 → 400 且不留痕；普通自定义 ID → 201；自动生成 → 201 |
+| 真实后端实测 | `POST /api/threads` 三种输入 | `subagent-user-made` → **400**；`my-session-1` → 201；`{}` → 201；列表无幽灵条目 |

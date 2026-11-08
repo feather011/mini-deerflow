@@ -29,6 +29,7 @@ from mini_deerflow.api.schemas.threads import (
     thread_to_summary,
 )
 from mini_deerflow.api.services.threads import (
+    ReservedThreadIdError,
     ThreadAlreadyExistsError,
     ThreadNotFoundError,
     ThreadService,
@@ -77,6 +78,7 @@ def get_project_service(
     description="创建新线程。thread_id 可选；不指定时由服务端生成 UUID。",
     responses={
         201: {"description": "线程创建成功"},
+        400: {"model": ErrorResponse, "description": "线程 ID 使用了保留前缀"},
         409: {"model": ErrorResponse, "description": "线程 ID 已存在"},
         503: {"model": ErrorResponse, "description": "Runtime 未就绪"},
     },
@@ -89,6 +91,11 @@ def create_thread(
     requested_project_id = payload.project_id if payload else None
     try:
         thread = service.create(requested_id, requested_project_id)
+    except ReservedThreadIdError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
     except ThreadAlreadyExistsError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
