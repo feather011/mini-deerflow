@@ -241,6 +241,8 @@ class SubagentRunner:
     parent_span_id: str | None = None
     # TRACE-01：Trace sink（子代理不走中间件管线，span 手工发）
     trace_sink: "TraceSink | None" = None
+    # 子任务实际发生的模型 / 工具调用次数（由子代理累加，落库时如实记录）
+    counters: "_CallCounters" = field(default_factory=lambda: _CallCounters())
 
     def run(self) -> SubagentResult:
         """执行子任务并返回结果。
@@ -357,6 +359,7 @@ class SubagentRunner:
                 trace_sink=self.trace_sink,
                 trace_run_id=self.parent_run_id or self.run_id,
                 parent_span_id=task_span_id,
+                counters=self.counters,
             )
 
             # 检查取消（在开始前）
@@ -374,6 +377,8 @@ class SubagentRunner:
                 self.task,
                 output=output,
                 run_id=self.run_id,
+                model_calls=self.counters.model_calls,
+                tool_calls=self.counters.tool_calls,
             )
 
         except _DeadlineExceededError:
@@ -392,6 +397,8 @@ class SubagentRunner:
                 error_type="BudgetExhaustedError",
                 error_message=str(e),
                 run_id=self.run_id,
+                model_calls=self.counters.model_calls,
+                tool_calls=self.counters.tool_calls,
             )
 
         except Exception as e:
@@ -402,6 +409,8 @@ class SubagentRunner:
                 error_type=type(e).__name__,
                 error_message=str(e),
                 run_id=self.run_id,
+                model_calls=self.counters.model_calls,
+                tool_calls=self.counters.tool_calls,
             )
 
         finally:
@@ -441,6 +450,8 @@ class SubagentRunner:
             error_type="CancelledError",
             error_message="任务被取消",
             run_id=self.run_id,
+            model_calls=self.counters.model_calls,
+            tool_calls=self.counters.tool_calls,
         )
 
     def _mark_timed_out_and_result(self) -> SubagentResult:
@@ -452,6 +463,8 @@ class SubagentRunner:
             error_type="TimeoutError",
             error_message="任务超时",
             run_id=self.run_id,
+            model_calls=self.counters.model_calls,
+            tool_calls=self.counters.tool_calls,
         )
 
 
@@ -502,6 +515,21 @@ class _CancellableModel:
         return self._model.decide(messages, tools)
 
 
+class _CallCounters:
+    """子任务实际发生的模型 / 工具调用次数。
+
+    由 Runner 创建并交给 `_BudgetAwareAgent` 累加，Runner 在**所有**返回路径
+    （成功 / 取消 / 超时 / 失败）上都能读到真实计数 —— 落库的子任务记录因此
+    能如实反映"子 Agent 做了什么"，而不是恒为 0。
+    """
+
+    __slots__ = ("model_calls", "tool_calls")
+
+    def __init__(self) -> None:
+        self.model_calls = 0
+        self.tool_calls = 0
+
+
 class _BudgetAwareAgent:
     """Budget-aware Agent wrapper。"""
     _DEFAULT_MAX_STEPS = 10
@@ -528,6 +556,8 @@ class _BudgetAwareAgent:
         trace_sink: "TraceSink | None" = None,
         trace_run_id: str = "",
         parent_span_id: str | None = None,
+        # 调用计数（由 Runner 持有，Agent 只负责累加）
+        counters: "_CallCounters | None" = None,
     ) -> None:
         self._model = model
         self._registry = registry
@@ -557,6 +587,7 @@ class _BudgetAwareAgent:
         self._trace_sink = trace_sink
         self._trace_run_id = trace_run_id
         self._parent_span_id = parent_span_id
+        self._counters = counters
 
     def _check_deadline(self) -> None:
         """检查是否超时。"""
@@ -575,6 +606,9 @@ class _BudgetAwareAgent:
         父节点是本子任务的 SUBAGENT_TASK span。
         """
         sink = self._trace_sink
+        if self._counters is not None:
+            # 与预算口径一致：失败/异常的 attempt 也计数。
+            self._counters.model_calls += 1
         if sink is None:
             return self._model.decide(model_messages, model_tools)
         span_id = uuid.uuid4().hex
@@ -729,6 +763,9 @@ class _BudgetAwareAgent:
                         self._budget.consume_tool_call()
                     except BudgetExceededError as e:
                         raise _BudgetExhaustedError(str(e)) from e
+                    if self._counters is not None:
+                        # 与预算口径一致：额度一旦消费就算一次调用。
+                        self._counters.tool_calls += 1
 
                     # 纵深防御第二层（执行限制）：模型可能凭上下文里的名字
                     # "凭记忆"伪造一个未授权工具（暴露限制挡不住这种情况），

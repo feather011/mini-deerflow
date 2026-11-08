@@ -420,6 +420,8 @@ class _SubmitHandler:
             started_at = result.started_at
             finished_at = result.finished_at
             duration = result.duration
+            model_calls = result.model_calls
+            tool_calls = result.tool_calls
         else:
             status = task.status.name
             output = ""
@@ -428,6 +430,8 @@ class _SubmitHandler:
             started_at = getattr(task, "started_at", None)
             finished_at = getattr(task, "finished_at", None)
             duration = None
+            model_calls = 0
+            tool_calls = 0
         return build_subagent_run_record(
             task_id=task.task_id,
             instruction=task.instruction,
@@ -439,6 +443,8 @@ class _SubmitHandler:
             finished_at=finished_at,
             duration_seconds=duration,
             parent_run_id=task.parent_run_id,
+            model_calls=model_calls,
+            tool_calls=tool_calls,
         )
 
     def _persist(self, parent_thread_id: str, record: dict[str, Any]) -> None:

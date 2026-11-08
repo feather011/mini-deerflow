@@ -21,7 +21,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -91,30 +91,43 @@ class _SlowModel:
 
 
 class _BlockingModel:
-    """阻塞在一次模型调用里，直到被告知放行。
+    """阻塞在一次模型调用里，直到**子任务自己的取消令牌**被置位。
 
     用于构造「取消发生时，子任务正处于一次进行中的模型调用」这一时序：
     取消能阻止**后续**调用，但进行中的那次会跑完 —— 这正是取消边界
     需要如实描述的地方。
+
+    解除阻塞的条件是「子任务的取消令牌**真的**被置位」，而不是「睡够
+    固定毫秒数」。用固定睡眠解除会引入竞态：机器繁忙时父还没来得及
+    取消子任务，子任务就已经跑完并被标成 SUCCEEDED —— 测试变成偶发失败
+    （本轮实测在整仓全量跑时出现过，单跑必过）。
     """
 
-    def __init__(self, content: str = "阻塞结果") -> None:
+    #: 等待子任务取消令牌的最长时间；超时后放行，避免测试挂死。
+    MAX_WAIT_SECONDS = 30.0
+
+    def __init__(
+        self,
+        content: str = "阻塞结果",
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> None:
         self._content = content
+        # 谓词：返回 True 表示子任务已被取消
+        self._is_cancelled = is_cancelled or (lambda: False)
         self.decide_calls = 0
-        self._release = threading.Event()
         self._entered = threading.Event()
 
     def decide(self, messages: list[Message], tools: list[Any] | None = None):
         self.decide_calls += 1
         self._entered.set()
-        # 最多等 5 秒，避免测试挂死
-        self._release.wait(timeout=5.0)
+        deadline = time.monotonic() + self.MAX_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            if self._is_cancelled():
+                break
+            time.sleep(0.02)
         return FinalAnswer(content=self._content)
 
-    def release(self) -> None:
-        self._release.set()
-
-    def wait_entered(self, timeout: float = 5.0) -> bool:
+    def wait_entered(self, timeout: float = 30.0) -> bool:
         return self._entered.wait(timeout=timeout)
 
 
@@ -397,8 +410,22 @@ class TestParentCancellationStopsChild:
         store = InMemoryThreadStore()
         store.create("th-1")
 
-        # 子模型：阻塞在第一次调用里，直到测试放行
-        child_model = _BlockingModel(content="阻塞结果")
+        # 子模型：阻塞在第一次调用里，直到**子任务自己的取消令牌**被置位。
+        # 谓词通过 holder 延迟拿到 manager —— manager 需要 child_model，
+        # child_model 又需要 manager 的取消令牌，只能用闭包打破这个循环。
+        manager_holder: dict[str, Any] = {}
+
+        def _child_cancelled() -> bool:
+            manager = manager_holder.get("manager")
+            if manager is None:
+                return False
+            tasks = manager.list_tasks()
+            if not tasks:
+                return False
+            token = manager._tokens.get(tasks[0].task_id)
+            return bool(token is not None and token.is_cancelled())
+
+        child_model = _BlockingModel(content="阻塞结果", is_cancelled=_child_cancelled)
         parent_model = _CountingModel(
             [
                 ToolCall(
@@ -419,6 +446,7 @@ class TestParentCancellationStopsChild:
             )
         )
         manager = _make_manager(store, model=child_model, registry=registry)
+        manager_holder["manager"] = manager
         _register_subagent_tools(
             registry,
             manager,
@@ -433,13 +461,19 @@ class TestParentCancellationStopsChild:
 
         def _cancel_after_child_started() -> None:
             nonlocal calls_before_cancel
-            # 等子代理真的进入模型调用，再取消
-            assert child_model.wait_entered(timeout=5.0), "子代理未进入模型调用"
+            # 等子代理真的进入模型调用，再取消。
+            # 不在这里断言：线程里的断言失败会被静默吞掉，主线程只看到
+            # "父令牌没置位"这种难懂的报错。改成返回，由主线程给出明确失败。
+            if not child_model.wait_entered(timeout=30.0):
+                return
             calls_before_cancel = child_model.decide_calls
             parent_token.cancel()
-            # 让进行中的那次调用返回 —— 它**不会**被强制中断
-            time.sleep(0.05)
-            child_model.release()
+            # 这里**不再**"睡够 50ms 就放行子模型"：
+            # 子模型的解除阻塞条件是「子任务的取消令牌真的被置位」，
+            # 父取消 → 父的等待循环 → Manager.cancel → 子任务令牌置位 →
+            # 进行中的那次调用自己返回（不被强制中断）。
+            # 用固定睡眠解除会引入竞态：机器繁忙时父还没来得及取消子任务，
+            # 子任务就已经跑完并被标成 SUCCEEDED —— 测试变成偶发失败。
 
         canceler = threading.Thread(target=_cancel_after_child_started)
         canceler.start()
@@ -457,7 +491,11 @@ class TestParentCancellationStopsChild:
             agent.run("th-1", "派个长任务", cancellation_token=parent_token)
         except Exception:
             pass
-        canceler.join(timeout=10)
+        canceler.join(timeout=30)
+
+        # ⓪ 取消时序必须成立：子代理确实进入了模型调用。
+        # 没有这一步，下面的断言会在「子代理压根没跑起来」时给出误导性报错。
+        assert child_model.decide_calls >= 1, "子代理未进入模型调用（取消时序未成立）"
 
         # ① 取消被父令牌观测：令牌确实置位
         assert parent_token.is_cancelled(), "父取消令牌应已置位"
@@ -664,6 +702,10 @@ class TestPersistence:
         assert record["instruction"] == "记录一下"
         assert "结论内容" in record["output"]
         assert record["task_id"].startswith("sa-")
+        # 计数必须**如实反映**子 Agent 实际做了什么，不能恒为 0
+        # （子模型被调用了 1 次、没调用工具）。
+        assert record["model_calls"] == 1, f"model_calls 应为 1，实际 {record['model_calls']}"
+        assert record["tool_calls"] == 0, f"tool_calls 应为 0，实际 {record['tool_calls']}"
 
     def test_主Agent收尾保存不覆盖子任务记录(self) -> None:
         """**关键回归**：FinalAnswer 的收尾保存用的是运行开始时的旧快照，

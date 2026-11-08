@@ -259,6 +259,10 @@ class SubagentResult:
     finished_at: float
     # duration 由 finished_at - started_at 计算，不存储
     run_id: str | None = None
+    # 子任务实际发生的模型 / 工具调用次数。
+    # 落库的子任务记录要如实反映"子 Agent 做了什么"，不能恒为 0。
+    model_calls: int = 0
+    tool_calls: int = 0
 
     def __post_init__(self) -> None:
         if self.terminal_status not in {
@@ -295,6 +299,8 @@ class SubagentResult:
         }
         if self.run_id is not None:
             result["run_id"] = self.run_id
+        result["model_calls"] = self.model_calls
+        result["tool_calls"] = self.tool_calls
         return result
 
     @classmethod
@@ -319,10 +325,12 @@ class SubagentResult:
             started_at=float(data["started_at"]),
             finished_at=float(data["finished_at"]),
             run_id=str(v) if (v := data.get("run_id")) is not None else None,
+            model_calls=int(data.get("model_calls", 0) or 0),
+            tool_calls=int(data.get("tool_calls", 0) or 0),
         )
 
     @classmethod
-    def from_task(cls, task: SubagentTask, output: str = "", error_type: str | None = None, error_message: str | None = None, run_id: str | None = None) -> "SubagentResult":
+    def from_task(cls, task: SubagentTask, output: str = "", error_type: str | None = None, error_message: str | None = None, run_id: str | None = None, model_calls: int = 0, tool_calls: int = 0) -> "SubagentResult":
         """从已完成的任务构建结果。task 必须处于终态。"""
         if task.status not in {
             TaskStatus.SUCCEEDED,
@@ -342,4 +350,6 @@ class SubagentResult:
             started_at=started,
             finished_at=finished,
             run_id=run_id,
+            model_calls=model_calls,
+            tool_calls=tool_calls,
         )
