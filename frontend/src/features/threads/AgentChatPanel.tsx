@@ -41,16 +41,22 @@ import { useDraftStore } from './useDraftStore'
 // TOOL-05：确认卡（聊天内嵌紧邻对应工具活动）
 import { useConfirmations } from '../confirmations/useConfirmations'
 import { ConfirmationCardList } from '../confirmations/ConfirmationCardList'
-// Subagent 首版：子任务卡（聊天区内嵌，展示主 Agent 派发的子任务）
+// Subagent 首版：子任务通知条（聊天区内嵌，点击在右侧打开子 Agent 会话）
 import { useSubagentCards } from '../subagents/useSubagentCards'
 import { SubagentCardList } from '../subagents/SubagentCardList'
+import type { SubagentCard as SubagentCardModel } from '../subagents/useSubagentCards'
+// 工具调用折叠块（会话内，像消息一样折叠展示）
+import { useToolCalls } from '../tools/useToolCalls'
+import { ToolCallList } from '../tools/ToolCallList'
 import styles from './AgentChatPanel.module.css'
 
 interface AgentChatPanelProps {
   thread: ThreadDetail
+  /** 点击子任务通知条：在右侧打开该子 Agent 的会话窗口 */
+  onOpenSubagent?: (card: SubagentCardModel) => void
 }
 
-export function AgentChatPanel({ thread }: AgentChatPanelProps) {
+export function AgentChatPanel({ thread, onOpenSubagent }: AgentChatPanelProps) {
   // 提交守卫：useRef 保证同一引用跨渲染持久
   const submittingRef = useRef(false)
 
@@ -267,18 +273,28 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
   // 两个来源合并：本轮 SSE 事件（实时进度）+ 线程详情里的持久化记录
   // （页面刷新后靠它恢复卡片 —— G6 的前端一半）。
   const subagentCards = useSubagentCards(events, thread.subagent_runs)
+  // 工具调用折叠块：从 SSE 的 tool.* 事件聚合。
+  const toolCalls = useToolCalls(events)
 
   return (
     <SSEContext.Provider value={{ events, status: streamStatus }}>
       <div className={styles.panel}>
-        {/* 消息列表（含乐观消息 + 流式 assistant） */}
+        {/* 消息列表（含乐观消息 + 流式 assistant）
+            工具调用折叠块、子任务通知条作为 children 传进去 —— 它们和消息
+            处在同一个滚动容器里，会随消息一起滚动，不会悬在聊天区底部。 */}
         <div className={styles.messageArea}>
           <MessageList
             messages={thread.messages}
             optimisticMessage={optimisticMsg}
             streamingText={currentText}
-          />
-          {/* TOOL-05：确认卡紧邻消息流底部渲染（按 run_id 分组） */}
+          >
+            {/* 工具调用折叠块（像消息一样折叠，不占地方） */}
+            <ToolCallList entries={toolCalls} />
+            {/* Subagent 首版：子任务通知条（点击在右侧打开子 Agent 会话） */}
+            <SubagentCardList cards={subagentCards} onOpen={onOpenSubagent} />
+          </MessageList>
+          {/* TOOL-05：确认卡紧邻消息流底部渲染（按 run_id 分组）
+              确认卡是「等用户拍板」的待办，固定在底部保证不会滚出视线。 */}
           <ConfirmationCardList
             byRunId={byRunId}
             activeRunId={confirmActiveRunId}
@@ -288,8 +304,6 @@ export function AgentChatPanel({ thread }: AgentChatPanelProps) {
             onApproveAndExecute={confirmApproveAndExecute}
             onVerify={confirmVerify}
           />
-          {/* Subagent 首版：子任务卡（实时事件 + 刷新后从持久化记录恢复） */}
-          <SubagentCardList cards={subagentCards} />
         </div>
 
         {/* SSE 事件面板（已隐藏） */}

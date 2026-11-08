@@ -5,9 +5,10 @@
 """
 from __future__ import annotations
 
+import json
 import time
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -66,6 +67,12 @@ class RunEvent(BaseModel):
     tool_result: str | None = None
     # model.token 事件携带 token 流式推送的增量文本
     delta: str | None = None
+    # 工具调用事件携带：入参**摘要**（键名 + 类型 + 长度，不含实际值）
+    tool_args: str | None = None
+    """工具入参摘要，如 ``expression=str·12字, timeout=num``。不放原值。"""
+    # 工具调用事件携带：结果（截断后）
+    tool_output: str | None = None
+    """工具调用结果（截断到 `_MAX_TOOL_OUTPUT` 字）。"""
 
     # Subagent 首版：子任务事件携带的字段。
     subagent_task_id: str | None = None
@@ -137,6 +144,75 @@ RunEventStatus = Literal[
 
 # 失败原因的最大展示长度：避免超长文本撑爆事件面板
 _MAX_FAILURE_DETAIL = 300
+
+# 工具入参摘要的最大展示长度
+_MAX_TOOL_ARGS = 600
+
+# 工具结果的最大展示长度：够看清结论，又不至于把整份文件塞进事件流
+_MAX_TOOL_OUTPUT = 2000
+
+
+def _clip(text: str, limit: int) -> str:
+    """按 `limit` 截断文本（超长加省略号）。"""
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _value_shape(value: Any) -> str:
+    """值的**形状**摘要：类型 + 规模，不含内容。
+
+    SSE 通道有既定约束（见本模块文档）：绝不暴露完整工具参数。
+    因此入参只以形状呈现 —— 用户能看到"调了哪些参数、参数多大"，
+    但看不到路径、表达式、凭据等实际内容。
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, str):
+        return f"str·{len(value)}字"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "num"
+    if isinstance(value, (list, tuple)):
+        return f"list·{len(value)}项"
+    if isinstance(value, dict):
+        return f"obj·{len(value)}键"
+    return type(value).__name__
+
+
+def tool_args_summary(arguments: dict[str, Any] | None) -> str | None:
+    """工具入参 → 摘要字符串（``key=形状, key2=形状``）。
+
+    空入参返回 None（不制造噪声事件字段）。
+    """
+    if not arguments:
+        return None
+    try:
+        items = [f"{key}={_value_shape(value)}" for key, value in arguments.items()]
+    except Exception:
+        # 入参形状异常也不该拖垮事件发布
+        return "args·无法摘要"
+    return _clip(", ".join(items), _MAX_TOOL_ARGS)
+
+
+def tool_output_summary(result: Any) -> str | None:
+    """工具结果 → 截断后的可展示文本。
+
+    非字符串结果按 JSON 序列化（无法序列化时退回 repr）。
+    """
+    if result is None:
+        return None
+    if isinstance(result, str):
+        text = result
+    else:
+        try:
+            text = json.dumps(result, ensure_ascii=False, default=str)
+        except Exception:
+            text = repr(result)
+    return _clip(text, _MAX_TOOL_OUTPUT)
 
 
 def _truncate(text: str) -> str:

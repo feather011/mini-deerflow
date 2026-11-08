@@ -175,4 +175,22 @@ describe('MessageList', () => {
     // 列表中有两条消息
     expect(screen.getAllByText(/发送中的消息|上一条消息/)).toHaveLength(2)
   })
+
+  it('children（工具块/子任务条）渲染在滚动容器内部，随消息一起滚动', () => {
+    const messages: MessageResponse[] = [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+    ]
+    render(
+      <MessageList messages={messages}>
+        <div data-testid="process-block">过程块</div>
+      </MessageList>,
+    )
+
+    const scroll = screen.getByTestId('message-scroll')
+    const block = screen.getByTestId('process-block')
+    // 关键回归点：过程块必须在滚动容器**里面**。
+    // 放外面就会悬在聊天区底部，不随消息滚动。
+    expect(scroll.contains(block)).toBe(true)
+  })
 })

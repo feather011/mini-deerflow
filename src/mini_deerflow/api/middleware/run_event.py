@@ -21,7 +21,9 @@ from mini_deerflow.api.schemas.streaming import (
     RunEvent,
     RunEventType,
     failure_text,
+    tool_args_summary,
     tool_failure_text,
+    tool_output_summary,
 )
 from mini_deerflow.api.services.event_broker import RunEventBroker
 from mini_deerflow.middleware import ExecutionContext, Middleware, OperationType
@@ -106,6 +108,8 @@ class RunEventMiddleware(Middleware[Any]):
                 RunEventType.TOOL_STARTED,
                 operation="tool",
                 tool_name=ctx.operation_name,
+                # 入参只以**摘要**呈现（键名 + 形状），不放原值
+                tool_args=tool_args_summary(ctx.tool_arguments),
             )
 
     def success(self, ctx: ExecutionContext, result: Any) -> Any:
@@ -143,6 +147,8 @@ class RunEventMiddleware(Middleware[Any]):
                 RunEventType.TOOL_COMPLETED,
                 operation="tool",
                 tool_name=ctx.operation_name,
+                # 结果（截断后）—— 供前端折叠块展开查看
+                tool_output=tool_output_summary(result),
             )
             # 25：project_execute 成功时发出 run.result（携带 changes/verification）
             # 只在返回字符串且形似 JSON 时发出；其余工具直接忽略

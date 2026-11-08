@@ -183,6 +183,31 @@ class TestSSE事件:
         completed = [m for m in events if m["event"] == "run.completed"]
         assert "126" in completed[0]["data"]["answer"]
 
+    def test_工具入参只以摘要出现_不含原值(self) -> None:
+        """SSE 通道的既定约束：绝不暴露完整工具参数。
+
+        会话里的工具折叠块要展示"调了什么"，但只能给**形状**。
+        """
+        app = _build_app()
+        with TestClient(app) as client:
+            tid = _create_thread(client)
+            result = _read_stream(client, tid, "计算 (17 + 25) * 3")
+
+        started = [m for m in result["messages"] if m["event"] == "tool.started"]
+        assert started, "应有 tool.started 事件"
+        args = started[0]["data"].get("tool_args")
+        assert args, "tool.started 应携带入参摘要"
+        # 表达式原文不能出现
+        assert "(17 + 25) * 3" not in args
+        # 但键名与形状要在：用户得看得出调了哪个参数
+        assert "expression=" in args
+        assert "str·" in args
+
+        completed = [m for m in result["messages"] if m["event"] == "tool.completed"]
+        output = completed[0]["data"].get("tool_output")
+        assert output is not None, "tool.completed 应携带结果"
+        assert "126" in output
+
     def test_工具失败_发_tool_failed_且唯一终态为_run_failed(self) -> None:
         model = _ScriptedModel([ToolCall(name="boom", arguments={}, id="t1")])
         app = _build_app(model=model, registry=_failing_registry())

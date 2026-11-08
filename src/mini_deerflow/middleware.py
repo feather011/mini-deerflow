@@ -62,6 +62,11 @@ class ExecutionContext:
     token_accumulator: "list[str] | None" = None
     # TOOL-02：工具授权检查通过后的已授予能力集合，供 handler（如 subagent_submit）读取并传递给子任务
     granted_capabilities: frozenset = field(default_factory=frozenset)
+    # 工具调用的入参。用于让 SSE 事件能展示"调了哪些参数"。
+    #
+    # 只用于**生成摘要**（键名 + 值的形状），原始值不直接进事件 ——
+    # SSE 通道有既定约束：绝不暴露完整工具参数。
+    tool_arguments: "dict[str, Any] | None" = None
 
     def is_cancelled(self) -> bool:
         return self.cancellation_token.is_cancelled() if self.cancellation_token else False

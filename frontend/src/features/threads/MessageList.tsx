@@ -10,7 +10,7 @@
  * - 提交状态通过 data-submit-status 属性透传给 CSS（不污染 content）
  * - 滚动到底部
  */
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 import type { MessageResponse } from '../../shared/types/threads'
 import type { OptimisticMessage, MessageResponseLocal } from './types'
 import { MarkdownMessage } from './MarkdownMessage'
@@ -22,6 +22,13 @@ interface MessageListProps {
   optimisticMessage?: OptimisticMessage | null
   /** 当前 run 累加的 token 文本（用于流式渲染 assistant 消息） */
   streamingText?: string
+  /**
+   * 追加在消息之后、**同一个滚动容器内**的内容。
+   *
+   * 工具调用折叠块、子任务通知条走这里 —— 它们必须和消息一起滚动，
+   * 而不是悬在聊天区底部（悬着会让人以为那是常驻控件）。
+   */
+  children?: ReactNode
 }
 
 /**
@@ -75,7 +82,12 @@ function MessageItem({
   )
 }
 
-export function MessageList({ messages, optimisticMessage, streamingText }: MessageListProps) {
+export function MessageList({
+  messages,
+  optimisticMessage,
+  streamingText,
+  children,
+}: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   // 渲染列表：服务端消息原样保留。
@@ -110,23 +122,23 @@ export function MessageList({ messages, optimisticMessage, streamingText }: Mess
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [renderItems.length, optimisticMessage?.status, streamingText])
 
-  if (renderItems.length === 0) {
-    return (
-      <div className={styles.empty}>
-        <p>还没有消息，发送第一条消息开始对话</p>
-      </div>
-    )
-  }
-
   return (
-    <div className={styles.list}>
-      {renderItems.map((msg, index) => (
-        <MessageItem
-          key={'clientId' in msg && msg.clientId ? msg.clientId : index}
-          message={msg}
-          submitStatus={'_submitStatus' in msg ? (msg as MessageResponseLocal)._submitStatus : undefined}
-        />
-      ))}
+    <div className={styles.list} data-testid="message-scroll">
+      {renderItems.length === 0 ? (
+        <div className={styles.empty}>
+          <p>还没有消息，发送第一条消息开始对话</p>
+        </div>
+      ) : (
+        renderItems.map((msg, index) => (
+          <MessageItem
+            key={'clientId' in msg && msg.clientId ? msg.clientId : index}
+            message={msg}
+            submitStatus={'_submitStatus' in msg ? (msg as MessageResponseLocal)._submitStatus : undefined}
+          />
+        ))
+      )}
+      {/* 消息之后的过程块：与消息同处一个滚动容器 */}
+      {children}
       <div ref={bottomRef} />
     </div>
   )

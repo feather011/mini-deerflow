@@ -84,6 +84,10 @@ export interface RunEvent {
   duration_seconds: number | null
   /** run.result 事件携带 project_execute 结构化结果（JSON 字符串） */
   tool_result?: string | null
+  /** 工具调用的入参**摘要**（键名 + 形状）；后端不放原值 */
+  tool_args?: string | null
+  /** 工具调用的结果（后端已截断） */
+  tool_output?: string | null
   /** model.token 事件携带 token 流式推送的增量文本 */
   delta?: string | null
   /** Subagent 首版：子任务 ID */

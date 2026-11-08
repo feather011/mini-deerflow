@@ -5949,3 +5949,179 @@ GET  /api/threads/subagent-user-made                  → 200 能读到
 | 定向回归 | `pytest tests/test_api_threads.py tests/test_subagent_wiring.py tests/test_subagent_runs_api.py tests/test_subagent_e2e_flow.py tests/test_cli.py tests/test_serialization.py` | **105 passed** |
 | 新增回归 | 同上（3 项） | 保留前缀 → 400 且不留痕；普通自定义 ID → 201；自动生成 → 201 |
 | 真实后端实测 | `POST /api/threads` 三种输入 | `subagent-user-made` → **400**；`my-session-1` → 201；`{}` → 201；列表无幽灵条目 |
+
+
+## Subagent UI 轮：子任务通知条 + 右侧子任务会话 + 工具调用折叠（2026-11-08）
+
+- **会话标识**：`claude-subagent-ui-20261108-1520`
+- **目标版本**：Subagent 首版闭环之后（master，基线 `6b0d81c`）
+- **状态**：READY_FOR_REVIEW（实现 + 自测完成，基线差分零回归；等协调窗口/用户验收）
+- **依赖**：Subagent 首版闭环（已完成）+ 子代理隔离线程已落库
+- **修改范围**：
+  - 后端：`src/mini_deerflow/middleware.py`、`src/mini_deerflow/agent.py`、
+    `src/mini_deerflow/api/middleware/run_event.py`、`src/mini_deerflow/api/schemas/streaming.py`
+  - 前端：`frontend/src/shared/types/events.ts`、`frontend/src/features/subagents/*`、
+    `frontend/src/features/tools/*`（新增）、`frontend/src/features/threads/AgentChatPanel.tsx`、
+    `frontend/src/app/App.tsx`
+
+### 需求（用户 2026-11-08 实机反馈）
+
+会话区里子任务卡是**全展开大块**，占满消息流。期望：
+
+1. 会话窗口只显示一条「调用运行 subagent 的通知」；
+2. 点击后**在右侧**打开该 subagent 的会话窗口；
+3. 会话里能不能像消息一样**折叠展示工具调用**。
+
+### 核查到的现状（先查再改）
+
+| 项 | 事实 |
+|---|---|
+| 子任务卡 | `SubagentCard.tsx` 全展开：状态 + task_id + 耗时 + 指令 `<pre>` + 结果 `<pre>` |
+| 工具调用在会话里 | **完全没有**。`AgentChatPanel.tsx` 里 `RunEventPanel` 被 `{false && ...}` 硬编码屏蔽；会话流里只有确认卡与子任务卡两种块 |
+| 工具事件（SSE） | 齐：`tool.started` / `tool.completed` / `tool.failed`，字段有 `tool_name` / `duration_seconds`；**无工具入参** |
+| 工具结果 | **只有 `project_execute` 进 SSE**（`run.result` 携带 `tool_result`），其余工具结果不进事件 → 折叠块要显示结果必须后端补 |
+| 子代理会话数据 | **已落库且可回读**：实测 `GET /api/threads/subagent-sa-xxx` → 200，messages = [user 指令, assistant 结论] |
+
+### 方案（用户已确认两项）
+
+- 右侧：**点击通知条后覆盖右侧面板**，带返回（不做第四栏、不做 Tab 切换）
+- 工具折叠：**本轮一起做**，含后端补 `tool_args` / `tool_output`
+
+### 实现
+
+**后端**（4 处）
+
+| 文件 | 改动 |
+|---|---|
+| `api/schemas/streaming.py` | `RunEvent` 增 `tool_args` / `tool_output`；新增 `tool_args_summary()` / `tool_output_summary()` / `_value_shape()` |
+| `middleware.py` | `ExecutionContext` 增 `tool_arguments`（只用于生成摘要） |
+| `agent.py` | 构造 `TOOL_CALL` 上下文时带上 `tool_arguments=dict(_args)` |
+| `api/middleware/run_event.py` | `tool.started` 带 `tool_args`；`tool.completed` 带 `tool_output` |
+
+**关键设计决策：入参只给「形状」，不给原值。**
+
+`api/schemas/streaming.py` 的模块约定写着"绝不暴露 …… 完整工具参数"。
+要让折叠块显示"调了什么参数"，又不能破坏这条约定，于是入参摘要成
+`expression=str·13字, timeout_seconds=int` —— **键名 + 值的类型/规模**，
+值本身不出现。哨兵串回归测试锁死这一点。
+
+工具**结果**则完整带出（截断 2000 字）：既有通道已有先例（`run.result`
+携带 `project_execute` 的完整 JSON），且 SSE 只推给该 run 的发起方、不落库。
+**若将来把事件流落库，这条要重新评估。**
+
+**前端**
+
+| 文件 | 改动 |
+|---|---|
+| `features/subagents/SubagentCard.tsx` + `.module.css` | 由全展开大卡改为**单行通知条**（`◈ 子 Agent · 指令摘要 · 已完成 · 0.0s · ›`）；改为 `<button>`，点击触发 `onOpen` |
+| `features/subagents/SubagentCardList.tsx` | 透传 `onOpen` |
+| `features/subagents/SubagentConversationPanel.tsx` + `.module.css`（新增） | 右侧子 Agent 会话窗口：按 ID 直读 `subagent-{task_id}` 隔离线程，渲染 messages；带 `←` 返回 |
+| `features/tools/useToolCalls.ts`（新增） | 从 SSE 的 `tool.*` 事件聚合工具调用（started/completed 配对、失败、孤立事件、耗时由时间戳相减） |
+| `features/tools/ToolCallBlock.tsx` + `.module.css`（新增） | 折叠块：默认一行（`▸ 调用 xxx · 完成 · 0.05s`），展开显示参数摘要 + 结果/失败原因 |
+| `features/tools/ToolCallList.tsx`（新增） | 折叠块列表 |
+| `features/threads/AgentChatPanel.tsx` | 接入工具折叠块；子任务卡改传 `onOpenSubagent` |
+| `features/threads/ThreadWorkspace.tsx` | 透传 `onOpenSubagent` |
+| `app/App.tsx` | 新增 `subagentView` 状态；点子任务 → 覆盖右侧面板显示子 Agent 会话（带返回），其余右侧内容不变 |
+| `shared/types/events.ts` | `RunEvent` 增 `tool_args` / `tool_output` |
+
+### 验证
+
+| 验证 | 方式 | 结果 |
+|---|---|---|
+| 前端 typecheck | `npm run typecheck` | 通过 |
+| 前端全量 | `npx vitest run` | **48 files / 568 tests passed**（新增 `useToolCalls` / `ToolCallBlock` / `SubagentConversationPanel` 三组用例） |
+| 后端新增单测 | `pytest tests/test_tool_event_payload.py` | **11 passed**（摘要不含原值、结果截断、事件字段默认 None） |
+| 后端 SSE 集成 | `pytest tests/test_phase21b_events.py` | 新增用例通过（`tool.started` 带摘要且不含表达式原文；`tool.completed` 带结果） |
+| 后端全量 | `pytest tests/` | 见下"基线差分" |
+| 浏览器实机 | 验收后端 8021（脚本模型，零付费）+ 前端 5301 | 见下"实机观察" |
+
+**实机观察**（`http://127.0.0.1:5301`，验收后端，脚本模型）
+
+- 会话里子任务现在是**一行通知条**（不再是铺开的大卡）：
+  `◈ 子 Agent · 调研这个报错的三个可能方向 · 已完成 · 0.0s · ›`
+- 工具调用折叠块同位显示：`▸ 调用 subagent_submit · 完成 · 0.05s`；
+  展开后：参数 `instruction=str·13字, timeout_seconds=int`、结果 JSON
+- 点通知条 → **右侧打开子 Agent 会话**：
+  `← 子 Agent 会话 / 调研这个报错的三个可能方向 / 子任务指令 … / 子 Agent 结论：三个方向值得查 …`
+- 点 `←` → 右侧恢复原来的「任务结果」面板
+- **刷新后**：通知条仍在（落库记录，G6 不变）；右侧仍能打开子 Agent 会话；
+  左侧栏无 `subagent-` 泄漏
+
+### 已知限制（如实记录，不掩饰）
+
+1. **工具调用块刷新后消失**。子任务通知条落库（`ThreadState.subagent_runs`），
+   所以刷新仍在；工具事件是 **SSE 实时流**，不落库，刷新即无。
+   这是"过程类事件 vs 状态类记录"的既有分界，本轮没有改它。
+2. **工具块不与消息精确交错**。`RunEvent` 有 `sequence`，但 `ThreadState.messages`
+   没有，两边无法按序对齐；因此工具块集中在消息流下方，而不是插在
+   "这条回复之前的那次工具调用"的位置。
+3. **工具结果进 SSE 是新增暴露面**。理由与边界见上；若将来落库需重新评估。
+4. **真实模型未验证**：本轮全部用脚本模型，真实模型是否/何时自主派发子任务、
+   真实 harness 路径都未跑。
+
+### 基线差分
+
+**协议**：`git archive <sha>` 导出干净副本 → 跑同一套测试 → 与基线**逐条差分失败集合**。
+
+| 层 | 基线 | 本轮 | 结论 |
+|---|---|---|---|
+| 后端全量 `pytest tests/` | `6b0d81c`：**3721 passed / 15 failed** | **3717 passed / 16 failed** | 15 项与基线**逐条一致**（MCP 环境问题）；多出的 1 项是 `test_tool07_process_tree_recovery.py::test_取消_不_强杀_进程树_…`，**单跑 5/5 通过**，属既有 TOOL-07 顺序敏感偶发项，本轮未触碰该文件 |
+| 前端单测 `npx vitest run` | 553 passed | **48 files / 569 tests passed** | 全绿，无新增失败 |
+| 前端 typecheck | 0 错误 | 0 错误 | 一致 |
+| **Playwright E2E** | `6b0d81c`：**15 failed / 25 passed** | **15 failed / 25 passed** | **失败集合逐条相同（byte-identical）** —— 本轮**零回归** |
+
+**E2E 差分方法**（可复现）：
+
+1. `git archive 6b0d81c | tar -x -C D:/tmp/base-e2e-6b0d81c` 导出基线（含未改动的后端 `src/`）；
+2. 基线前端 `node_modules` 软链到当前工作区（同一套依赖，避免重装）；
+3. 基线跑 `E2E_BACKEND_PORT=8030 E2E_FRONTEND_PORT=5190 npx playwright test` → **15 failed / 25 passed**；
+4. 本轮跑 `E2E_BACKEND_PORT=8040 E2E_FRONTEND_PORT=5200 npx playwright test` → **15 failed / 25 passed**；
+5. `comm -13 / -23` 双向差分失败集合 → **两侧差集均为空**，集合逐条相同。
+
+**那 15 项既有失败是什么**（如实记录，不掩饰）：全部卡在等 `执行完成` 这个**瞬时文案**上。
+`执行完成` 只有一个来源 —— `runProgress.ts` 的 `run.completed` → `text: '执行完成'`，
+而它渲染在 `RunStatusLine` 里；`RunStatusLine` 的挂载条件是 `isRunning`（connecting/streaming），
+**run 一到终态就整行卸载**，于是「执行完成」这句话在终态永远来不及出现。
+另一处候选来源 `RunEventPanel`（含 `completed: '执行完成'` 与「停止接收」按钮）自 `7154b92`
+（2026-10-16）起被 `{false && …}` 硬编码屏蔽，e2e 文档里写的"header statusText"已不存在。
+
+这两处都是**基线既有**（`6b0d81c` 的 `AgentChatPanel.tsx` 第 296/383 行与本轮改动前逐字相同），
+**不是本轮引入**。本轮未顺手改它：那属于"终态反馈该显示在哪、显示多久"的交互口径变更，
+会牵动 `RunStatusLine` 的既有语义，需要单独一轮连同 e2e 一起改。
+
+**跑 e2e 的两个环境坑（本轮踩到）**：
+
+1. `frontend/.env.local` 里的 `VITE_API_TARGET` 会**静默遮蔽** `playwright.config.ts` 注入的
+   `VITE_API_BASE_URL`（`config.ts` 先读 `VITE_API_TARGET`）→ 前端指向 8000 → CORS 被拒 →
+   页面显示「后端离线」→ **30 个 e2e 全挂**。跑 e2e 前必须移走 `.env.local`。
+2. `scripts/subagent_acceptance_server.py` 的 CORS 白名单只放行 **5173–5209**，
+   前端跑在 5300+ 会被跨源拦截（页面能开、但「新建会话」无效）。
+
+### 本轮追加：过程块不再悬在聊天区底部（用户 2026-11-08 二次反馈）
+
+用户实机反馈：子任务通知条**悬挂在消息窗口下方**，不随消息滚动。
+
+**根因**：`AgentChatPanel` 把 `ToolCallList` / `SubagentCardList` 渲染成 `MessageList` 的**兄弟节点**
+（`messageArea` 的子节点），而滚动容器是 `MessageList` 内部的 `.list`（`overflow-y: auto`）——
+兄弟节点不在滚动容器里，于是永远贴在聊天区底部。
+
+**修法**：`MessageList` 新增 `children` 槽位，把过程块作为 children 传进去 → 与消息同处一个
+滚动容器。`data-testid="message-scroll"` 标出该容器，供回归测试断言。
+`bottomRef` 移到 children 之后，"滚动到底部"仍能滚到最末尾。
+
+**确认卡（TOOL-05）不动**：它是"等用户拍板"的待办，固定在底部保证不会滚出视线；
+子任务通知条与工具块是"过程记录"，应当随消息滚动。
+
+**验证**：
+
+| 验证 | 方式 | 结果 |
+|---|---|---|
+| 单测（新增回归） | `MessageList.test.tsx`「children 渲染在滚动容器内部」 | 通过 |
+| 前端全量 | `npx vitest run` | **48 files / 569 tests passed** |
+| 浏览器实机 | Playwright 断言 `subagent-card` / `tool-call-block` 是 `message-scroll` 的后代 | `{"cardInScroll":true,"toolInScroll":true}` |
+| 浏览器实机（滚动行为） | 矮窗口 1280×300 制造溢出 → `scrollTop` 从 273 归 0 | 通知条 `y` 从 61 → 334，**随内容一起移动**（钉在底部则纹丝不动） |
+
+**顺手规避的一个潜在撞名**：工具折叠块的 CSS 类原名 `.summary`，与 e2e 的
+`page.locator('[class*="summary"]')`（指向 SSE 事件面板摘要行）撞名 —— 该定位器会同时命中两个元素，
+`expect(...).toBeVisible()` 在严格模式下会直接报错。已改名 `.row`。
+

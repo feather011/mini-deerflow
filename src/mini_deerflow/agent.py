@@ -592,6 +592,9 @@ class Agent:
                         budget=run_budget,
                         cancellation_token=cancellation_token,
                         parent_span_id=model_ctx.span_id,
+                        # 让 SSE 的 tool.started 事件能展示"调了哪些参数"。
+                        # 只用于生成摘要，原始值不直接进事件。
+                        tool_arguments=dict(_args),
                     )
                     def _do_tool_call() -> str:
                         # 25：三层纵深防御

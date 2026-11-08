@@ -13,10 +13,13 @@ import { useThread } from './hooks'
 import { AgentChatPanel } from './AgentChatPanel'
 import { ErrorNotice } from '../../shared/ui/ErrorNotice'
 import type { ApiError } from '../../shared/api'
+import type { SubagentCard } from '../subagents/useSubagentCards'
 import styles from './ThreadWorkspace.module.css'
 
 interface ThreadWorkspaceProps {
   threadId: string | null
+  /** 点击子任务通知条：在右侧打开该子 Agent 的会话窗口 */
+  onOpenSubagent?: (card: SubagentCard) => void
 }
 
 function NotSelected() {
@@ -56,11 +59,18 @@ function NotFound({ threadId }: { threadId: string }) {
   )
 }
 
-function ThreadInfo({ thread }: { thread: { thread_id: string; messages: unknown[] } }) {
+function ThreadInfo({
+  thread,
+  onOpenSubagent,
+}: {
+  thread: { thread_id: string; messages: unknown[] }
+  onOpenSubagent?: (card: SubagentCard) => void
+}) {
   return (
     <div className={styles.chat}>
       <AgentChatPanel
         thread={thread as Parameters<typeof AgentChatPanel>[0]['thread']}
+        onOpenSubagent={onOpenSubagent}
       />
     </div>
   )
@@ -86,7 +96,7 @@ function ThreadError({ error }: { error: ApiError }) {
   )
 }
 
-export function ThreadWorkspace({ threadId }: ThreadWorkspaceProps) {
+export function ThreadWorkspace({ threadId, onOpenSubagent }: ThreadWorkspaceProps) {
   // Hook 必须在条件语句外调用（React Hooks 规则）
   const { data, isLoading, isError, error } = useThread(threadId)
 
@@ -109,7 +119,7 @@ export function ThreadWorkspace({ threadId }: ThreadWorkspaceProps) {
   }
 
   if (data != null) {
-    return <ThreadInfo thread={data} />
+    return <ThreadInfo thread={data} onOpenSubagent={onOpenSubagent} />
   }
 
   return <NotSelected />

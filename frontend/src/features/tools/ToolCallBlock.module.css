@@ -1,0 +1,101 @@
+/* 工具调用折叠块：默认一行，展开才占地方 */
+
+.block {
+  border-left: 2px solid var(--border-color, #4a7d9a);
+  background: var(--info-bg, #eef5fa);
+  margin: 4px 0;
+  border-radius: 0 4px 4px 0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.block[data-status='running'] {
+  border-left-color: #4a7d9a;
+}
+
+.block[data-status='succeeded'] {
+  border-left-color: #4a7d2a;
+}
+
+.block[data-status='failed'] {
+  border-left-color: #b30;
+  background: var(--error-bg, #fdeeee);
+}
+
+/* 折叠块的标题行。
+   类名刻意叫 .row 而不是 .summary —— e2e 里有 `[class*="summary"]`
+   这种子串定位器（指向 SSE 事件面板的摘要行），撞名会让它匹配到多个元素。 */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+
+.row:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.caret {
+  color: #666;
+  font-size: 11px;
+  width: 10px;
+}
+
+.toolName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: monospace;
+}
+
+.status {
+  font-size: 12px;
+  color: #555;
+  flex-shrink: 0;
+}
+
+.duration {
+  font-size: 12px;
+  color: #666;
+  flex-shrink: 0;
+}
+
+.detail {
+  padding: 0 10px 8px 28px;
+}
+
+.detailLabel {
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 2px;
+}
+
+.args,
+.output,
+.error {
+  font-family: monospace;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 6px 8px;
+  border-radius: 3px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+  margin: 0 0 6px;
+}
+
+.error {
+  color: #b30;
+}

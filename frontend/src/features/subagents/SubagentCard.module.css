@@ -1,12 +1,26 @@
+/* 子任务通知条：会话里只占一行 */
+
 .card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 5px 10px;
+  margin: 4px 0;
   border: 1px solid var(--border-color, #4a7d9a);
-  border-radius: 6px;
+  border-left-width: 3px;
+  border-radius: 4px;
   background: var(--info-bg, #eef5fa);
-  padding: 12px 16px;
-  margin: 8px 0;
+  color: inherit;
   font-family: inherit;
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1.5;
+  cursor: pointer;
+}
+
+.card:hover {
+  background: #e2eef7;
 }
 
 .card[data-status='SUCCEEDED'] {
@@ -26,61 +40,52 @@
   color: #555;
 }
 
-.header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.icon {
+  flex-shrink: 0;
+  color: #4a7d9a;
+}
+
+.name {
+  flex-shrink: 0;
   font-weight: 600;
-  margin-bottom: 6px;
 }
 
-.status {
-  font-size: 13px;
-}
-
-.taskId {
-  font-family: monospace;
-  font-size: 12px;
-  background: rgba(0, 0, 0, 0.05);
-  padding: 1px 6px;
-  border-radius: 3px;
-}
-
-.duration {
-  font-size: 12px;
-  color: #666;
-  font-weight: 400;
-}
-
-.summary {
-  margin: 6px 0;
+.instruction {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: #333;
 }
 
-.instruction,
-.output {
-  font-family: monospace;
+.status {
+  flex-shrink: 0;
   font-size: 12px;
-  background: rgba(0, 0, 0, 0.04);
-  padding: 6px 8px;
-  border-radius: 3px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 160px;
-  overflow: auto;
-  margin: 0 0 4px;
+  color: #555;
 }
 
-.meta {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-top: 8px;
+.duration {
+  flex-shrink: 0;
   font-size: 12px;
   color: #666;
 }
 
 .error {
+  flex-shrink: 0;
+  font-size: 12px;
   color: #b30;
   font-weight: 600;
+}
+
+.meta {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: #666;
+}
+
+.openHint {
+  flex-shrink: 0;
+  color: #666;
+  font-size: 15px;
 }
