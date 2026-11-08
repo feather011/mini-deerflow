@@ -6034,7 +6034,7 @@ GET  /api/threads/subagent-user-made                  → 200 能读到
 | 前端 lint | `npx oxlint .` | **8 warnings = 基线同数**（中途一度 9 条，因 `App.tsx` 的 setState-in-effect；已改为派生，见 `a5b205d`） |
 | 后端新增单测 | `pytest tests/test_tool_event_payload.py` | **11 passed**（摘要不含原值、结果截断、事件字段默认 None） |
 | 后端 SSE 集成 | `pytest tests/test_phase21b_events.py` | 新增用例通过（`tool.started` 带摘要且不含表达式原文；`tool.completed` 带结果） |
-| 后端全量 | `pytest tests/` | 见下"基线差分" |
+| 后端全量 | `pytest tests/` | 见下"基线差分"（基线 23 failed / 本轮 23 failed，**失败集合逐条相同**） |
 | 浏览器实机 | 验收后端 8021（脚本模型，零付费）+ 前端 5301 | 见下"实机观察" |
 
 **实机观察**（`http://127.0.0.1:5301`，验收后端，脚本模型）
@@ -6067,10 +6067,17 @@ GET  /api/threads/subagent-user-made                  → 200 能读到
 
 | 层 | 基线 | 本轮 | 结论 |
 |---|---|---|---|
-| 后端全量 `pytest tests/` | `6b0d81c`：**3721 passed / 15 failed** | **3717 passed / 16 failed** | 15 项与基线**逐条一致**（MCP 环境问题）；多出的 1 项是 `test_tool07_process_tree_recovery.py::test_取消_不_强杀_进程树_…`，**单跑 5/5 通过**，属既有 TOOL-07 顺序敏感偶发项，本轮未触碰该文件 |
-| 前端单测 `npx vitest run` | 553 passed | **48 files / 569 tests passed** | 全绿，无新增失败 |
+| 后端全量 `pytest tests/` | `6b0d81c`：**3715 passed / 23 failed** | **3727 passed / 23 failed** | 失败集合**逐条相同**（差分脚本双向差集均为空）：23 项全是 MCP / harness 环境问题（本机无 MCP server、项目执行权限），两树在 `uv run --offline` 下同样失败；多出的 12 passed 是本轮新增用例 |
+| 前端单测 `npx vitest run` | 553 passed | **48 files / 569 tests passed** | 全绿，无新增失败（+16：本轮新增用例） |
 | 前端 typecheck | 0 错误 | 0 错误 | 一致 |
 | **Playwright E2E** | `6b0d81c`：**15 failed / 25 passed** | **15 failed / 25 passed** | **失败集合逐条相同（byte-identical）** —— 本轮**零回归** |
+
+**后端差分方法**：基线与本轮都 `git archive` 导出成干净副本，各自 `uv run --offline python -m pytest tests/`，
+再把两份输出的 `FAILED <nodeid>` 行解析出来双向差分。两树都是 **23 failed**，
+`comm -13` / `comm -23` 两侧差集**均为空** → 失败集合逐条相同，本轮零回归。
+23 项全是环境问题：`test_mcp.py`（本机无 MCP server）、`test_project_execute_e2e.py` /
+`test_task_handover_e2e.py` / `test_tool07_*`（harness 执行权限 / 真实 Provider）。
+单独复跑 `tests/test_mcp.py`：两树各 11 failed / 35 passed，完全一致。
 
 **E2E 差分方法**（可复现）：
 
