@@ -5956,7 +5956,7 @@ GET  /api/threads/subagent-user-made                  → 200 能读到
 - **会话标识**：`claude-subagent-ui-20261108-1520`
 - **目标版本**：Subagent 首版闭环之后（master，基线 `6b0d81c`）
 - **状态**：READY_FOR_REVIEW（实现 + 自测完成，基线差分零回归；等协调窗口/用户验收）
-- **提交**：`bb4a7d7`（子任务通知条 + 右侧会话 + 工具折叠 + 滚动布局）、`a5b205d`（去掉 setState-in-effect，lint 回到基线）；均已普通 push 到 `master`
+- **提交**：`bb4a7d7`（子任务通知条 + 右侧会话 + 工具折叠 + 滚动布局）、`a5b205d`（去掉 setState-in-effect，lint 回到基线）、`45a92cf`（本节补写基线差分）；均已**普通 push** 到 `master`，无 force / 无 amend / 无历史改写
 - **依赖**：Subagent 首版闭环（已完成）+ 子代理隔离线程已落库
 - **修改范围**：
   - 后端：`src/mini_deerflow/middleware.py`、`src/mini_deerflow/agent.py`、
