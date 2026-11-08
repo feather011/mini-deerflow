@@ -5786,6 +5786,8 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
 - **浏览器实机未跑**：本轮前端只做了组件级测试（渲染 + 刷新恢复路径），
   **未在浏览器里实测刷新后卡片恢复**。G6 的「浏览器刷新后恢复卡片」
   在**代码路径与组件测试层面已验证**，浏览器端到端 = **未验证**。
+  > **已被下一节取代**：浏览器实机已跑通（刷新后卡片恢复 + 会话列表不再泄漏
+  > 子代理线程），证据见「Subagent 缺陷修复轮」一节。
 - 真实 harness 路径未跑（需先确认假凭据/本地 mock/禁外网）。
 - `lead_agent/` 未接入（本轮明确不做），6324 行留档不维护。
 
@@ -5806,3 +5808,70 @@ Python 导入确认：`PYTHONPATH=<整合 worktree>/src`，`mini_deerflow` /
 - 真实模型实测：确认模型在什么情况下会派发子任务（是否过度派发）。
 - 浏览器实机验收：刷新后子任务卡恢复。
 - 后续可选：子任务结果回灌主 Agent 的摘要策略（当前直接给完整输出摘录）。
+
+## Subagent 缺陷修复轮：子代理隔离线程泄漏到用户会话列表（2026-11-08）
+
+- **任务 ID**：SUBAGENT-V1-FIX
+- **会话标识**：claude-subagent-fix-20261108-1103
+- **目标版本**：master（基线 `947ae5b`）
+- **状态**：READY_FOR_REVIEW（缺陷已修 + 回归测试通过 + 浏览器实机复验通过；真实模型仍未验证）
+- **分支**：master（本地直改，worktree `D:/tmp/master-smoke-010ef33`）
+
+### 缺陷（上一轮浏览器验收时实测发现）
+
+上一轮验收截图里左侧会话列表出现 `subagent-sa-db8d1a2731e4`。查证为**真实缺陷**，
+且是本轮引入的：
+
+- `SubagentRunner._run_task_body` 把子代理的隔离线程建在**同一个** `ThreadStore`
+  里（thread_id = `subagent-{task_id}`）；
+- `ThreadService.list()` 原样返回 `store.list_threads()`，没区分「用户会话」与
+  「子代理隔离线程」；
+- 于是 `GET /api/threads` 把子线程当用户会话吐出去 —— 左侧栏出现看不懂的条目，
+  用户还会以为能跟子线程对话。
+
+### 修复
+
+| 文件 | 改动 |
+|---|---|
+| `src/mini_deerflow/subagent_models.py` | 新增 `SUBAGENT_THREAD_PREFIX` / `is_subagent_thread_id()` / `build_subagent_thread_id()`：前缀成为**单一事实源** |
+| `src/mini_deerflow/subagent_executor.py` | 两处硬编码 `f"subagent-{task_id}"` 改调 `build_subagent_thread_id()` |
+| `src/mini_deerflow/api/services/threads.py` | `ThreadService.list()` 过滤子代理线程 |
+| `src/mini_deerflow/cli.py` | CLI 会话列表同样过滤（API 与 CLI 是同一个「用户会话列表」概念） |
+| `tests/test_api_threads.py` | 新增 2 项回归：列表不含 `subagent-*`；按 ID 直读子线程仍可用 |
+
+**按 ID 直读不封**：过滤只作用于列表接口，`GET /api/threads/subagent-xxx` 仍能读到，
+便于调试与取证。
+
+### 验证命令与实际结果
+
+| 验证 | 命令 | 结果 |
+|---|---|---|
+| 定向回归 | `pytest tests/test_api_threads.py tests/test_cli.py tests/test_subagent_wiring.py tests/test_subagent_runs_api.py tests/test_subagent_e2e_flow.py tests/test_serialization.py` | **103 passed** |
+| 后端全量 | `pytest tests/` | **3721 passed, 15 failed, 15 skipped, 42 subtests** |
+| 失败集合差分 | 与基线 `947ae5b` 的 15 项失败逐条比对 | **完全一致 → 本轮未引入新失败**（15 项均为既有 MCP 环境失败） |
+| 浏览器实机（API 层） | `scripts/subagent_acceptance_server.py --port 8231` + HTTP 驱动 | SSE 序列 `run.started → model → tool.started(subagent_submit) → subagent.started → subagent.completed → tool.completed → model → run.completed` |
+| 子代理线程确实存在 | `GET /api/threads/subagent-sa-xxx` | **HTTP 200**（证明过滤的是「显示」，不是「没创建」） |
+| 会话列表不再泄漏 | `GET /api/threads` | **无任何 `subagent-` 条目**（修复前有） |
+| G6 API 重读 | `GET /api/threads/{父线程}` → `subagent_runs` | **1 条，`status=SUCCEEDED`，含子 Agent 产出** |
+| 浏览器实机（UI 层） | 前端 dev server `:5188` + Playwright | 卡片渲染 ✅；`reload()` 后卡片仍在 ✅；整页 `innerText` 无 `subagent-` 串 ✅ |
+| 证据截图 | `docs/evidence/subagent/` | `card-render.png` / `card-after-reload.png` / `card-after-fix-reload.png` |
+
+### 本轮新增的可复用验收工具
+
+| 文件 | 用途 |
+|---|---|
+| `scripts/subagent_acceptance_server.py` | **浏览器验收入口**：真实 `create_app()` + 全部生产路由，只把模型换成脚本模型（`_AcceptanceModel` 派发 / `_ChildModel` 产出）。零付费、零外网。 |
+| `scripts/subagent_demo.py` | **终端验收入口**：直接跑主 Agent → 派发 → 子 Agent 产出 → 落库记录，打印全部中间产物。 |
+
+两个脚本都复用生产工具链路、SSE、落库、Trace，**只换模型**。
+
+### 未验证事项（不变）
+
+- **真实模型未验证**：真实 Provider 下模型是否愿意派发、时机是否合适，仍未验证。
+- 真实 harness 路径未跑（需假凭据 / 本地 mock / 禁外网）。
+- `lead_agent/` 未接入，6324 行留档不维护。
+
+### 下一步依赖
+
+- 真实模型实测（派发时机与频率）。
+- 真实 harness 路径。

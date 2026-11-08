@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 from mini_deerflow.project_store import ProjectNotFoundError, ProjectStore
+from mini_deerflow.subagent_models import is_subagent_thread_id
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import (
     ThreadAlreadyExistsError as StoreAlreadyExistsError,
@@ -114,8 +115,18 @@ class ThreadService:
         return state
 
     def list(self) -> tuple[ThreadState, ...]:
-        """列出全部线程；按 Store 实现约定的稳定顺序返回。"""
-        return self._store.list_threads()
+        """列出**用户会话**线程；按 Store 实现约定的稳定顺序返回。
+
+        Subagent 首版：子代理的隔离线程（``subagent-{task_id}``）与普通
+        会话共用同一个 ThreadStore，但它们**不是用户会话** —— 列出来会
+        在左侧会话栏出现一堆看不懂的 `subagent-sa-xxx`，还会让用户
+        误以为能跟子线程对话。因此这里按前缀过滤掉。
+        """
+        return tuple(
+            state
+            for state in self._store.list_threads()
+            if not is_subagent_thread_id(state.thread_id)
+        )
 
     def get(self, thread_id: str) -> ThreadState:
         """按 ID 读取线程；不存在抛出 ThreadNotFoundError。"""

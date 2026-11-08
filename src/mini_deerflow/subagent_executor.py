@@ -40,6 +40,7 @@ from mini_deerflow.subagent_models import (
     SubagentResult,
     SubagentTask,
     TaskStatus,
+    build_subagent_thread_id,
 )
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import InMemoryThreadStore, ThreadStore
@@ -285,7 +286,7 @@ class SubagentRunner:
             event_id=span_id,
             parent_id=self.parent_span_id,
             run_id=self.parent_run_id or self.run_id,
-            thread_id=f"subagent-{self.task.task_id}",
+            thread_id=build_subagent_thread_id(self.task.task_id),
             task_id=self.task.task_id,
             operation=OperationType.SUBAGENT_TASK.name,
             name="subagent_task",
@@ -298,7 +299,7 @@ class SubagentRunner:
 
     def _run_task_body(self, task_span_id: str) -> SubagentResult:
         """执行子任务并返回结果。"""
-        thread_id = f"subagent-{self.task.task_id}"
+        thread_id = build_subagent_thread_id(self.task.task_id)
 
         try:
             # 如果还是 QUEUED（直接调用 SubagentRunner，未经过 Manager._run_task），

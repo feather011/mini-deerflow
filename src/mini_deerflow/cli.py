@@ -28,6 +28,7 @@ from mini_deerflow.skill_registry import SkillRegistry
 from mini_deerflow.skill_runtime import DefaultSkillContextProvider, SkillContextProvider
 from mini_deerflow.skill_selector import RuleBasedSkillSelector
 from mini_deerflow.runtime import RuntimeConfig, create_runtime, load_context_config
+from mini_deerflow.subagent_models import is_subagent_thread_id
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import (
     SQLiteThreadStore,
@@ -92,9 +93,14 @@ def format_trace(trace: list[dict]) -> str:
 
 
 def format_thread_list(store: ThreadStore, current: str) -> str:
-    """列出所有 Thread；当前 Thread 前加 *，其他前加 2 个空格。"""
+    """列出所有 Thread；当前 Thread 前加 *，其他前加 2 个空格。
+
+    子代理的隔离线程（``subagent-{task_id}``）不是用户会话，不列出。
+    """
     lines: list[str] = []
     for t in store.list_threads():
+        if is_subagent_thread_id(t.thread_id):
+            continue
         prefix = "* " if t.thread_id == current else "  "
         lines.append(f"{prefix}{t.thread_id}")
     return "\n".join(lines)

@@ -15,7 +15,9 @@ tests/test_e2e_snapshot_sse.py
 # 运行时工作目录
 workmode/
 workspaces/
+.mini-deerflow/
 
 # 前端临时目录
 frontend/pnpm-lock.yaml
 frontend/node_modules/
+frontend/.playwright-cli/

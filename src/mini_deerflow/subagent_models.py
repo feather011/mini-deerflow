@@ -15,6 +15,24 @@ from typing import Any
 SCHEMA_VERSION = 1
 
 
+#: 子代理隔离线程的 thread_id 前缀。
+#:
+#: 子代理在自己的线程里执行（上下文与父线程完全隔离），该线程与
+#: **普通会话**共用同一个 ThreadStore，因此需要一个明确的前缀把两者
+#: 区分开 —— 会话列表、上下文用量等面向用户的接口据此过滤。
+SUBAGENT_THREAD_PREFIX = "subagent-"
+
+
+def is_subagent_thread_id(thread_id: str) -> bool:
+    """thread_id 是否是子代理的隔离线程。"""
+    return isinstance(thread_id, str) and thread_id.startswith(SUBAGENT_THREAD_PREFIX)
+
+
+def build_subagent_thread_id(task_id: str) -> str:
+    """由 task_id 构造子代理的隔离 thread_id。"""
+    return f"{SUBAGENT_THREAD_PREFIX}{task_id}"
+
+
 class TaskStatus(Enum):
     """Subagent 任务状态枚举。"""
     QUEUED = auto()

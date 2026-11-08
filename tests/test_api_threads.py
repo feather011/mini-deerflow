@@ -22,6 +22,10 @@ from mini_deerflow.api.app import create_app
 from mini_deerflow.api.config import ApiSettings
 from mini_deerflow.api.services.threads import ThreadService
 from mini_deerflow.runtime import RuntimeContext, create_runtime
+from mini_deerflow.subagent_models import (
+    build_subagent_thread_id,
+    is_subagent_thread_id,
+)
 from mini_deerflow.thread_store import InMemoryThreadStore
 from mini_deerflow.tools import ToolRegistry
 
@@ -181,6 +185,36 @@ def test_list_threads_response_shape_has_only_thread_id() -> None:
         response = client.get("/api/threads")
     item = response.json()["threads"][0]
     assert set(item.keys()) == {"thread_id"}
+
+
+def test_list_threads_excludes_subagent_isolation_threads() -> None:
+    """子代理的隔离线程不能出现在用户会话列表里。
+
+    回归：Subagent 首版把子任务线程建在**同一个** ThreadStore 里，
+    于是 `GET /api/threads` 会把 `subagent-sa-xxx` 当成用户会话列出来，
+    左侧会话栏出现一堆看不懂的条目。
+    """
+    client, store = _make_client()
+    with client:
+        client.post("/api/threads", json={"thread_id": "user-thread"})
+        # 子代理线程由 SubagentRunner 直接建在同一个 store 里
+        store.create(build_subagent_thread_id("sa-abc123"))
+        response = client.get("/api/threads")
+    assert response.status_code == 200
+    ids = [item["thread_id"] for item in response.json()["threads"]]
+    assert ids == ["user-thread"]
+    assert not any(is_subagent_thread_id(tid) for tid in ids)
+
+
+def test_get_subagent_thread_still_readable_by_id() -> None:
+    """过滤只作用于**列表**；按 ID 直接读子代理线程仍然可用（调试/取证需要）。"""
+    client, store = _make_client()
+    thread_id = build_subagent_thread_id("sa-abc123")
+    store.create(thread_id)
+    with client:
+        response = client.get(f"/api/threads/{thread_id}")
+    assert response.status_code == 200
+    assert response.json()["thread_id"] == thread_id
 
 
 # =============================================================================
