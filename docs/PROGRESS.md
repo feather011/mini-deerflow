@@ -5956,6 +5956,7 @@ GET  /api/threads/subagent-user-made                  → 200 能读到
 - **会话标识**：`claude-subagent-ui-20261108-1520`
 - **目标版本**：Subagent 首版闭环之后（master，基线 `6b0d81c`）
 - **状态**：READY_FOR_REVIEW（实现 + 自测完成，基线差分零回归；等协调窗口/用户验收）
+- **提交**：`bb4a7d7`（子任务通知条 + 右侧会话 + 工具折叠 + 滚动布局）、`a5b205d`（去掉 setState-in-effect，lint 回到基线）；均已普通 push 到 `master`
 - **依赖**：Subagent 首版闭环（已完成）+ 子代理隔离线程已落库
 - **修改范围**：
   - 后端：`src/mini_deerflow/middleware.py`、`src/mini_deerflow/agent.py`、
@@ -6029,7 +6030,8 @@ GET  /api/threads/subagent-user-made                  → 200 能读到
 | 验证 | 方式 | 结果 |
 |---|---|---|
 | 前端 typecheck | `npm run typecheck` | 通过 |
-| 前端全量 | `npx vitest run` | **48 files / 568 tests passed**（新增 `useToolCalls` / `ToolCallBlock` / `SubagentConversationPanel` 三组用例） |
+| 前端全量 | `npx vitest run` | **48 files / 569 tests passed**（新增 `useToolCalls` / `ToolCallBlock` / `SubagentConversationPanel` 三组用例 + MessageList children 回归用例） |
+| 前端 lint | `npx oxlint .` | **8 warnings = 基线同数**（中途一度 9 条，因 `App.tsx` 的 setState-in-effect；已改为派生，见 `a5b205d`） |
 | 后端新增单测 | `pytest tests/test_tool_event_payload.py` | **11 passed**（摘要不含原值、结果截断、事件字段默认 None） |
 | 后端 SSE 集成 | `pytest tests/test_phase21b_events.py` | 新增用例通过（`tool.started` 带摘要且不含表达式原文；`tool.completed` 带结果） |
 | 后端全量 | `pytest tests/` | 见下"基线差分" |
