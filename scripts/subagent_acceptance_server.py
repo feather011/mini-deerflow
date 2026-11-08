@@ -150,7 +150,10 @@ def main() -> int:
     parser.add_argument(
         "--api-target",
         default=None,
-        help="同时写出 frontend/.env.local 指向本后端（默认自动生成）",
+        help=(
+            "写出 frontend/.env.local 指向的前端代理目标；"
+            "默认指向本后端自身；传 'none' 则不写文件"
+        ),
     )
     args = parser.parse_args()
 
@@ -168,6 +171,15 @@ def main() -> int:
     )
     app = create_app(settings, runtime_factory=lambda: runtime)
 
+    # 写前端的环境文件：Vite dev server 默认代理到 5173 后端的写法在
+    # 本仓库是 VITE_API_TARGET，验收人不该手工去猜该填哪个端口。
+    env_path = REPO_ROOT / "frontend" / ".env.local"
+    if args.api_target != "none":
+        target = args.api_target or f"http://{args.host}:{args.port}"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text(f"VITE_API_TARGET={target}\n", encoding="utf-8")
+        print(f"已写出 {env_path} → VITE_API_TARGET={target}", flush=True)
+
     # 打印验收指引
     print("\n" + "=" * 66, flush=True)
     print("Subagent 首版验收服务器（脚本模型，零付费、零外网）", flush=True)
@@ -182,6 +194,8 @@ def main() -> int:
     print("     → 子任务卡**仍在**（记录已落库，G6 收口）", flush=True)
     print("  4. 打开「查看任务 → 过程」", flush=True)
     print("     → 时间线里能看到「子任务开始 / 子任务结束」事件", flush=True)
+    print("\n提示：左侧会话栏**不应**出现 subagent- 开头的条目", flush=True)
+    print("      （子代理的隔离线程不是用户会话）", flush=True)
     print("\n停服：Ctrl+C", flush=True)
     print("=" * 66 + "\n", flush=True)
 
