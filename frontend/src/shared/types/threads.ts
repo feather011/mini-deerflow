@@ -60,6 +60,11 @@ export interface SubagentRunRecord {
   tool_calls?: number
   model_calls?: number
   recorded_at?: number
+  /**
+   * 时序锚点：该子任务发生在父会话第几条消息之后。
+   * 后端派发时记录；刷新后据此把子任务卡放回原来的位置。
+   */
+  after_message_count?: number
 }
 
 /**

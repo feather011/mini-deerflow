@@ -86,4 +86,19 @@ describe('collectToolCalls', () => {
 
     expect(entries).toEqual([])
   })
+
+  it('工具调用带本轮锚点（插在消息流里的当时位置）', () => {
+    const entries = collectToolCalls(
+      [event({ event_type: 'tool.started', sequence: 1, tool_name: 'calculator' })],
+      4,
+    )
+    expect(entries[0]!.after_message_count).toBe(4)
+  })
+
+  it('没有锚点时为 null（前端退回末尾展示）', () => {
+    const entries = collectToolCalls([
+      event({ event_type: 'tool.started', sequence: 1, tool_name: 'calculator' }),
+    ])
+    expect(entries[0]!.after_message_count).toBeNull()
+  })
 })

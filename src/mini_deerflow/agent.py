@@ -28,6 +28,7 @@ from mini_deerflow.models import (
     ToolCalls,
 )
 from mini_deerflow.skill_runtime import SkillContextProvider
+from mini_deerflow.subagent_runs import collapse_run_anchors
 from mini_deerflow.thread_state import ThreadState
 from mini_deerflow.thread_store import ThreadStore
 from mini_deerflow.tools import (
@@ -595,6 +596,15 @@ class Agent:
                         # 让 SSE 的 tool.started 事件能展示"调了哪些参数"。
                         # 只用于生成摘要，原始值不直接进事件。
                         tool_arguments=dict(_args),
+                        # 过程块的时序锚点：本轮工具调用产生的过程块
+                        # （子任务卡、工具折叠块）应插在**本轮用户消息之后**，
+                        # 而不是永远挂在会话末尾。
+                        #
+                        # history_len 是本轮开始前的历史长度；本轮先追加一条
+                        # user 消息，因此“锚点之前的消息数”= history_len + 1。
+                        # 工具往返不进落库消息（只进 working_messages），
+                        # 所以这个值在整轮里都成立。
+                        metadata={"message_anchor": history_len + 1},
                     )
                     def _do_tool_call() -> str:
                         # 25：三层纵深防御
@@ -784,6 +794,40 @@ class Agent:
                 seen.add(tid)
                 ordered.append(dict(record))
             thread.subagent_runs = ordered
+
+    def collapse_failed_run_anchors(self, thread_id: str, run_id: str) -> int:
+        """本轮消息没有落库时，把它的子任务卡锚点收到轮次边界。
+
+        ``Agent.run`` 只在给出最终回答时提交本轮消息。父任务被取消
+        （或失败）时本轮消息**不落库**，但子任务卡已经在运行途中写进
+        线程状态，锚点仍指向「本轮 user 消息之后」。下一轮消息落库后，
+        那个锚点会正好指向下一轮的提问 —— 卡片因此串到下一轮下面。
+
+        这里把锚点收到本轮起点（线程当前消息数），卡片停在轮次边界上，
+        既不消失，也不会被后面落库的消息拖走。
+
+        已提交的一轮**不受影响**：护栏规则见
+        ``subagent_runs.collapse_run_anchors``（锚点不大于消息数即原样不动）。
+
+        读 / 写 store 失败一律按「保持原样」处理 —— 收尾失败不能影响主流程。
+        """
+        try:
+            thread = self._store.get(thread_id)
+        except Exception:
+            return 0
+        if thread is None:
+            return 0
+        try:
+            changed = collapse_run_anchors(thread, run_id)
+        except Exception:
+            return 0
+        if not changed:
+            return 0
+        try:
+            self._store.save(thread)
+        except Exception:
+            return 0
+        return changed
 
     def _process_memory(
         self,

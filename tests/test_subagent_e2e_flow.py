@@ -119,8 +119,12 @@ def test_端到端_派发到结果回传到落库重读() -> None:
     assert runs[0]["instruction"] == "调研三个可能的解决方向"
 
     # 6) 记录里不带敏感字段（不含原始异常栈 / 完整参数）
+    #    after_message_count 是时序锚点（卡片插在第几条消息之后），不是敏感字段
     assert set(runs[0]) <= {
         "task_id", "instruction", "status", "output", "error_type",
         "error_message", "started_at", "finished_at", "duration_seconds",
         "parent_run_id", "tool_calls", "model_calls", "recorded_at",
+        "after_message_count",
     }
+    assert isinstance(runs[0]["after_message_count"], int)
+    assert runs[0]["after_message_count"] >= 1

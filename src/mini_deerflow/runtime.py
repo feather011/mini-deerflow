@@ -375,6 +375,18 @@ class IntegratedAgent:
         #（用于诊断；assemble 本身失败时由身份比较跳过，见 _capture_last_usage）。
         try:
             return pipeline.execute(ctx, action)
+        except Exception:
+            # 本轮没有走到最终回答 → 本轮消息**没有落库**。
+            # 子任务卡却已经在运行途中写进线程状态，锚点仍指向
+            # 「本轮 user 消息之后」。下一轮消息落库后，那个锚点会正好
+            # 指向下一轮的提问 —— 卡片因此串到下一轮下面。
+            # 这里把锚点收回轮次边界：卡片留在会话里（取消可追溯），
+            # 但不会挂到下一轮的问题下面。
+            try:
+                self._agent.collapse_failed_run_anchors(thread_id, effective_run_id)
+            except Exception:
+                pass
+            raise
         finally:
             self._capture_last_usage(thread_id, effective_run_id)
 

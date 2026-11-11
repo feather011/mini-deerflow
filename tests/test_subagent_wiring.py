@@ -783,3 +783,85 @@ class TestPersistence:
         }
         restored = ThreadState.from_dict(old)
         assert restored.subagent_runs == []
+
+
+class TestMessageAnchor:
+    """子任务卡的**时序锚点**：插在消息流里的当时位置，而不是永远在末尾。"""
+
+    def _run_with_history(
+        self, store: InMemoryThreadStore, history: list[Message]
+    ) -> dict[str, Any]:
+        thread = store.get("th-1")
+        thread.extend(history)
+        store.save(thread)
+
+        child_model = _CountingModel([FinalAnswer(content="子任务结论")])
+        parent_model = _CountingModel(
+            [
+                ToolCall(
+                    name="subagent_submit",
+                    arguments={"instruction": "带锚点的任务"},
+                ),
+                FinalAnswer(content="主 Agent 收尾"),
+            ]
+        )
+
+        registry = ToolRegistry()
+        registry.register(
+            Tool(
+                name="noop",
+                description="占位",
+                parameters={"type": "object", "properties": {}},
+                handler=lambda args: "{}",
+            )
+        )
+        manager = _make_manager(store, model=child_model, registry=registry)
+        _register_subagent_tools(
+            registry,
+            manager,
+            store,
+            model=child_model,
+            parent_tool_names=tuple(t.name for t in registry.list_tools()),
+        )
+
+        agent = Agent(
+            model=parent_model,
+            registry=registry,
+            store=store,
+            max_steps=4,
+            tool_policy_registry=manager._tool_policy_registry,
+        )
+        agent.run("th-1", "本轮问题")
+        return store.get("th-1").subagent_runs[0]
+
+    def test_锚点指向本轮用户消息之后(self) -> None:
+        store = InMemoryThreadStore()
+        store.create("th-1")
+        record = self._run_with_history(store, [])
+
+        # 空历史 → 本轮 user 消息是第 1 条 → 锚点 = 1（插在它之后）
+        assert record["after_message_count"] == 1
+
+        thread = store.get("th-1")
+        # 最终消息列表 = [user, assistant]，锚点 1 = user 之后
+        assert [m.role for m in thread.messages] == ["user", "assistant"]
+
+    def test_锚点随历史长度前移(self) -> None:
+        store = InMemoryThreadStore()
+        store.create("th-1")
+        history = [
+            Message(role="user", content="上一轮问题"),
+            Message(role="assistant", content="上一轮回答"),
+        ]
+        record = self._run_with_history(store, history)
+
+        # 历史 2 条 → 本轮 user 消息是第 3 条 → 锚点 = 3
+        assert record["after_message_count"] == 3
+
+        thread = store.get("th-1")
+        assert [m.role for m in thread.messages] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]

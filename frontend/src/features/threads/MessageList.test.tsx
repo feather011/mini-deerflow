@@ -176,15 +176,22 @@ describe('MessageList', () => {
     expect(screen.getAllByText(/发送中的消息|上一条消息/)).toHaveLength(2)
   })
 
-  it('children（工具块/子任务条）渲染在滚动容器内部，随消息一起滚动', () => {
+  it('过程块（工具块/子任务条）渲染在滚动容器内部，随消息一起滚动', () => {
     const messages: MessageResponse[] = [
       { role: 'user', content: 'Hello' },
       { role: 'assistant', content: 'Hi' },
     ]
     render(
-      <MessageList messages={messages}>
-        <div data-testid="process-block">过程块</div>
-      </MessageList>,
+      <MessageList
+        messages={messages}
+        blocks={[
+          {
+            key: 'block-1',
+            afterMessageCount: 1,
+            node: <div data-testid="process-block">过程块</div>,
+          },
+        ]}
+      />,
     )
 
     const scroll = screen.getByTestId('message-scroll')
@@ -192,5 +199,106 @@ describe('MessageList', () => {
     // 关键回归点：过程块必须在滚动容器**里面**。
     // 放外面就会悬在聊天区底部，不随消息滚动。
     expect(scroll.contains(block)).toBe(true)
+  })
+
+  it('过程块插在锚点位置（两条消息之间），不是堆在末尾', () => {
+    const messages: MessageResponse[] = [
+      { role: 'user', content: '第一条' },
+      { role: 'assistant', content: '第二条' },
+      { role: 'assistant', content: '第三条' },
+    ]
+    const { container } = render(
+      <MessageList
+        messages={messages}
+        blocks={[
+          {
+            key: 'block-1',
+            afterMessageCount: 1,
+            node: <div data-testid="process-block">过程块</div>,
+          },
+        ]}
+      />,
+    )
+
+    const block = screen.getByTestId('process-block')
+    const text = container.textContent ?? ''
+    // 位置：第一条之后、第二条之前
+    expect(text.indexOf('第一条')).toBeLessThan(text.indexOf('过程块'))
+    expect(text.indexOf('过程块')).toBeLessThan(text.indexOf('第二条'))
+    // 且不在最后一条消息之后
+    expect(text.indexOf('过程块')).toBeLessThan(text.indexOf('第三条'))
+    expect(block).toBeInTheDocument()
+  })
+
+  it('锚点超过消息条数时退回末尾（消息还没到齐）', () => {
+    const messages: MessageResponse[] = [{ role: 'user', content: '第一条' }]
+    const { container } = render(
+      <MessageList
+        messages={messages}
+        blocks={[
+          {
+            key: 'block-1',
+            afterMessageCount: 5,
+            node: <div data-testid="process-block">过程块</div>,
+          },
+        ]}
+      />,
+    )
+    const text = container.textContent ?? ''
+    expect(text.indexOf('第一条')).toBeLessThan(text.indexOf('过程块'))
+  })
+
+  it('同一锚点的多个过程块按给定顺序排列', () => {
+    const messages: MessageResponse[] = [
+      { role: 'user', content: '第一条' },
+      { role: 'assistant', content: '第二条' },
+    ]
+    const { container } = render(
+      <MessageList
+        messages={messages}
+        blocks={[
+          {
+            key: 'block-a',
+            afterMessageCount: 1,
+            node: <div>块A</div>,
+          },
+          {
+            key: 'block-b',
+            afterMessageCount: 1,
+            node: <div>块B</div>,
+          },
+        ]}
+      />,
+    )
+    const text = container.textContent ?? ''
+    expect(text.indexOf('块A')).toBeLessThan(text.indexOf('块B'))
+    expect(text.indexOf('块B')).toBeLessThan(text.indexOf('第二条'))
+  })
+
+  // ====== UI-SUBAGENT-INLINE-01：父任务取消后旧卡不串到下一轮 ======
+
+  it('锚点 0 的过程块排在所有消息之前，不挂到后面的提问下面', () => {
+    // 后端把「本轮没落库」的子任务卡锚点收到轮次边界 0。
+    // 0 在放置规则里是「排在最前面」—— 卡片停在轮次边界，
+    // 不会因为下一轮消息落库而挂到下一轮提问下面（串位）。
+    const messages: MessageResponse[] = [
+      { role: 'user', content: '下一轮的提问' },
+      { role: 'assistant', content: '下一轮的回答' },
+    ]
+    const { container } = render(
+      <MessageList
+        messages={messages}
+        blocks={[
+          {
+            key: 'block-cancelled',
+            afterMessageCount: 0,
+            node: <div data-testid="process-block">被取消那一轮的子任务卡</div>,
+          },
+        ]}
+      />,
+    )
+    const text = container.textContent ?? ''
+    expect(text.indexOf('被取消那一轮的子任务卡')).toBeLessThan(text.indexOf('下一轮的提问'))
+    expect(text.indexOf('被取消那一轮的子任务卡')).toBeLessThan(text.indexOf('下一轮的回答'))
   })
 })

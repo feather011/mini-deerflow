@@ -156,4 +156,107 @@ describe('useSubagentCards', () => {
     expect(result.current[0]!.status).toBe('FAILED')
     expect(result.current[0]!.error_type).toBe('RuntimeError')
   })
+
+  it('实时卡片带本轮锚点', () => {
+    const events = [
+      makeEvent({
+        event_type: 'subagent.started',
+        subagent_task_id: 'sa-anchor',
+        subagent_status: 'RUNNING',
+      }),
+    ]
+    const { result } = renderHook(() => useSubagentCards(events, [], 3))
+    expect(result.current[0]!.after_message_count).toBe(3)
+  })
+
+  it('持久化记录带回后端记下的锚点（刷新后位置不变）', () => {
+    const persisted: SubagentRunRecord[] = [
+      {
+        task_id: 'sa-p',
+        instruction: '持久化的任务',
+        status: 'SUCCEEDED',
+        output: '结果',
+        after_message_count: 5,
+      },
+    ]
+    const { result } = renderHook(() => useSubagentCards([], persisted, 9))
+    // 持久化锚点优先于实时锚点
+    expect(result.current[0]!.after_message_count).toBe(5)
+  })
+
+  it('旧记录没有锚点时退回同任务的实时锚点，再没有则为 null', () => {
+    const persisted: SubagentRunRecord[] = [
+      {
+        task_id: 'sa-old',
+        instruction: '旧记录',
+        status: 'SUCCEEDED',
+        output: '结果',
+      },
+    ]
+    // 同一任务既有实时事件又有旧记录 → 用实时锚点
+    const events = [
+      makeEvent({
+        event_type: 'subagent.started',
+        subagent_task_id: 'sa-old',
+        subagent_status: 'RUNNING',
+      }),
+    ]
+    const { result } = renderHook(() => useSubagentCards(events, persisted, 7))
+    expect(result.current[0]!.after_message_count).toBe(7)
+
+    // 只有旧记录（老会话的子任务）→ 位置未知，退回末尾
+    const { result: noAnchor } = renderHook(() => useSubagentCards([], persisted))
+    expect(noAnchor.current[0]!.after_message_count).toBeNull()
+  })
+
+  // ====== UI-SUBAGENT-INLINE-01：父任务取消后旧卡不串到下一轮 ======
+
+  it('持久化锚点 0 覆盖实时锚点（取消后收回的轮次边界）', () => {
+    // 后端把「本轮没落库」的子任务卡锚点收到轮次边界 0。
+    // 0 不是 nullish —— 持久化记录里的 0 必须赢过实时事件带的锚点，
+    // 否则卡片会被实时锚点拖到下一轮提问下面。
+    const persisted: SubagentRunRecord[] = [
+      {
+        task_id: 'sa-cancelled',
+        instruction: '被取消那一轮的子任务',
+        status: 'CANCELLED',
+        output: '',
+        after_message_count: 0,
+      },
+    ]
+    const events = [
+      makeEvent({
+        event_type: 'subagent.started',
+        subagent_task_id: 'sa-cancelled',
+        subagent_status: 'RUNNING',
+      }),
+    ]
+    const { result } = renderHook(() => useSubagentCards(events, persisted, 1))
+    expect(result.current[0]!.after_message_count).toBe(0)
+  })
+
+  it('刷新前后旧卡的归属一致（锚点都来自持久化记录）', () => {
+    const persisted: SubagentRunRecord[] = [
+      {
+        task_id: 'sa-cancelled',
+        instruction: '被取消那一轮的子任务',
+        status: 'CANCELLED',
+        output: '',
+        after_message_count: 0,
+      },
+    ]
+    // 刷新前：还有上一轮的实时事件；刷新后：只剩持久化记录。
+    // 两种情况下卡片的锚点必须一致 —— 归属不因刷新而改变。
+    const events = [
+      makeEvent({
+        event_type: 'subagent.failed',
+        subagent_task_id: 'sa-cancelled',
+        subagent_status: 'CANCELLED',
+      }),
+    ]
+    const { result: beforeRefresh } = renderHook(() => useSubagentCards(events, persisted, 1))
+    const { result: afterRefresh } = renderHook(() => useSubagentCards([], persisted, null))
+    expect(beforeRefresh.current[0]!.after_message_count).toBe(0)
+    expect(afterRefresh.current[0]!.after_message_count).toBe(0)
+  })
 })

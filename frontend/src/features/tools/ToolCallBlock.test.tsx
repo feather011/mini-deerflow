@@ -16,6 +16,7 @@ const base: ToolCallEntry = {
   error: null,
   status: 'succeeded',
   duration_seconds: 0.25,
+  after_message_count: 1,
 }
 
 describe('ToolCallBlock', () => {

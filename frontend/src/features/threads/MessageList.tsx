@@ -10,11 +10,32 @@
  * - 提交状态通过 data-submit-status 属性透传给 CSS（不污染 content）
  * - 滚动到底部
  */
-import { useEffect, useRef, type ReactNode } from 'react'
+import { Fragment, useEffect, useRef, type ReactNode } from 'react'
 import type { MessageResponse } from '../../shared/types/threads'
 import type { OptimisticMessage, MessageResponseLocal } from './types'
 import { MarkdownMessage } from './MarkdownMessage'
 import styles from './MessageList.module.css'
+
+/**
+ * 过程块（子任务通知条、工具调用折叠块）的时序锚点。
+ *
+ * 过程块不是消息，但它们**发生在会话的某个时刻** —— 与其永远堆在
+ * 会话末尾（悬挂式），不如插到它当时的位置，让后来的消息把它顶上去，
+ * 和消息流融在一起。
+ */
+export interface MessageBlock {
+  /** 稳定唯一键（同一锚点下多个块时用于 React key） */
+  key: string
+  /**
+   * 该块插在第 N 条消息之后（N = 锚点之前有多少条消息）。
+   *
+   * N 超过当前消息条数时退回到末尾（消息还没到齐时先挂末尾，
+   * 消息补齐后自动归位）。
+   */
+  afterMessageCount: number
+  /** 块内容 */
+  node: ReactNode
+}
 
 interface MessageListProps {
   messages: MessageResponse[]
@@ -23,12 +44,12 @@ interface MessageListProps {
   /** 当前 run 累加的 token 文本（用于流式渲染 assistant 消息） */
   streamingText?: string
   /**
-   * 追加在消息之后、**同一个滚动容器内**的内容。
+   * 过程块：与消息**同处一个滚动容器**，并按锚点插到消息流里的当时位置。
    *
-   * 工具调用折叠块、子任务通知条走这里 —— 它们必须和消息一起滚动，
-   * 而不是悬在聊天区底部（悬着会让人以为那是常驻控件）。
+   * 工具调用折叠块、子任务通知条走这里 —— 它们必须和消息一起滚动、
+   * 被后来的消息顶上去，而不是永远悬在聊天区底部。
    */
-  children?: ReactNode
+  blocks?: MessageBlock[]
 }
 
 /**
@@ -82,11 +103,76 @@ function MessageItem({
   )
 }
 
+/** 渲染树的一段：React key + 内容 */
+interface RenderSlot {
+  key: string
+  node: ReactNode
+}
+
+/**
+ * 把消息与过程块编成交错渲染树。
+ *
+ * 规则：
+ * - 锚点 N 的块插在第 N 条消息**之后**（N = 锚点之前有多少条消息）；
+ * - 锚点 ≤ 0 的块排在最前面；
+ * - 锚点超过消息条数的块退回末尾（消息还没到齐时先挂末尾，
+ *   消息补齐后自动归位）。
+ */
+function buildRenderTree(
+  items: readonly (MessageResponse | MessageResponseLocal)[],
+  blocks?: readonly MessageBlock[],
+): RenderSlot[] {
+  const slots: RenderSlot[] = []
+  const byAnchor = new Map<number, MessageBlock[]>()
+  const leading: MessageBlock[] = []
+  const trailing: MessageBlock[] = []
+
+  for (const block of blocks ?? []) {
+    if (block.afterMessageCount <= 0) {
+      leading.push(block)
+    } else if (block.afterMessageCount > items.length) {
+      trailing.push(block)
+    } else {
+      const list = byAnchor.get(block.afterMessageCount)
+      if (list) list.push(block)
+      else byAnchor.set(block.afterMessageCount, [block])
+    }
+  }
+
+  for (const block of leading) {
+    slots.push({ key: block.key, node: block.node })
+  }
+
+  items.forEach((msg, index) => {
+    slots.push({
+      key: 'clientId' in msg && msg.clientId ? msg.clientId : `msg-${index}`,
+      node: (
+        <MessageItem
+          message={msg}
+          submitStatus={'_submitStatus' in msg ? (msg as MessageResponseLocal)._submitStatus : undefined}
+        />
+      ),
+    })
+    const after = byAnchor.get(index + 1)
+    if (after) {
+      for (const block of after) {
+        slots.push({ key: block.key, node: block.node })
+      }
+    }
+  })
+
+  for (const block of trailing) {
+    slots.push({ key: block.key, node: block.node })
+  }
+
+  return slots
+}
+
 export function MessageList({
   messages,
   optimisticMessage,
   streamingText,
-  children,
+  blocks,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -128,17 +214,10 @@ export function MessageList({
         <div className={styles.empty}>
           <p>还没有消息，发送第一条消息开始对话</p>
         </div>
-      ) : (
-        renderItems.map((msg, index) => (
-          <MessageItem
-            key={'clientId' in msg && msg.clientId ? msg.clientId : index}
-            message={msg}
-            submitStatus={'_submitStatus' in msg ? (msg as MessageResponseLocal)._submitStatus : undefined}
-          />
-        ))
-      )}
-      {/* 消息之后的过程块：与消息同处一个滚动容器 */}
-      {children}
+      ) : null}
+      {buildRenderTree(renderItems, blocks).map((slot) => (
+        <Fragment key={slot.key}>{slot.node}</Fragment>
+      ))}
       <div ref={bottomRef} />
     </div>
   )

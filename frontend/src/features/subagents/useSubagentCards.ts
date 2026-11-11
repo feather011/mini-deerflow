@@ -27,6 +27,13 @@ export interface SubagentRunRecord {
   tool_calls?: number
   model_calls?: number
   recorded_at?: number
+  /**
+   * 时序锚点：该子任务发生在父会话第几条消息之后。
+   *
+   * 由后端在派发时记录（见 subagent_tools 的 message_anchor），
+   * 刷新页面后据此把卡片放回原来的位置，而不是堆到会话末尾。
+   */
+  after_message_count?: number
 }
 
 /** 卡片视图模型 */
@@ -40,6 +47,13 @@ export interface SubagentCard {
   duration_seconds?: number
   /** 该卡片是否来自本轮实时事件（false = 从持久化记录恢复） */
   live: boolean
+  /**
+   * 时序锚点：卡片应插在第几条消息之后。
+   *
+   * 持久化记录带后端记下的锚点；实时事件没有位置信息，用本轮锚点兜底。
+   * null = 位置未知（前端退回末尾展示）。
+   */
+  after_message_count: number | null
 }
 
 /** 终态集合：这些状态不再变化 */
@@ -67,6 +81,7 @@ export const SUBAGENT_STATUS_LABEL: Record<string, string> = {
  */
 function collectFromEvents(
   events: readonly RunEvent[] | null | undefined,
+  anchor: number | null,
 ): Map<string, SubagentCard> {
   const cards = new Map<string, SubagentCard>()
   if (!events) return cards
@@ -95,27 +110,31 @@ function collectFromEvents(
       error_message: existing?.error_message,
       duration_seconds: existing?.duration_seconds,
       live: true,
+      after_message_count: anchor,
     })
   }
   return cards
 }
 
 /**
- * 聚��子任务卡。
+ * 聚合子任务卡。
  *
  * @param events 本轮 SSE 事件（可空）
  * @param persisted API 重读到的持久化记录（可空）—— 刷新后靠它恢复卡片
+ * @param anchor 本轮实时事件的时序锚点（第几条消息之后）
  */
 export function useSubagentCards(
   events: readonly RunEvent[] | null | undefined,
   persisted?: readonly SubagentRunRecord[] | null,
+  anchor?: number | null,
 ): SubagentCard[] {
   return useMemo(() => {
-    const cards = collectFromEvents(events)
+    const cards = collectFromEvents(events, anchor ?? null)
 
     // 持久化记录优先（落库后的权威事实）
     for (const record of persisted ?? []) {
       if (!record?.task_id) continue
+      const liveCard = cards.get(record.task_id)
       cards.set(record.task_id, {
         task_id: record.task_id,
         instruction: record.instruction ?? '',
@@ -125,10 +144,13 @@ export function useSubagentCards(
         error_message: record.error_message,
         duration_seconds: record.duration_seconds,
         live: false,
+        // 锚点优先取后端记下的值；旧记录没有这个字段时退回实时锚点
+        after_message_count:
+          record.after_message_count ?? liveCard?.after_message_count ?? null,
       })
     }
 
     // 按记录顺序排（持久化在前），未落库的按开始时间追加
     return [...cards.values()]
-  }, [events, persisted])
+  }, [events, persisted, anchor])
 }

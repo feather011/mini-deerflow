@@ -105,6 +105,25 @@ def _check_int(args: dict, name: str, field: str, min_val: int | None = None) ->
     return result
 
 
+def _extract_message_anchor(context: object | None) -> int | None:
+    """从执行上下文里取"过程块应插在第几条消息之后"的锚点。
+
+    Agent.run 在构造工具调用的 ExecutionContext 时把锚点放进
+    ``metadata['message_anchor']``（= 本轮 user 消息之前的历史条数 + 1）。
+    这里是唯一的读取点：拿不到就返回 None，由调用方走兜底逻辑。
+    """
+    if context is None:
+        return None
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("message_anchor")
+    # bool 是 int 子类，必须排除
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
 # --- Handler 实现 ---
 
 
@@ -204,6 +223,19 @@ class _SubmitHandler:
                 if isinstance(ctx_span_id, str) and ctx_span_id:
                     parent_span_id = ctx_span_id
 
+            # 时序锚点：子任务卡要插在父会话消息流里的**当时位置**
+            # （本轮用户消息之后），而不是永远挂在会话末尾。
+            #
+            # 首选 Agent.run 放进 ExecutionContext.metadata 的值 —— 那是
+            # "本轮 user 消息之前有多少条消息"的权威答案。拿不到时退回到
+            # 父线程当前消息数 + 1（父线程里本轮 user 消息尚未落库，
+            # 因此 +1 正好是它之后的位置）。
+            after_message_count = _extract_message_anchor(context)
+            if after_message_count is None:
+                after_message_count = self._fallback_message_anchor(
+                    effective_parent_thread_id
+                )
+
             instruction = _check_str(arguments, tool_name, "instruction")
             timeout = _check_int(arguments, tool_name, "timeout_seconds", 1)
             max_steps = _check_int(arguments, tool_name, "max_steps", 1)
@@ -301,7 +333,7 @@ class _SubmitHandler:
                 parent_token=parent_token,
             )
 
-            record = self._build_record(task, result)
+            record = self._build_record(task, result, after_message_count=after_message_count)
             self._persist(effective_parent_thread_id, record)
 
             if result is None:
@@ -410,8 +442,14 @@ class _SubmitHandler:
         self,
         task: Any,
         result: SubagentResult | None,
+        *,
+        after_message_count: int | None = None,
     ) -> dict[str, Any]:
-        """构造可持久化的子任务记录。"""
+        """构造可持久化的子任务记录。
+
+        ``after_message_count`` 是时序锚点（见 _extract_message_anchor）：
+        前端据此把卡片插到消息流里的当时位置。
+        """
         if result is not None:
             status = result.terminal_status.name
             output = result.output
@@ -445,7 +483,23 @@ class _SubmitHandler:
             parent_run_id=task.parent_run_id,
             model_calls=model_calls,
             tool_calls=tool_calls,
+            after_message_count=after_message_count,
         )
+
+    def _fallback_message_anchor(self, parent_thread_id: str) -> int | None:
+        """没有上下文锚点时的兜底：父线程消息数 + 1。
+
+        父线程里**本轮的 user 消息尚未落库**（Agent 在最终回答时才
+        一次性提交），因此"当前消息数 + 1"正好是那条 user 消息之后的位置。
+        取不到父线程时返回 None（前端会退回末尾展示）。
+        """
+        if self._thread_store is None:
+            return None
+        try:
+            thread = self._thread_store.get(parent_thread_id)
+            return int(getattr(thread, "message_count", 0)) + 1
+        except Exception:
+            return None
 
     def _persist(self, parent_thread_id: str, record: dict[str, Any]) -> None:
         """把子任务记录写进父线程的 ThreadState。

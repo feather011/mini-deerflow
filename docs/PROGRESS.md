@@ -6134,3 +6134,168 @@ GET  /api/threads/subagent-user-made                  → 200 能读到
 `page.locator('[class*="summary"]')`（指向 SSE 事件面板摘要行）撞名 —— 该定位器会同时命中两个元素，
 `expect(...).toBeVisible()` 在严格模式下会直接报错。已改名 `.row`。
 
+---
+
+## UI 轮：子任务卡 / 工具折叠块改为「消息流内的时序锚点」（2026-11-08）
+
+- 任务 ID：UI-SUBAGENT-INLINE-01
+- 会话标识：claude-worker-20261108-2145-a
+- 目标版本：工作区 `D:/tmp/master-smoke-010ef33`（master 的 git worktree，已切出分支 `automation/subagent-inline-ui`），基线 `141872b`（master）
+- 状态：**实现完成 + 已实测**；**未 commit / 未 push**（等用户授权）
+- 依据：用户「子agent不要悬挂式的，要向消息一样输出在会话框内会被新信息顶到上面」
+
+### 一、问题
+
+子任务通知条与工具调用折叠块原先统一挂在聊天区**底部**（悬挂式），且与消息不在同一个滚动容器里：
+后来的消息不会把它们顶上去，用户读不出「这个子任务是在哪句话之后发生的」。
+
+### 二、做法：位置锚点（不是绝对定位）
+
+`Message` 没有 id / 序号 / 时间戳（`models.py`），只有**下标**可用，因此用**位置锚点**表达时序：
+
+- 锚点语义：`after_message_count = N` ⇒ 该块插在渲染列表**前 N 条消息之后**；
+  `N ≤ 0` 排最前；`N > 消息条数` 时暂挂末尾（消息补齐后自动归位）。
+- 后端：`Agent.run` 构造工具调用的 `ExecutionContext` 时写入 `metadata={"message_anchor": history_len + 1}`
+  （本轮 user 消息在运行期间**尚未落库**，直到 FinalAnswer 才随 `thread.extend(pending)` 一起保存
+  ⇒ 锚点正好是本轮 user 消息的位置）。
+- 后端落库：`subagent_submit` 处理器把锚点写进子任务记录 `after_message_count`，
+  刷新页面后据此把卡片放回原位；拿不到锚点时退回 `None`（前端按末尾展示）。
+- 前端：`MessageList` 新增 `blocks` prop（`MessageBlock[]`），把消息与过程块编成交错渲染树（`buildRenderTree`）；
+  `useSubagentCards` / `useToolCalls` 各自带 `after_message_count`；同一 run 内的工具调用共用本轮锚点。
+- **没做**：确认卡片（TOOL-05 待决策项）仍固定在底部 —— 那是待办，不是过程历史。
+
+### 三、改动文件（14）
+
+- 后端：`src/mini_deerflow/agent.py`、`src/mini_deerflow/subagent_tools.py`、`src/mini_deerflow/subagent_runs.py`
+- 前端：`frontend/src/features/threads/MessageList.tsx`、`frontend/src/features/threads/AgentChatPanel.tsx`、
+  `frontend/src/features/tools/useToolCalls.ts`、`frontend/src/features/subagents/useSubagentCards.ts`、
+  `frontend/src/shared/types/threads.ts`
+- 测试：`tests/test_subagent_wiring.py`（新增 `TestMessageAnchor` 2 例）、
+  `tests/test_subagent_e2e_flow.py`（记录字段白名单补 `after_message_count`，并断言锚点为 int ≥ 1）、
+  `frontend/src/features/threads/MessageList.test.tsx`、`frontend/src/features/tools/ToolCallBlock.test.tsx`、
+  `frontend/src/features/tools/useToolCalls.test.ts`、`frontend/src/features/subagents/useSubagentCards.test.ts`
+
+### 四、验证证据
+
+**后端**（同一解释器、同一口径 `.venv` + `PYTHONPATH`；基线用 `git archive master` 导出干净树，避免口径不可比）：
+
+| | 基线（master 141872b） | 本轮 |
+|---|---|---|
+| 全量 `pytest tests/` | 23 failed / 3727 passed | 23 failed / **3729 passed**（+2 = 新增锚点用例） |
+| 失败用例集合 | 23 项（全部落在 MCP / harness / project_execute / task_handover / tool07 这 8 个文件） | **逐条 diff 完全相同** |
+
+中途曾出现 1 项新增红灯：`tests/test_subagent_e2e_flow.py` 的「记录字段白名单」断言不含新字段
+`after_message_count` —— 已更新该契约断言（补字段 + 断言锚点为 int ≥ 1），未放宽其他断言。
+
+**前端**：`npx vitest run` → 48 files / **577 passed**（基线 569，+8 条位置相关用例）；
+`npm run typecheck` → 无错；`npm run lint` → **8 条警告 = 基线同数**
+（中途因导出 `buildRenderTree` 多 1 条 `react/only-export-components`，已改回模块内函数恢复基线）。
+
+**浏览器实测**（Playwright，真实后端 127.0.0.1:8000 + **真实 minimax 模型** + vite 5173），
+会话 `ada784aaf1c0`，DOM 顺序取自 `[data-testid=message-scroll]` 的子节点：
+
+1. 第 1 轮：`user` → `tool-call-list`(subagent_submit) → `subagent-card-list` → `assistant`
+   —— 过程块**插在消息流里**，不是挂在底部。
+2. 再发第 2 轮（新增 2 条消息）后：卡片仍在第 1 条消息之后 —— **被新消息顶上去**。
+3. 浏览器 `reload` 后：卡片**仍在同一位置**（走持久化的 `after_message_count`）。
+4. `GET /api/threads/ada784aaf1c0` → `subagent_runs[0].after_message_count = 1`，
+   消息序列 `[user, assistant, user, assistant]` —— 与前端落位一致。
+
+### 五、限制 / 未做
+
+- 工具折叠块仍只在**当前 run** 内可见（SSE 事件按 run 清空，刷新后只剩子任务卡）——本轮未改。
+- 15 项 e2e 既有红灯（`执行完成` 文案只在 `isRunning` 时挂载）本轮**未处理**，不在本任务范围。
+- 真实模型实测中主 agent 有时只回一句「已派发」就结束、未复述子 agent 产出 ——
+  属**模型行为**，非本轮时序改动引入（另案）。
+- 未 commit / 未 push：改动只在工作区 `D:/tmp/master-smoke-010ef33`（分支 `automation/subagent-inline-ui`）。
+
+### 六、下一依赖
+
+- 需要用户验收界面位置；确认后再定 commit / push 路径（用户主工作区当前在 `automation/test-01`，不含本轮 UI 基础）。
+
+
+## UI 轮补验：父任务取消后旧子任务卡不串到下一轮（2026-11-10）
+
+- 任务 ID：UI-SUBAGENT-INLINE-01（补验轮，承接 2026-11-08 的时序锚点 UI 轮）
+- 会话标识：claude-worker-20261110-2345-a
+- 目标版本：`D:/tmp/master-smoke-010ef33`（master 的 git worktree），分支 `automation/subagent-inline-ui`，基线 `141872b`
+- 状态：实现完成 + 已实测；**未 commit / 未 push**
+
+### 一、问题
+
+`Agent.run` 只在给出最终回答时提交本轮消息。父任务被取消（或失败）时**本轮消息不落库**，
+但子任务卡已经在运行途中写进 `thread.subagent_runs`，锚点仍是「本轮 user 消息之后」
+（本轮开始前的消息数 + 1）。下一轮消息落库后，那个锚点正好指向**下一轮的提问** ——
+卡片因此串到下一轮下面，看起来像属于下一轮。
+
+### 二、做法
+
+- `subagent_runs.collapse_run_anchors(thread, run_id)`：把「锚点 > 线程当前消息数」的记录
+  （说明它指向一条并不存在的消息，即本轮没落库）收到当前消息数 —— 卡片停在**轮次边界**。
+  护栏让规则只影响没落库的那一轮：已提交的一轮锚点不大于消息数，原样不动。
+- `Agent.collapse_failed_run_anchors(thread_id, run_id)`：读 / 改 / 存 store，失败一律按
+  「保持原样」处理。
+- `runtime.IntegratedAgent.run`：本轮没走到最终回答（异常退出）时调用上面的回收，
+  然后原样抛出异常（取消 / 超时 / 失败的对外语义不变）。
+- 前端：锚点 `0` 在放置规则里是「排在最前面」（`MessageList.buildRenderTree` 的 leading 分支）；
+  `useSubagentCards` 用 `record.after_message_count ?? liveCard?.after_message_count ?? null`，
+  `0` 不是 nullish —— **持久化的 0 赢过实时锚点**，卡片不会被实时事件拖回下一轮。
+
+### 三、改动文件（本轮工作区状态，未提交）
+
+后端：`src/mini_deerflow/agent.py`、`src/mini_deerflow/runtime.py`、`src/mini_deerflow/subagent_runs.py`
+测试：`tests/test_subagent_cancel_anchor.py`（新增，未跟踪）
+前端测试：`frontend/src/features/threads/MessageList.test.tsx`、`frontend/src/features/subagents/useSubagentCards.test.ts`
+
+> 口径说明：本轮开始时，工作区已含「取消后回收锚点」的实现与两条定向回归
+> （`test_父任务取消后旧子任务卡不串到下一轮`、`test_锚点回收只影响没落库的那一轮`）。
+> 本轮做的是**独立复现与补证**：先证明该实现确实是串位的修复（回退后用例失败），
+> 再补一条「取消发生在第二轮」的定向回归。
+
+### 四、验证证据
+
+**复现（回退修复后失败）**：把工作区复制到独立临时目录 `D:/tmp/cancel-repro`，
+仅把 `src/mini_deerflow/runtime.py` 换回 master 版本（= 去掉「异常时回收锚点」这一处），
+用同一个 `.venv` 解释器 + `PYTHONPATH` 跑同一份用例：
+
+| 用例 | 回退修复后 | 当前工作区 |
+|---|---|---|
+| `test_父任务取消后旧子任务卡不串到下一轮` | **失败**：`anchor_after_a=1, anchor_after_b=1` → slot `after-message-1`（挂在 user B 下面） | 通过 |
+| `test_取消发生在第二轮_旧卡停在上一轮边界不随后续消息漂移` | **失败**：`assert 3 == 2`（锚点没收回） | 通过 |
+| `test_锚点回收只影响没落库的那一轮`（纯单元，不依赖接线） | 通过 | 通过 |
+
+结论：串位**真实复现**，修复确实把它关掉了（失败集合逐条对应）。
+
+**当前工作区的定向测试**（同一解释器、同一 `PYTHONPATH` 口径）：
+
+- `pytest tests/test_subagent_cancel_anchor.py` → **3 passed**
+- `pytest tests/test_subagent_cancel_anchor.py tests/test_subagent_wiring.py tests/test_subagent_e2e_flow.py
+  tests/test_cancel_semantics.py tests/test_api_runs.py tests/test_api_runs_stream.py
+  tests/test_api_runs_stream_components.py` → **148 passed**
+- 前端 `npx vitest run src/features/subagents/useSubagentCards.test.ts src/features/threads/MessageList.test.tsx`
+  → **33 passed**（含「锚点 0 排在所有消息之前」「持久化 0 赢过实时锚点」「刷新前后归属一致」）
+
+**行为结论（与验收标准对应）**：
+
+- 取消后 A **不落库**：`GET /api/threads/<id>` 的 `messages` 在取消后仍只有之前已提交的轮次
+  （首轮场景为空），被取消那一轮的 user / assistant 都不在库里。
+- 旧卡的去向：锚点从「本轮 user 消息之后」收到**轮次边界**（= 线程当前消息数）。
+  - 取消发生在**首轮** → 锚点 0 → 前端规则是「排在最前面」→ 卡片停在消息流最上方，
+    **不在 B 的提问下面**；卡片保留在会话里（取消可追溯），不会被抹掉。
+  - 取消发生在**第二轮** → 锚点 2 → 卡片落在第一轮的回答之后（第三轮提问之前），
+    后续新增的消息**不会**把它拖走。
+- 刷新前后归属一致：刷新后位置只来自持久化记录的 `after_message_count`，
+  与刷新前（持久化记录优先于实时事件）取同一个值。
+
+### 五、限制 / 未做
+
+- 未做浏览器端复验：真实前端要跑出子任务卡需要真实模型派发，本轮明确不调用付费模型；
+  消息流顺序由前端组件测试（真实 `MessageList` 渲染 + DOM 顺序断言）覆盖。
+- 未重跑全量 `pytest tests/`（本轮只补验一条链路，且未改正常链路的任何行为）。
+- 旧记录（引入锚点之前落库的）没有 `after_message_count` → 前端退回末尾展示，属既有行为，未改。
+- 未 commit / 未 push。
+
+### 六、下一依赖
+
+- 需要用户验收「取消后旧卡的落位」是否符合预期（首轮取消 → 排在最前；第二轮取消 → 上一轮边界）。
+- 确认后再定 commit / push 路径。

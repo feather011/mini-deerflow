@@ -27,6 +27,13 @@ export interface ToolCallEntry {
   status: 'running' | 'succeeded' | 'failed'
   /** 耗时（秒）；由事件时间戳相减得到 */
   duration_seconds: number | null
+  /**
+   * 时序锚点：该工具调用发生在第几条消息之后。
+   *
+   * 一次 run 只对应一轮问答，因此同一 run 里的工具调用共用同一个锚点
+   * （= 本轮 user 消息的位置）。null = 位置未知（前端退回末尾展示）。
+   */
+  after_message_count: number | null
 }
 
 interface Pending {
@@ -42,11 +49,16 @@ const TOOL_EVENT_TYPES = new Set(['tool.started', 'tool.completed', 'tool.failed
  * 聚合工具调用。
  *
  * 纯函数，便于单测（不依赖 React）。
+ *
+ * @param events 本轮 SSE 事件
+ * @param anchor 本轮工具调用的时序锚点（第几条消息之后）；null = 未知
  */
 export function collectToolCalls(
   events: readonly RunEvent[] | null | undefined,
+  anchor?: number | null,
 ): ToolCallEntry[] {
   if (!events) return []
+  const afterMessageCount = anchor ?? null
   const entries: ToolCallEntry[] = []
   const pending: Pending[] = []
 
@@ -71,6 +83,7 @@ export function collectToolCalls(
         error: null,
         status: 'running',
         duration_seconds: null,
+        after_message_count: afterMessageCount,
       })
       continue
     }
@@ -102,6 +115,7 @@ export function collectToolCalls(
         error: event.error ?? null,
         status: failed ? 'failed' : 'succeeded',
         duration_seconds: null,
+        after_message_count: afterMessageCount,
       })
     }
   }
@@ -123,6 +137,7 @@ function findLastIndex<T>(
 /** React Hook 版本 */
 export function useToolCalls(
   events: readonly RunEvent[] | null | undefined,
+  anchor?: number | null,
 ): ToolCallEntry[] {
-  return useMemo(() => collectToolCalls(events), [events])
+  return useMemo(() => collectToolCalls(events, anchor), [events, anchor])
 }

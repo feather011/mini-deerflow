@@ -23,12 +23,13 @@
  * - unknown + 有新草稿：保留新草稿，pendingSent 不动
  * - 恢复操作：restorePendingSent → pendingSent → textarea
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useAgentStream } from './useAgentStream'
 import { useContextUsage, ContextUsageIndicator } from './'
 import type { ThreadDetail } from '../../shared/types/threads'
 import type { ApiError } from '../../shared/api/client'
 import { MessageList } from './MessageList'
+import type { MessageBlock } from './MessageList'
 import { MessageComposer } from './MessageComposer'
 import { RunEventPanel } from './RunEventPanel'
 import { RunStatusLine } from './RunStatusLine'
@@ -62,6 +63,20 @@ export function AgentChatPanel({ thread, onOpenSubagent }: AgentChatPanelProps) 
 
   // 乐观消息
   const [optimisticMsg, setOptimisticMsg] = useState<OptimisticMessage | null>(null)
+
+  // 本轮过程块的时序锚点：过程块插在第几条消息之后。
+  //
+  // 发送时按当时的会话消息数 + 1 记下 —— 那正是"本轮 user 消息"的位置
+  // （后端在本轮开始时的历史长度 + 1，两边口径一致）。工具折叠块与子任务条
+  // 据此插到消息流里的**当时位置**，而不是永远挂在会话末尾。
+  //
+  // 绑定 threadId：切换会话后旧锚点不再适用。
+  const [runAnchorState, setRunAnchorState] = useState<{
+    threadId: string
+    anchor: number
+  } | null>(null)
+  const runAnchor =
+    runAnchorState?.threadId === thread.thread_id ? runAnchorState.anchor : null
 
   // 已处理的 run.result 事件序列号（防重复 ingest）
   const processedResultSeq = useRef<number>(0)
@@ -222,6 +237,12 @@ export function AgentChatPanel({ thread, onOpenSubagent }: AgentChatPanelProps) 
     // 会因为「不大于游标」被整段跳过，文件和 diff 都不更新。
     processedResultSeq.current = 0
 
+    // 记下本轮过程块的锚点（第几条消息之后）= 当前消息数 + 1
+    setRunAnchorState({
+      threadId: thread.thread_id,
+      anchor: thread.messages.length + 1,
+    })
+
     // 保存草稿快照（发送前），编辑区继续接受新草稿
     savePendingSent(message)
     start(message)
@@ -272,27 +293,70 @@ export function AgentChatPanel({ thread, onOpenSubagent }: AgentChatPanelProps) 
   //
   // 两个来源合并：本轮 SSE 事件（实时进度）+ 线程详情里的持久化记录
   // （页面刷新后靠它恢复卡片 —— G6 的前端一半）。
-  const subagentCards = useSubagentCards(events, thread.subagent_runs)
+  const subagentCards = useSubagentCards(events, thread.subagent_runs, runAnchor)
   // 工具调用折叠块：从 SSE 的 tool.* 事件聚合。
-  const toolCalls = useToolCalls(events)
+  const toolCalls = useToolCalls(events, runAnchor)
+
+  // 过程块按锚点分组后交给 MessageList 交错渲染。
+  //
+  // 同一锚点下：工具折叠块在前（父 Agent 视角的调用），子任务条在后
+  // （子 Agent 视角的结果）。锚点未知（null）的一律排到末尾。
+  const blocks = useMemo<MessageBlock[]>(() => {
+    const groups = new Map<
+      number,
+      { tools: typeof toolCalls; cards: SubagentCardModel[] }
+    >()
+    const groupOf = (anchor: number | null) => {
+      const key = anchor ?? Number.MAX_SAFE_INTEGER
+      let group = groups.get(key)
+      if (!group) {
+        group = { tools: [], cards: [] }
+        groups.set(key, group)
+      }
+      return group
+    }
+    for (const entry of toolCalls) {
+      groupOf(entry.after_message_count).tools.push(entry)
+    }
+    for (const card of subagentCards) {
+      groupOf(card.after_message_count).cards.push(card)
+    }
+
+    const result: MessageBlock[] = []
+    for (const anchor of [...groups.keys()].sort((a, b) => a - b)) {
+      const group = groups.get(anchor)!
+      if (group.tools.length > 0) {
+        result.push({
+          key: `tool-calls@${anchor}`,
+          afterMessageCount: anchor,
+          node: <ToolCallList entries={group.tools} />,
+        })
+      }
+      if (group.cards.length > 0) {
+        result.push({
+          key: `subagent-cards@${anchor}`,
+          afterMessageCount: anchor,
+          node: <SubagentCardList cards={group.cards} onOpen={onOpenSubagent} />,
+        })
+      }
+    }
+    return result
+  }, [toolCalls, subagentCards, onOpenSubagent])
 
   return (
     <SSEContext.Provider value={{ events, status: streamStatus }}>
       <div className={styles.panel}>
         {/* 消息列表（含乐观消息 + 流式 assistant）
-            工具调用折叠块、子任务通知条作为 children 传进去 —— 它们和消息
-            处在同一个滚动容器里，会随消息一起滚动，不会悬在聊天区底部。 */}
+            工具调用折叠块、子任务通知条作为 blocks 传进去 —— 它们和消息
+            处在同一个滚动容器里，并按锚点插到消息流里的当时位置：
+            会被后来的消息顶上去，而不是永远悬在聊天区底部。 */}
         <div className={styles.messageArea}>
           <MessageList
             messages={thread.messages}
             optimisticMessage={optimisticMsg}
             streamingText={currentText}
-          >
-            {/* 工具调用折叠块（像消息一样折叠，不占地方） */}
-            <ToolCallList entries={toolCalls} />
-            {/* Subagent 首版：子任务通知条（点击在右侧打开子 Agent 会话） */}
-            <SubagentCardList cards={subagentCards} onOpen={onOpenSubagent} />
-          </MessageList>
+            blocks={blocks}
+          />
           {/* TOOL-05：确认卡紧邻消息流底部渲染（按 run_id 分组）
               确认卡是「等用户拍板」的待办，固定在底部保证不会滚出视线。 */}
           <ConfirmationCardList
